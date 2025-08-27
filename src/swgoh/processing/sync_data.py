@@ -1,16 +1,51 @@
 # src/swgoh/processing/sync_data.py
 
-from typing import Any, Dict, List, Set, Tuple
-import os
-from ..sheets import open_or_create, write_sheet, try_get_worksheet
+from typing import Any, Dict, List, Set, Tuple, Optional
+import os, re, json
+from ..sheets import open_or_create, write_sheet
 from ..comlink import fetch_metadata, fetch_data_items
 from ..http import post_json
 from .. import config as cfg
 
 
-# -------------------------------
-# Helpers generales
-# -------------------------------
+# ---------- Env / Config ----------
+EXCLUDE = set(getattr(cfg, "EXCLUDE_BASEID_CONTAINS", []))
+LOCALE = os.getenv("LOCALE", "ENG_US").strip() or "ENG_US"
+
+# toggles estilo script original
+SKIP_EMPTY_BASEID = os.getenv("SKIP_EMPTY_BASEID", "true").lower() == "true"
+DEDUP_UNITS = os.getenv("DEDUP_UNITS", "true").lower() == "true"
+
+# mapeos de omicron (opcional, igual que antes)
+OMICRON_MODE_MAP_JSON = os.getenv("OMICRON_MODE_MAP_JSON", "").strip()
+OMICRON_MODE_MAP = os.getenv("OMICRON_MODE_MAP", "").strip()
+
+# nombres de pestañas (idénticos al original)
+SHEET_CHARACTERS = getattr(cfg, "SHEET_CHARACTERS", "characters")
+SHEET_SHIPS = getattr(cfg, "SHEET_SHIPS", "ships")
+SHEET_ZETAS = getattr(cfg, "SHEET_ZETAS", "zetas")
+SHEET_OMICRONS = getattr(cfg, "SHEET_OMICRONS", "omicrons")
+
+
+# ---------- Helpers ----------
+def ensure_array(root: Any, key: str) -> List[Dict[str, Any]]:
+    if isinstance(root, dict):
+        for r in (root, root.get("data", {}), root.get("payload", {})):
+            if isinstance(r, dict) and isinstance(r.get(key), list):
+                return r[key]
+    return []
+
+def _extract_field(d: Dict[str, Any], candidates: List[str]) -> Optional[str]:
+    for path in candidates:
+        cur: Any = d; ok = True
+        for p in path.split("."):
+            if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+            else:
+                ok = False; break
+        if ok and isinstance(cur, (str, int)):
+            return str(cur)
+    return None
 
 def _as_int(value, default: int | None = None) -> int | None:
     try:
@@ -18,302 +53,321 @@ def _as_int(value, default: int | None = None) -> int | None:
     except Exception:
         return default
 
-
-def _unit_name_fallback(u: Dict[str, Any], fallback: str) -> str:
-    # Si localization falla, usamos estos campos de /data units
-    return str(
-        u.get("uiName")
-        or u.get("longName")
-        or u.get("name")
-        or u.get("localizedName")
-        or fallback
-    )
-
-
-def _normalize_alignment(val: Any) -> str:
-    """
-    Normaliza alignment a: "Light Side" / "Dark Side" / "Neutral" / "".
-    Acepta strings (LIGHT/DARK/NEUTRAL) o números (1,2,3) y variantes.
-    """
-    if val is None:
+def loc_lookup_ci(loc_upper: Dict[str, str], key: Optional[str]) -> str:
+    if not key:
         return ""
-    s = str(val).strip().upper()
-    # valores numéricos comunes
-    if s.isdigit():
-        n = int(s)
-        if n == 1:
-            return "Light Side"
-        if n == 2:
-            return "Dark Side"
-        if n == 3:
-            return "Neutral"
-    # variantes de texto
-    if "LIGHT" in s or s in {"LS", "LIGHT_SIDE", "LIGHTSIDE"}:
-        return "Light Side"
-    if "DARK" in s or s in {"DS", "DARK_SIDE", "DARKSIDE"}:
-        return "Dark Side"
-    if "NEUTRAL" in s:
-        return "Neutral"
-    return ""
+    return loc_upper.get(str(key).upper(), "")
 
+def fetch_localization_raw(loc_bundle: str, locale: str) -> Dict[str, Any]:
+    # Igual que el original: unzip + id = "{bundle}:{locale}"
+    return post_json("/localization", {"unzip": True, "payload": {"id": f"{loc_bundle}:{locale}"}, "enums": False})
 
-def _alignment_from_unit(u: Dict[str, Any]) -> str:
-    """
-    Intenta extraer el alignment de forma robusta:
-      1) forceAlignment / alignment
-      2) categorías (alignment_light / alignment_dark / neutral)
-    """
-    val = u.get("forceAlignment") or u.get("alignment")
-    norm = _normalize_alignment(val)
-    if norm:
-        return norm
-
-    # 2) categorías
-    cats = (u.get("categoryIdList") or u.get("categories") or [])
-    for c in cats:
-        cs = str(c).lower()
-        if "alignment_light" in cs or "light_side" in cs or cs.endswith("_light"):
-            return "Light Side"
-        if "alignment_dark" in cs or "dark_side" in cs or cs.endswith("_dark"):
-            return "Dark Side"
-        if "neutral" in cs:
-            return "Neutral"
-
-    return ""
-
-
-def _collect_unit_skill_ids(u: Dict[str, Any]) -> List[str]:
-    """
-    Extrae la lista de skillIds referenciadas por la unidad desde distintos campos posibles.
-    """
-    out: List[str] = []
-
-    # 1) skillReferenceList: [{ skillId, ...}, ...]
-    for ref in (u.get("skillReferenceList") or []):
-        sid = ref.get("skillId") or ref.get("id")
-        if sid:
-            out.append(str(sid))
-
-    # 2) skillList: ["skchr_xxx", ...]
-    for sid in (u.get("skillList") or []):
-        out.append(str(sid))
-
-    # 3) unitSkillIds / skills
-    for sid in (u.get("unitSkillIds") or u.get("skills") or []):
-        if isinstance(sid, dict):
-            sid = sid.get("id") or sid.get("skillId")
-        if sid:
-            out.append(str(sid))
-
-    return out
-
-
-def _skill_has_zeta(s: Dict[str, Any]) -> bool:
-    if s.get("isZeta") is True:
-        return True
-    if _as_int(s.get("zetaTier")) is not None:
-        return True
-    tiers = s.get("tier") or s.get("tiers") or []
-    for t in tiers:
-        if t.get("isZeta") is True:
-            return True
-        if str(t.get("name") or "").lower().find("zeta") >= 0:
-            return True
-    return False
-
-
-def _skill_has_omicron(s: Dict[str, Any]) -> Tuple[bool, int | None]:
-    tiers = s.get("tier") or s.get("tiers") or []
-    for t in tiers:
-        if t.get("isOmicron") is True or (t.get("omicronMode") is not None):
-            return True, _as_int(t.get("omicronMode"))
-    if s.get("isOmicron") is True or (s.get("omicronMode") is not None):
-        return True, _as_int(s.get("omicronMode"))
-    return False, None
-
-
-# -------------------------------
-# Localization
-# -------------------------------
-
-def _fetch_localization(locale: str) -> Dict[str, Any]:
-    """
-    Llama a /localization con el payload estándar que usábamos antes.
-    Si no responde, devuelve {} (el script seguirá con fallback de nombres).
-    """
-    try:
-        return post_json("/localization", {"payload": {"language": str(locale)}, "enums": False})
-    except BaseException:
-        return {}
-
-
-def _build_localization_map(loc: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Construye un mapa key -> texto desde la respuesta de /localization.
-    Soporta varios formatos (dict/list) sin romperse.
-    """
+def parse_loc_txt_map(loc_data: Dict[str, Any], locale: str) -> Dict[str, str]:
+    # Busca "Loc_<LOCALE>.txt" con líneas KEY|VALUE
+    candidates = [f"Loc_{locale}.txt", f"Loc_{locale.upper()}.txt", f"Loc_{locale.lower()}.txt"]
+    text_blob = None
+    for k in candidates:
+        v = loc_data.get(k)
+        if isinstance(v, str):
+            text_blob = v; break
+    if text_blob is None:
+        for k, v in (loc_data or {}).items():
+            if isinstance(k, str) and k.endswith(".txt") and isinstance(v, str):
+                text_blob = v; break
+    if not text_blob:
+        raise SystemExit(f"No encontré 'Loc_{locale}.txt' en /localization.")
     mapping: Dict[str, str] = {}
-    if not loc:
-        return mapping
+    for raw in text_blob.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "|" not in line:
+            continue
+        key, val = line.split("|", 1)
+        key = key.strip()
+        if key.startswith("[") and key.endswith("]"):
+            key = key[1:-1].strip()
+        mapping[key] = val.strip()
+    return {k.upper(): v for k, v in mapping.items()}  # lookup case-insensitive
 
-    strings = (
-        loc.get("strings")
-        or loc.get("payload", {}).get("strings")
-        or loc.get("data", {}).get("strings")
-        or loc.get("localizedStrings")
-        or loc.get("stringsList")
-        or []
-    )
-    if isinstance(strings, dict):
-        for k, v in strings.items():
-            try:
-                mapping[str(k)] = str(v)
-            except Exception:
-                pass
-    elif isinstance(strings, list):
-        for s in strings:
-            key = s.get("key") or s.get("id") or s.get("name")
-            val = s.get("text") or s.get("value") or s.get("localizedString") or s.get("locString")
-            if key is not None and val is not None:
-                try:
-                    mapping[str(key)] = str(val)
-                except Exception:
-                    pass
+def friendly_unit_name_with_key(unit: Dict[str, Any], loc_upper: Dict[str, str]) -> Tuple[str, str]:
+    nk = (unit.get("nameKey") or unit.get("unitNameKey") or "").strip()
+    if nk:
+        name = loc_lookup_ci(loc_upper, nk)
+        if name:
+            return name, nk
+    base = (unit.get("baseId") or unit.get("base_id") or "").strip()
+    if base:
+        cand = f"UNIT_{base}_NAME"
+        name = loc_lookup_ci(loc_upper, cand)
+        if name:
+            return name, cand
+        return "", (nk or cand)
+    return "", nk
+
+def force_alignment_text(val: Any) -> str:
+    try:
+        x = int(val)
+    except Exception:
+        return ""
+    return {1: "Neutral", 2: "Light Side", 3: "Dark Side"}.get(x, "")
+
+def load_omicron_mode_map() -> Dict[str, str]:
+    if OMICRON_MODE_MAP_JSON:
+        try:
+            d = json.loads(OMICRON_MODE_MAP_JSON)
+            return {str(k): str(v) for k, v in d.items()}
+        except Exception as e:
+            print(f"[WARN] OMICRON_MODE_MAP_JSON inválido: {e}")
+    mapping: Dict[str, str] = {}
+    if OMICRON_MODE_MAP:
+        try:
+            for p in [p.strip() for p in OMICRON_MODE_MAP.split(",") if p.strip()]:
+                if ":" in p:
+                    k, v = p.split(":", 1)
+                    mapping[str(k).strip()] = str(v).strip()
+        except Exception as e:
+            print(f"[WARN] OMICRON_MODE_MAP inválido: {e}")
     return mapping
 
+def omicron_mode_text(mode_val: Any, mapping: Dict[str, str]) -> str:
+    if mode_val in (None, ""):
+        return ""
+    s = str(mode_val).strip()
+    if s in mapping:
+        return mapping[s]
+    try:
+        si = str(int(float(s)))
+        return mapping.get(si, "")
+    except Exception:
+        return ""
 
-# -------------------------------
-# Proceso principal
-# -------------------------------
+# Ability helpers (resolver friendly de skills vía ability)
+def index_abilities(abilities: List[Dict[str, Any]]):
+    by_id, by_namekey, by_desckey = {}, {}, {}
+    for ab in abilities:
+        if not isinstance(ab, dict): continue
+        aid = (ab.get("id") or ab.get("abilityId") or "").strip()
+        if aid: by_id[aid.upper()] = ab
+        nk = (ab.get("nameKey") or "").strip()
+        if nk: by_namekey[nk.upper()] = ab
+        dk = (ab.get("descKey") or "").strip()
+        if dk: by_desckey[dk.upper()] = ab
+    return by_id, by_namekey, by_desckey
 
+def map_skill_to_ability(skill: Dict[str, Any], ab_by_id: Dict[str, Any],
+                         ab_by_namekey: Dict[str, Any], ab_by_desckey: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ar = (skill.get("abilityReference") or "").strip()
+    if ar and ar.upper() in ab_by_id:
+        return ab_by_id[ar.upper()]
+    nk = (skill.get("nameKey") or "").strip()
+    if nk and nk.upper() in ab_by_namekey:
+        return ab_by_namekey[nk.upper()]
+    dk = (skill.get("descKey") or "").strip()
+    if dk and dk.upper() in ab_by_desckey:
+        return ab_by_desckey[dk.upper()]
+    return None
+
+def friendly_ability_name_for_skill(ab: Dict[str, Any], loc_upper: Dict[str, str]) -> Tuple[str, str, str]:
+    """
+    Devuelve (friendly_name, skill_name_key, abilityReference_NAME_usado).
+    Intenta {ability.id}_NAME; fallback a ability.nameKey.
+    """
+    ab_id = (ab.get("id") or ab.get("abilityId") or "").strip().upper()
+    if ab_id:
+        cand = f"{ab_id}_NAME"
+        val = loc_lookup_ci(loc_upper, cand)
+        if val:
+            return val, cand, cand
+    nk = (ab.get("nameKey") or "").strip()
+    if nk:
+        val2 = loc_lookup_ci(loc_upper, nk)
+        if val2:
+            return val2, nk, ""
+    return "No encontrado", "", ""
+
+
+# ---------- Main ----------
 def run() -> Dict[str, int]:
-    # Config
-    SHEET_CHARACTERS = getattr(cfg, "SHEET_CHARACTERS", "Characters")
-    SHEET_SHIPS = getattr(cfg, "SHEET_SHIPS", "Ships")
-    SHEET_CHARACTERS_ZETAS = getattr(cfg, "SHEET_CHARACTERS_ZETAS", "CharactersZetas")
-    SHEET_CHARACTERS_OMICRONS = getattr(cfg, "SHEET_CHARACTERS_OMICRONS", "CharactersOmicrons")
-    EXCLUDE = set(getattr(cfg, "EXCLUDE_BASEID_CONTAINS", []))
-    LOCALE = os.getenv("LOCALE", "ENG_US")
-
-    # /metadata
+    # 1) /metadata -> versiones + bundle de localization
     meta = fetch_metadata()
-    version = (
-        meta.get("latestGamedataVersion")
-        or meta.get("payload", {}).get("latestGamedataVersion")
-        or meta.get("data", {}).get("latestGamedataVersion")
-    )
+    version = _extract_field(meta, [
+        "latestGamedataVersion",
+        "payload.latestGamedataVersion",
+        "data.latestGamedataVersion",
+    ])
+    loc_bundle = _extract_field(meta, [
+        "latestLocalizationBundleVersion",
+        "payload.latestLocalizationBundleVersion",
+        "data.latestLocalizationBundleVersion",
+    ])
     if not version:
-        raise SystemExit("No latestGamedataVersion")
+        raise SystemExit("No pude obtener latestGamedataVersion.")
+    if not loc_bundle:
+        raise SystemExit("No pude obtener latestLocalizationBundleVersion.")
 
-    # /data units + skills
+    # 2) /localization
+    loc_raw = fetch_localization_raw(loc_bundle, LOCALE)
+    loc_upper = parse_loc_txt_map(loc_raw, LOCALE)
+
+    # 3) /data units (Characters/Ships) + índice skill→unit
     du = fetch_data_items(version, "units")
-    ds = fetch_data_items(version, "skill")
-    units = du.get("units") or du.get("payload", {}).get("units") or []
-    skills = ds.get("skill") or ds.get("payload", {}).get("skill") or []
+    units = ensure_array(du, "units")
+    print(f"[INFO] Unidades recibidas: {len(units)}")
 
-    # Localization map
-    loc_map = _build_localization_map(_fetch_localization(LOCALE))
-
-    # Index de skills
-    skill_by_id: Dict[str, Dict[str, Any]] = {}
-    for s in skills:
-        sid = s.get("id") or s.get("skillId")
-        if sid is not None:
-            skill_by_id[str(sid)] = s
-
-    # Construcción de Characters / Ships (base_id; Name; Alignment)
-    headers_units = ["base_id", "Name", "Alignment"]
-    chars_rows: List[List[Any]] = []
-    ships_rows: List[List[Any]] = []
-    seen_units: Set[str] = set()
-    unit_skills: Dict[str, List[str]] = {}
-
+    units_by_base_norm: Dict[str, Dict[str, Any]] = {}
     for u in units:
-        base_id = (u.get("baseId") or u.get("id") or "").upper()
-        if not base_id:
-            continue
-        if base_id in seen_units:
-            continue
-        if EXCLUDE and any(substr in base_id for substr in EXCLUDE):
-            continue
-        seen_units.add(base_id)
+        if not isinstance(u, dict): continue
+        raw_base = (u.get("baseId") or u.get("base_id") or "").strip()
+        if EXCLUDE and any(substr in raw_base.upper() for substr in EXCLUDE): continue
+        base_norm = re.sub(r"\s+", "", raw_base).upper()
+        if not base_norm and SKIP_EMPTY_BASEID: continue
+        if DEDUP_UNITS and base_norm in units_by_base_norm: continue
+        units_by_base_norm[base_norm] = u
 
-        # Friendly Name desde localization (como antes): nameKey -> loc_map
-        name_key = u.get("nameKey")
-        name = loc_map.get(name_key) if name_key else None
-        if not name:
-            name = _unit_name_fallback(u, base_id)
+    dedup_units = list(units_by_base_norm.values())
+    print(f"[INFO] Unidades tras filtro/dedup: {len(dedup_units)}")
 
-        alignment = _alignment_from_unit(u)
+    unit_friendly_by_base: Dict[str, str] = {}
+    skillid_to_unit_bases: Dict[str, set] = {}
 
-        ctype = u.get("combatType") or u.get("combat_type") or 1
-        ctype = _as_int(ctype, 1) or 1
+    characters_rows: List[List[Any]] = []
+    ships_rows: List[List[Any]] = []
 
-        row = [base_id, str(name), alignment]
-        if ctype == 2:
+    for u in dedup_units:
+        base_id = (u.get("baseId") or u.get("base_id") or "").strip()
+        combat_type = u.get("combatType")
+        align_val = u.get("forceAlignment")
+
+        friendly, _ = friendly_unit_name_with_key(u, loc_upper)
+        unit_friendly_by_base[base_id] = friendly or ""
+
+        # skill → units
+        for ref in (u.get("skillReference") or []):
+            if isinstance(ref, dict):
+                sid = ref.get("id") or ref.get("skillId") or ref.get("abilityId")
+            else:
+                sid = str(ref)
+            if sid:
+                skillid_to_unit_bases.setdefault(str(sid), set()).add(base_id)
+
+        row = [base_id, (friendly or ""), force_alignment_text(align_val)]
+        if int(combat_type or 0) == 1:
+            characters_rows.append(row)
+        elif int(combat_type or 0) == 2:
             ships_rows.append(row)
+
+    # 4) /data ability (resolver friendly de skills)
+    da = fetch_data_items(version, "ability")
+    abilities = ensure_array(da, "ability")
+    print(f"[INFO] Abilities recibidos: {len(abilities)}")
+    ab_by_id, ab_by_namekey, ab_by_desckey = index_abilities(abilities)
+
+    # 5) /data skill (zetas/omicrons)
+    ds = fetch_data_items(version, "skill")
+    skills = ensure_array(ds, "skill")
+    print(f"[INFO] Skills: {len(skills)}")
+
+    zetas_rows: List[List[Any]] = []
+    omicrons_rows: List[List[Any]] = []
+
+    om_map = load_omicron_mode_map()
+
+    for s in skills:
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get("id") or "")
+        ability_ref = (s.get("abilityReference") or "").strip()
+
+        # friendly desde ability → localization
+        ab = map_skill_to_ability(s, ab_by_id, ab_by_namekey, ab_by_desckey)
+        if ab:
+            friendly_skill, skill_key_used, ability_key_used = friendly_ability_name_for_skill(ab, loc_upper)
         else:
-            chars_rows.append(row)
+            # fallback: {abilityReference}_NAME y luego nameKey de la skill
+            friendly_skill, skill_key_used, ability_key_used = ("No encontrado", "", "")
+            if ability_ref:
+                cand = f"{ability_ref.upper()}_NAME"
+                val = loc_lookup_ci(loc_upper, cand)
+                if val:
+                    friendly_skill, skill_key_used, ability_key_used = val, cand, cand
+            if friendly_skill == "No encontrado":
+                nk = (s.get("nameKey") or "").strip()
+                if nk:
+                    val2 = loc_lookup_ci(loc_upper, nk)
+                    if val2:
+                        friendly_skill, skill_key_used, ability_key_used = val2, nk, ""
 
-        unit_skills[base_id] = _collect_unit_skill_ids(u)
+        # omicronMode (valor + texto)
+        skill_omicron_mode = s.get("omicronMode")
+        omicron_mode_value = "" if skill_omicron_mode in (None, "") else str(skill_omicron_mode)
+        omicron_mode_text_val = omicron_mode_text(omicron_mode_value, om_map)
 
-    # Zetas / Omicrons
-    headers_zetas = ["base_id", "skillId", "skillName"]
-    headers_omis = ["base_id", "skillId", "skillName", "omicronMode"]
+        # detectar zeta/omicron via tiers
+        tiers = s.get("tier")
+        if tiers is None: tiers = s.get("tiers", [])
+        is_zeta = False
+        is_omicron = False
+        recipe_id = ""
+        if isinstance(tiers, list):
+            for t in tiers:
+                if not isinstance(t, dict): continue
+                name = str(t.get("name") or "").lower()
+                if (t.get("isZeta") is True) or ("zeta" in name):
+                    is_zeta = True
+                if (t.get("isOmicron") is True) or (t.get("omicronMode") not in (None, "")):
+                    is_omicron = True
+                for k in ("recipeId", "recipeID", "unlockRecipeId", "unlockRecipeID"):
+                    rv = t.get(k)
+                    if rv not in (None, ""):
+                        recipe_id = str(rv)
+        # flags a nivel de skill (por si el schema lo trae así)
+        if not (is_zeta or is_omicron):
+            if s.get("isZeta") is True:
+                is_zeta = True
+            if (s.get("isOmicron") is True) or (s.get("omicronMode") not in (None, "")):
+                is_omicron = True
 
-    zeta_rows: List[List[Any]] = []
-    omi_rows: List[List[Any]] = []
-    seen_zeta: Set[Tuple[str, str]] = set()
-    seen_omi: Set[Tuple[str, str]] = set()
+        # CharacterName y concatenado
+        bases = sorted(list(skillid_to_unit_bases.get(sid, set())))
+        character_name = (unit_friendly_by_base.get(bases[0], "") if bases else "")
+        char_skill_concat = (f"{character_name}|{friendly_skill}" if character_name else friendly_skill)
 
-    def _skill_name(s: Dict[str, Any], fallback: str) -> str:
-        return str(
-            s.get("name")
-            or s.get("uiName")
-            or s.get("nameKey")
-            or s.get("descKey")
-            or fallback
-        )
+        row = [
+            sid,
+            ability_ref,
+            friendly_skill,
+            skill_key_used,
+            ability_key_used,
+            omicron_mode_value,
+            omicron_mode_text_val,
+            recipe_id,
+            character_name,
+            char_skill_concat,
+        ]
+        if is_zeta:
+            zetas_rows.append(row)
+        if is_omicron:
+            omicrons_rows.append(row)
 
-    for base_id, sids in unit_skills.items():
-        for sid in sids:
-            s = skill_by_id.get(sid)
-            if not s:
-                continue
-            if _skill_has_zeta(s):
-                key = (base_id, sid)
-                if key not in seen_zeta:
-                    seen_zeta.add(key)
-                    zeta_rows.append([base_id, sid, _skill_name(s, sid)])
-            has_omi, omi_mode = _skill_has_omicron(s)
-            if has_omi:
-                key = (base_id, sid)
-                if key not in seen_omi:
-                    seen_omi.add(key)
-                    omi_rows.append([base_id, sid, _skill_name(s, sid), "" if omi_mode is None else str(omi_mode)])
-
-    # Orden estable
-    chars_rows.sort(key=lambda r: r[1])  # por Name
-    ships_rows.sort(key=lambda r: r[1])
-    zeta_rows.sort(key=lambda r: (r[0], r[2]))
-    omi_rows.sort(key=lambda r: (r[0], r[2], r[3]))
-
-    # Escribir
+    # 6) Escribir a Sheets
     ws_chars = open_or_create(SHEET_CHARACTERS)
     ws_ships = open_or_create(SHEET_SHIPS)
-    ws_zetas = open_or_create(SHEET_CHARACTERS_ZETAS)
-    ws_omis = open_or_create(SHEET_CHARACTERS_OMICRONS)
+    ws_zetas = open_or_create(SHEET_ZETAS)
+    ws_omis = open_or_create(SHEET_OMICRONS)
 
-    write_sheet(ws_chars, headers_units, chars_rows)
+    headers_units = ["base_id", "Name", "Alignment"]
+    write_sheet(ws_chars, headers_units, characters_rows)
     write_sheet(ws_ships, headers_units, ships_rows)
-    write_sheet(ws_zetas, headers_zetas, zeta_rows)
-    write_sheet(ws_omis, headers_omis, omi_rows)
+
+    headers_zetas = ["skillid", "abilityReference", "skill name", "skill name key", "abilityReference_NAME",
+                     "omicronMode", "omicronModeText", "recipeId", "CharacterName", "CharacterName|skill name"]
+    write_sheet(ws_zetas, headers_zetas, zetas_rows)
+    write_sheet(ws_omis, headers_zetas, omicrons_rows)
 
     return {
-        "characters": len(chars_rows),
+        "characters": len(characters_rows),
         "ships": len(ships_rows),
-        "zetas": len(zeta_rows),
-        "omicrons": len(omi_rows),
+        "zetas": len(zetas_rows),
+        "omicrons": len(omicrons_rows),
     }
 
 
