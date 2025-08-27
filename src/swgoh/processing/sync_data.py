@@ -304,83 +304,86 @@ def run() -> Dict[str, int]:
     print(f"[INFO] Skills: {len(skills)}")
     om_map = load_omicron_mode_map()
 
-    zetas_rows: List[List[Any]] = []
-    omicrons_rows: List[List[Any]] = []
+omicrons_rows: List[List[Any]] = []
+zetas_rows: List[List[Any]] = []
 
-    def friendly_skill_for_skill(s: Dict[str, Any]) -> Tuple[str, str, str]:
-        # Intenta resolver vía ability → localization (ID_NAME) y si no, por nameKey
-        friendly_skill, skill_key_used, ability_key_used = ("No encontrado", "", "")
-        ab = map_skill_to_ability(s, ab_by_id, ab_by_namekey, ab_by_desckey)
-        if ab:
-            friendly_skill, skill_key_used, ability_key_used = friendly_ability_name_for_skill(ab, loc_upper)
-        if friendly_skill == "No encontrado":
-            nk = (s.get("nameKey") or "").strip()
-            if nk:
-                val2 = loc_lookup_ci(loc_upper, nk)
-                if val2:
-                    friendly_skill, skill_key_used, ability_key_used = val2, nk, ""
-        return friendly_skill, skill_key_used, ability_key_used
+def friendly_skill_for_skill(s: Dict[str, Any]) -> Tuple[str, str, str]:
+    friendly_skill, skill_key_used, ability_key_used = ("No encontrado", "", "")
+    ab = map_skill_to_ability(s, ab_by_id, ab_by_namekey, ab_by_desckey)
+    if ab:
+        friendly_skill, skill_key_used, ability_key_used = friendly_ability_name_for_skill(ab, loc_upper)
+    if friendly_skill == "No encontrado":
+        nk = (s.get("nameKey") or "").strip()
+        if nk:
+            val2 = loc_lookup_ci(loc_upper, nk)
+            if val2:
+                friendly_skill, skill_key_used, ability_key_used = val2, nk, ""
+    return friendly_skill, skill_key_used, ability_key_used
 
-    for s in skills:
-        if not isinstance(s, dict):
+for s in skills:
+    if not isinstance(s, dict):
+        continue
+
+    sid = str(s.get("id") or "")
+    # ⬇️ Filtro por skillid usando EXCLUDE_BASEID_CONTAINS
+    if EXCLUDE and any(substr in sid.upper() for substr in EXCLUDE):
+        continue
+
+    ability_ref = (s.get("abilityReference") or "").strip()
+
+    # Nombre amigable de la skill
+    friendly_skill, skill_key_used, ability_key_used = friendly_skill_for_skill(s)
+
+    # omicronMode a nivel de skill (valor + texto)
+    skill_omicron_mode = s.get("omicronMode")
+    omicron_mode_value = "" if skill_omicron_mode in (None, "") else str(skill_omicron_mode)
+    omicron_mode_text_val = omicron_mode_text(omicron_mode_value, om_map)
+
+    # tiers (solo añadimos filas cuando el tier marca explícitamente isZetaTier / isOmicronTier)
+    tiers = s.get("tier")
+    if tiers is None:
+        tiers = s.get("tiers", [])
+    if not isinstance(tiers, list):
+        continue
+
+    # CharacterName (primer unit que referencia la skill)
+    bases = sorted(list(skillid_to_unit_bases.get(sid, set())))
+    character_name = (unit_friendly_by_base.get(bases[0], "") if bases else "")
+    char_skill_concat = (f"{character_name}|{friendly_skill}" if character_name else friendly_skill)
+
+    for tr in tiers:
+        if not isinstance(tr, dict):
+            continue
+        is_zeta = bool(tr.get("isZetaTier"))
+        is_omicron = bool(tr.get("isOmicronTier"))  # ← seguimos usando sólo isOmicronTier
+
+        if not (is_zeta or is_omicron):
             continue
 
-        sid = str(s.get("id") or "")
-        ability_ref = (s.get("abilityReference") or "").strip()
+        # recipeId (varios nombres posibles)
+        recipe_id = ""
+        for k in ("recipeId", "tierUpRecipeId", "upgradeRecipeId", "upgradeRecipeReference"):
+            v = tr.get(k)
+            if v not in (None, ""):
+                recipe_id = str(v)
+                break
 
-        # Nombre amigable de la skill
-        friendly_skill, skill_key_used, ability_key_used = friendly_skill_for_skill(s)
-
-        # omicronMode a nivel de skill (se muestra como valor y texto)
-        skill_omicron_mode = s.get("omicronMode")
-        omicron_mode_value = "" if skill_omicron_mode in (None, "") else str(skill_omicron_mode)
-        omicron_mode_text_val = omicron_mode_text(omicron_mode_value, om_map)
-
-        # tiers (solo añadimos filas cuando el tier marca explícitamente isZetaTier / isOmicronTier)
-        tiers = s.get("tier")
-        if tiers is None:
-            tiers = s.get("tiers", [])
-        if not isinstance(tiers, list):
-            continue
-
-        # CharacterName (primer unit que referencia la skill)
-        bases = sorted(list(skillid_to_unit_bases.get(sid, set())))
-        character_name = (unit_friendly_by_base.get(bases[0], "") if bases else "")
-        char_skill_concat = (f"{character_name}|{friendly_skill}" if character_name else friendly_skill)
-
-        for tr in tiers:
-            if not isinstance(tr, dict):
-                continue
-            is_zeta = bool(tr.get("isZetaTier"))
-            is_omicron = bool(tr.get("isOmicronTier"))  # ← filtro exacto pedido
-
-            if not (is_zeta or is_omicron):
-                continue
-
-            # recipeId (mismo patrón del original: varios nombres posibles)
-            recipe_id = ""
-            for k in ("recipeId", "tierUpRecipeId", "upgradeRecipeId", "upgradeRecipeReference"):
-                v = tr.get(k)
-                if v not in (None, ""):
-                    recipe_id = str(v)
-                    break
-
-            row = [
-                sid,
-                ability_ref,
-                friendly_skill,
-                skill_key_used,           # skill name key que resolvió
-                ability_key_used,         # {ability.id}_NAME si se usó
-                omicron_mode_value,       # omicronMode (skill-level)
-                omicron_mode_text_val,    # texto opcional por mapping
-                recipe_id,
-                character_name,
-                char_skill_concat,
-            ]
-            if is_zeta:
-                zetas_rows.append(row)
-            if is_omicron:
-                omicrons_rows.append(row)
+        row = [
+            sid,
+            ability_ref,
+            friendly_skill,
+            skill_key_used,
+            ability_key_used,
+            omicron_mode_value,
+            omicron_mode_text_val,
+            recipe_id,
+            character_name,
+            char_skill_concat,
+        ]
+        if is_zeta:
+            zetas_rows.append(row)
+        if is_omicron:
+            omicrons_rows.append(row)
 
     # Orden estable (igual que veníamos haciendo)
     characters_rows.sort(key=lambda r: r[1])
