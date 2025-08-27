@@ -6,13 +6,11 @@ from .config import SPREADSHEET_ID, SPREADSHEET_NAME
 _gc = None
 _sh = None
 
-
 def _client():
     global _gc
     if _gc is None:
         _gc = gspread.authorize(load_credentials())
     return _gc
-
 
 def spreadsheet():
     global _sh
@@ -27,7 +25,6 @@ def spreadsheet():
         raise SystemExit("Falta SPREADSHEET_ID o SPREADSHEET_NAME")
     return _sh
 
-
 def open_or_create(title: str):
     sh = spreadsheet()
     try:
@@ -35,14 +32,12 @@ def open_or_create(title: str):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=1, cols=1)
 
-
 def try_get_worksheet(title: str):
     sh = spreadsheet()
     try:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         return None
-
 
 def write_sheet(ws, headers: List[str], rows: List[List[Any]], chunk_size: int = 500):
     ws.clear()
