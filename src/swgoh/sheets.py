@@ -40,15 +40,28 @@ def try_get_worksheet(title: str):
         return None
 
 def write_sheet(ws, headers: List[str], rows: List[List[Any]], chunk_size: int = 500):
+    # Asegurar tamaño suficiente de la cuadrícula antes de escribir
+    need_rows = max(1 + len(rows), 1)           # 1 fila de cabecera + filas de datos
+    need_cols = max(len(headers), 1)
+    cur_rows = getattr(ws, "row_count", 0) or 0
+    cur_cols = getattr(ws, "col_count", 0) or 0
+    if need_rows > cur_rows or need_cols > cur_cols:
+        ws.resize(rows=need_rows, cols=need_cols)
+
+    # Limpiar y escribir cabecera
     ws.clear()
     ws.update(values=[headers], range_name="A1")
+
     if not rows:
         return
+
+    # Escribir en bloques
     start_row = 2
-    ncols = max(1, len(headers))
+    ncols = need_cols
     for i in range(0, len(rows), chunk_size):
         block = rows[i:i + chunk_size]
         end_row = start_row + len(block) - 1
         rng = f"A{start_row}:{gspread.utils.rowcol_to_a1(end_row, ncols)}"
         ws.update(values=block, range_name=rng, value_input_option="RAW")
         start_row = end_row + 1
+
