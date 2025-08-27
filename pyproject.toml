@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "swgoh"
+version = "0.1.0"
+description = "SWGOH data sync + Telegram bot monorepo"
+authors = [{name = "Aroa"}]
+requires-python = ">=3.10"
+dependencies = [
+"gspread==6.1.2",
+"google-auth==2.32.0",
+"python-telegram-bot==20.7",
+"requests>=2.31.0",
+"python-dateutil>=2.9.0",
+"pytz>=2024.1",
+]
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
+[tool.setuptools]
+package-dir = {"" = "src"}
