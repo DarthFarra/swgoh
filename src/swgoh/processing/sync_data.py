@@ -3,7 +3,6 @@ from ..sheets import open_or_create, write_sheet
 from ..comlink import fetch_metadata, fetch_data_items
 from ..config import SHEET_CHARACTERS, SHEET_SHIPS, EXCLUDE_BASEID_CONTAINS
 
-
 def run() -> Dict[str, int]:
     # 1) Obtener versión de datos
     meta = fetch_metadata()
@@ -17,10 +16,9 @@ def run() -> Dict[str, int]:
 
     # 2) Descargar items
     du = fetch_data_items(version, "units")
-    ds = fetch_data_items(version, "skill")  # reservado por si lo usas más tarde
+    # ds = fetch_data_items(version, "skill")  # reservado
 
     units = du.get("units") or du.get("payload", {}).get("units") or []
-    # skills = ds.get("skill") or ds.get("payload", {}).get("skill") or []  # no usado aquí
 
     # 3) Preparar filas para Characters y Ships
     headers = ["baseId", "friendlyName", "combatType"]
@@ -60,7 +58,6 @@ def run() -> Dict[str, int]:
     write_sheet(ws_ships, headers, ships_rows)
 
     return {"characters": len(chars_rows), "ships": len(ships_rows)}
-
 
 if __name__ == "__main__":
     print(run())
