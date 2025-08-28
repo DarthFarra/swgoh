@@ -1,153 +1,143 @@
+import os
+import json
+import base64
 import asyncio
-import logging
-from typing import Any, Dict, List, Optional, Tuple
+import traceback
+from typing import Any, Dict, List, Tuple
 
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import Bot
-from ..sheets import try_get_worksheet
-from .. import config as cfg
 
-BOT_TOKEN = getattr(cfg, "TELEGRAM_BOT_TOKEN", None) or getattr(cfg, "BOT_TOKEN", None)
-SHEET_USUARIOS = getattr(cfg, "SHEET_USUARIOS", "Usuarios")
-SHEET_ASIGNACIONES = getattr(cfg, "SHEET_ASIGNACIONES_ROTE", "Asignaciones ROTE")
+# ====== CONFIG (según tu petición) ======
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
-log = logging.getLogger("send_assignments_daily")
+SHEET_USUARIOS = os.getenv("USUARIOS_SHEET", "Usuarios")
+SHEET_ASIGNACIONES = os.getenv("ASIGNACIONES_SHEET", "Asignaciones ROTE")
 
+# Envío por fase (opcional)
+ASSIGNMENTS_PHASE = os.getenv("ASSIGNMENTS_PHASE", "").strip()  # si vacío, enviará todas
 
-def _headers(ws) -> List[str]:
-    vals = ws.get("1:1") or [[]]
-    return [h.strip() for h in (vals[0] if vals else [])]
+# ====== Google Sheets ======
+def _load_service_account_creds() -> Credentials:
+    raw = os.getenv(SERVICE_ACCOUNT_ENV)
+    if not raw:
+        raise RuntimeError(f"Variable de entorno {SERVICE_ACCOUNT_ENV} no definida")
 
+    def try_json(s: str):
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
 
-def _col_index(headers: List[str], *cands: str) -> Optional[int]:
-    h_low = [h.lower() for h in headers]
-    for i, h in enumerate(h_low):
-        for c in cands:
-            if c in h:
-                return i
-    return None
+    info = try_json(raw)
+    if info is None:
+        # ¿base64?
+        try:
+            decoded = base64.b64decode(raw).decode("utf-8")
+            info = try_json(decoded)
+        except Exception:
+            info = None
 
+    if info is None:
+        # ¿ruta a archivo?
+        try:
+            with open(raw, "r", encoding="utf-8") as f:
+                info = json.load(f)
+        except Exception as e:
+            raise RuntimeError(
+                f"No pude interpretar {SERVICE_ACCOUNT_ENV} como JSON/base64/ruta: {e}"
+            )
 
-def _get_usuarios() -> List[Dict[str, str]]:
-    ws = try_get_worksheet(SHEET_USUARIOS)
-    if not ws:
-        return []
-    vals = ws.get_all_values() or []
-    if not vals:
-        return []
-    headers = [h.strip() for h in (vals[0] or [])]
-    out = []
-    for row in vals[1:]:
-        if not row:
-            continue
-        rec = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        out.append(rec)
-    return out
-
-
-def _get_assignments() -> Tuple[List[str], List[List[str]]]:
-    ws = try_get_worksheet(SHEET_ASIGNACIONES)
-    if not ws:
-        return [], []
-    vals = ws.get_all_values() or []
-    if not vals:
-        return [], []
-    return vals[0], vals[1:]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    return Credentials.from_service_account_info(info, scopes=scopes)
 
 
-def _filter_assignments_for(rows: List[List[str]], headers: List[str], player_name: str) -> List[Dict[str, str]]:
-    idx_player = _col_index(headers, "player", "jugador", "player name")
-    idx_phase = _col_index(headers, "fase", "phase")
-    idx_planet = _col_index(headers, "planeta", "planet")
-    idx_task = _col_index(headers, "personaje", "character", "tarea", "assignment", "asignacion")
+def open_spreadsheet():
+    if not SPREADSHEET_ID:
+        raise RuntimeError("Falta SPREADSHEET_ID")
+    credentials = _load_service_account_creds()
+    client = gspread.authorize(credentials)
+    return client.open_by_key(SPREADSHEET_ID)
 
-    res: List[Dict[str, str]] = []
+
+def read_sheet(spreadsheet, name: str) -> List[Dict[str, Any]]:
+    ws = spreadsheet.worksheet(name)
+    rows = ws.get_all_records()
+    return [{(k or "").strip().lower(): v for k, v in r.items()} for r in rows]
+
+
+# ====== Mensajes ======
+def build_message(alias: str, fase: str, rows: List[Dict[str, Any]]) -> str:
+    por_planeta: Dict[str, List[str]] = {}
     for r in rows:
-        if not r:
-            continue
-        cand = (r[idx_player] if (idx_player is not None and idx_player < len(r)) else "").strip() if idx_player is not None else ""
-        if player_name and cand and cand.lower() != player_name.lower():
-            continue
-        res.append({
-            "phase": (r[idx_phase] if (idx_phase is not None and idx_phase < len(r)) else "").strip(),
-            "planet": (r[idx_planet] if (idx_planet is not None and idx_planet < len(r)) else "").strip(),
-            "task": (r[idx_task] if (idx_task is not None and idx_task < len(r)) else "").strip(),
-        })
-    return res
+        planeta = str(r.get("planeta", "Sin planeta")).strip()
+        oper = str(r.get("operacion", "Sin operación")).strip()
+        pers = str(r.get("personaje", "Sin personaje")).strip()
+        por_planeta.setdefault(planeta, []).append(f"- {pers} ({oper})")
 
+    if not por_planeta:
+        return f"Asignaciones de {alias} (Fase {fase})\n\nNo tienes asignaciones registradas."
 
-def _format_assignments(rows: List[Dict[str, str]], player_name: str) -> str:
-    if not rows:
-        return f"<b>Asignaciones de {player_name}</b>\n\nNo tienes asignaciones registradas."
-    grouped: Dict[Tuple[str, str], List[str]] = {}
-    for r in rows:
-        key = (r.get("phase", ""), r.get("planet", ""))
-        grouped.setdefault(key, []).append(r.get("task", ""))
-
-    lines = [f"<b>Asignaciones de {player_name}</b>", ""]
-    for (phase, planet), tasks in sorted(grouped.items(), key=lambda x: (x[0][0], x[0][1])):
-        title = f"• Fase {phase} – {planet}" if phase else f"• {planet or 'Sin planeta'}"
-        lines.append(title)
-        for t in tasks:
-            lines.append(f"   · {t}")
+    lines = [f"Asignaciones de {alias} (Fase {fase})", ""]
+    for planeta, asigns in por_planeta.items():
+        lines.append(f" {planeta}:")
+        lines.extend(asigns)
+        lines.append("")
     return "\n".join(lines)
 
 
-async def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("Falta TELEGRAM_BOT_TOKEN en config.py o env.")
-    bot = Bot(BOT_TOKEN)
+# ====== Main ======
+async def main_async():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
+    bot = Bot(token=TELEGRAM_TOKEN)
 
-    users = _get_usuarios()
-    if not users:
-        log.info("No hay usuarios en la hoja; nada que enviar.")
-        return
+    ss = open_spreadsheet()
 
-    headers, rows = _get_assignments()
-    if not headers:
-        log.info("No hay hoja de asignaciones o está vacía.")
-        return
+    usuarios = read_sheet(ss, SHEET_USUARIOS)   # user_id, chat_id, username, alias, rol
+    asign = read_sheet(ss, SHEET_ASIGNACIONES)  # fase, planeta, operacion, personaje, jugador, user_id, chat_id
 
-    # Detectar columnas básicas en Usuarios
-    uheaders = [h.strip().lower() for h in (users[0].keys() if users else [])]
-    def uget(rec: Dict[str, str], *cands: str) -> str:
-        for c in cands:
-            for k in rec.keys():
-                if c in k.lower():
-                    return rec.get(k, "")
-        return ""
+    alias_by_uid = {str(u.get("user_id", "")).strip(): str(u.get("alias", "")).strip() for u in usuarios}
+    chat_by_uid = {str(u.get("user_id", "")).strip(): str(u.get("chat_id", "")).strip() for u in usuarios}
 
-    sent = 0
-    for rec in users:
-        chat_id_str = uget(rec, "chat_id")
-        player_name = uget(rec, "player_name", "jugador", "player")
-        if not chat_id_str:
-            continue
-        try:
-            chat_id = int(chat_id_str)
-        except Exception:
-            continue
-        if not player_name:
-            # si no tiene player_name, omitir con aviso leve
-            log.info("Usuario %s sin player_name; se omite", chat_id)
-            continue
+    fases_target = [ASSIGNMENTS_PHASE] if ASSIGNMENTS_PHASE else sorted({str(r.get("fase", "")).strip() for r in asign if str(r.get("fase", "")).strip()})
+    enviados = 0
+    errores = 0
 
-        filtered = _filter_assignments_for(rows, [h.strip() for h in headers], player_name)
-        text = _format_assignments(filtered, player_name)
+    for fase in fases_target:
+        rows_by_uid: Dict[str, List[Dict[str, Any]]] = {}
+        for r in asign:
+            if str(r.get("fase", "")).strip() != str(fase):
+                continue
+            uid = str(r.get("user_id", "")).strip()
+            rows_by_uid.setdefault(uid, []).append(r)
 
-        try:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
-            sent += 1
-        except Exception as e:
-            log.warning("No pude enviar a %s (%s): %s", chat_id, player_name, e)
+        for uid, rows in rows_by_uid.items():
+            chat_id = chat_by_uid.get(uid, "")
+            if not chat_id:
+                continue
+            alias = alias_by_uid.get(uid, uid or "Sin alias")
+            text = build_message(alias, fase, rows)
+            try:
+                await bot.send_message(chat_id=int(chat_id), text=text)
+                enviados += 1
+            except Exception as e:
+                errores += 1
+                print(f"❌ Error al enviar a chat_id={chat_id}: {e}")
+                traceback.print_exc()
 
-        await asyncio.sleep(0.05)  # pequeño respiro para Telegram
+    print(f"✅ Envío finalizado. Mensajes enviados: {enviados}, errores: {errores}")
 
-    log.info("Mensajes enviados: %s", sent)
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
