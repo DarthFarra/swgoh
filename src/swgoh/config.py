@@ -18,6 +18,9 @@ SHEET_SHIPS = os.getenv("SHEET_SHIPS", "Ships")
 SHEET_USERS = os.getenv("SHEET_USERS", "Usuarios")
 SHEET_ASSIGNMENTS = os.getenv("SHEET_ASSIGNMENTS", "Asignaciones ROTE")
 
+# BOT
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+
 # Filtros / otros
 EXCLUDE_BASEID_CONTAINS = [x.strip().upper() for x in os.getenv("EXCLUDE_BASEID_CONTAINS", "").split(",") if x.strip()]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Madrid")
