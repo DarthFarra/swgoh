@@ -100,24 +100,31 @@ def _headers(ws) -> List[str]:
 
 def _ensure_usuarios_headers(ws):
     """
-    Garantiza que la hoja tenga como mínimo las columnas requeridas,
-    SIN borrar datos. Si falta alguna, la añade al final de la cabecera.
+    Garantiza cabecera mínima SIN borrar filas existentes.
+    Si falta alguna columna requerida, la añade al final.
     """
     required = ["user_id", "chat_id", "username", "alias", "rol"]
-
     headers = ws.row_values(1) or []
     if not headers:
         ws.update("A1", [required])
         return
-
     lower = [h.strip().lower() for h in headers]
     added = False
     for col in required:
         if col not in lower:
-            headers.append(col)   # la añadimos al final
+            headers.append(col)   # añade al final
             added = True
     if added:
-        ws.update("1:1", [headers])  # actualiza solo la fila de cabecera
+        ws.update("1:1", [headers])  # solo cabecera
+
+
+def _header_map(ws) -> Dict[str, int]:
+    """
+    Devuelve mapa header_lower -> índice (1-based). Asegura cabecera primero.
+    """
+    _ensure_usuarios_headers(ws)
+    headers = _headers(ws)
+    return {h.strip().lower(): i for i, h in enumerate(headers, start=1)}
 
 
 # =========================
@@ -140,8 +147,8 @@ class RegistroHandler:
         return PEDIR_ALIAS
 
     async def recibir_alias(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        alias = (update.message.text or "").strip()
-        if not alias:
+        alias_input = (update.message.text or "").strip()
+        if not alias_input:
             await update.message.reply_text("El alias no puede estar vacío. Intenta de nuevo.")
             return PEDIR_ALIAS
 
@@ -152,35 +159,91 @@ class RegistroHandler:
         username = f"@{user.username}" if user.username else ""
 
         ws = self.spreadsheet.worksheet(SHEET_USUARIOS)
-        _ensure_usuarios_headers(ws)
+        col = _header_map(ws)  # asegura cabecera y devuelve índices
 
-        records = ws.get_all_records()
-        headers = _headers(ws)
-        lower_map = {h.lower(): i for i, h in enumerate(headers, start=1)}
+        # Leemos todas las filas para buscar coincidencias
+        # Usamos get_all_values para incluir filas con celdas vacías
+        all_vals = ws.get_all_values() or []
+        headers = all_vals[0] if all_vals else []
+        rows = all_vals[1:] if len(all_vals) > 1 else []
 
-        # buscar por user_id
-        target_row = None
-        for idx, rec in enumerate(records, start=2):
-            if str(rec.get("user_id", "")).strip() == user_id:
-                target_row = idx
+        # Helper para obtener celda segura por nombre de columna
+        def cell_val(row: List[str], colname: str) -> str:
+            idx = col.get(colname, 0)
+            return (row[idx - 1].strip() if idx and idx - 1 < len(row) else "")
+
+        # 1) Buscar por user_id exacto
+        row_index_by_uid: Optional[int] = None
+        for i, row in enumerate(rows, start=2):
+            if cell_val(row, "user_id") == user_id:
+                row_index_by_uid = i
                 break
 
-        if target_row is None:
-            # append
-            row = [""] * len(headers)
-            row[lower_map["user_id"] - 1] = user_id
-            row[lower_map["chat_id"] - 1] = chat_id
-            row[lower_map["username"] - 1] = username
-            row[lower_map["alias"] - 1] = alias
-            row[lower_map["rol"] - 1] = "miembro"
-            ws.append_row(row, value_input_option="RAW")
-        else:
-            # actualizar
-            ws.update_cell(target_row, lower_map["chat_id"], chat_id)
-            ws.update_cell(target_row, lower_map["username"], username)
-            ws.update_cell(target_row, lower_map["alias"], alias)
+        if row_index_by_uid:
+            # Ya registrado: actualizamos chat_id y username
+            updates = []
+            if col.get("chat_id"):
+                updates.append((row_index_by_uid, col["chat_id"], chat_id))
+            if col.get("username"):
+                updates.append((row_index_by_uid, col["username"], username))
+            # Si el alias está vacío, rellenamos con el proporcionado
+            current_alias = ws.cell(row_index_by_uid, col["alias"]).value if col.get("alias") else ""
+            if col.get("alias") and not (current_alias or "").strip():
+                updates.append((row_index_by_uid, col["alias"], alias_input))
+            if col.get("rol"):
+                current_rol = ws.cell(row_index_by_uid, col["rol"]).value
+                if not (current_rol or "").strip():
+                    updates.append((row_index_by_uid, col["rol"], "miembro"))
+            for r, c, v in updates:
+                ws.update_cell(r, c, v)
 
-        await update.message.reply_text(f"✅ Registrado como: *{alias}*", parse_mode="Markdown")
+            await update.message.reply_text("✅ Ya estabas registrado. He actualizado tus datos de Telegram.")
+            return ConversationHandler.END
+
+        # 2) Buscar por alias (case-insensitive) con user_id vacío → vincular
+        row_index_by_alias: Optional[int] = None
+        for i, row in enumerate(rows, start=2):
+            a = cell_val(row, "alias")
+            uid_cell = cell_val(row, "user_id")
+            if a and a.lower() == alias_input.lower() and not uid_cell:
+                row_index_by_alias = i
+                break
+
+        if row_index_by_alias:
+            updates = []
+            if col.get("user_id"):
+                updates.append((row_index_by_alias, col["user_id"], user_id))
+            if col.get("chat_id"):
+                updates.append((row_index_by_alias, col["chat_id"], chat_id))
+            if col.get("username"):
+                updates.append((row_index_by_alias, col["username"], username))
+            # Mantener alias tal cual está en la hoja (no lo cambiamos)
+            if col.get("rol"):
+                current_rol = ws.cell(row_index_by_alias, col["rol"]).value
+                if not (current_rol or "").strip():
+                    updates.append((row_index_by_alias, col["rol"], "miembro"))
+            for r, c, v in updates:
+                ws.update_cell(r, c, v)
+
+            await update.message.reply_text("✅ Alias existente vinculado a tu Telegram.")
+            return ConversationHandler.END
+
+        # 3) No hay coincidencias → insertar nueva fila
+        # Construimos una fila con el largo de la cabecera actual
+        new_row = [""] * len(headers)
+        if col.get("user_id"):
+            new_row[col["user_id"] - 1] = user_id
+        if col.get("chat_id"):
+            new_row[col["chat_id"] - 1] = chat_id
+        if col.get("username"):
+            new_row[col["username"] - 1] = username
+        if col.get("alias"):
+            new_row[col["alias"] - 1] = alias_input
+        if col.get("rol"):
+            new_row[col["rol"] - 1] = "miembro"
+        ws.append_row(new_row, value_input_option="RAW")
+
+        await update.message.reply_text(f"✅ Registrado como: *{alias_input}*", parse_mode="Markdown")
         return ConversationHandler.END
 
     async def cancelar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,32 +361,6 @@ class AsignacionOperacionesHandler:
             )
             return
 
-        if data.startswith("op_planeta_"):
-            _, _, fase, planeta = data.split("_", 3)
-            por_jugador: Dict[str, List[str]] = {}
-            for r in datos:
-                if str(r.get("fase", "")) != str(fase):
-                    continue
-                if str(r.get("planeta", "")).strip() != planeta:
-                    continue
-                uid = str(r.get("user_id", "")).strip()
-                alias = alias_map.get(uid, uid or "Sin alias")
-                pers = str(r.get("personaje", "Sin personaje")).strip()
-                oper = str(r.get("operacion", "Sin operación")).strip()
-                por_jugador.setdefault(alias, []).append(f"- {pers} ({oper})")
-
-            if not por_jugador:
-                await query.edit_message_text(f"Sin asignaciones en Fase {fase} / {planeta}.")
-                return
-
-            lines = [f"Operaciones – Fase {fase} / {planeta}", ""]
-            for alias, tareas in sorted(por_jugador.items()):
-                lines.append(f"{alias}:")
-                lines.extend(tareas)
-                lines.append("")
-            await query.edit_message_text("\n".join(lines))
-            return
-
     # ---------- /operacionesjugador (oficiales por fase→jugador) ----------
     async def cmd_operaciones_jugador(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._es_oficial(update.effective_user.id):
@@ -392,7 +429,7 @@ class AsignacionOperacionesHandler:
             # Oficiales
             CommandHandler("operaciones", self.cmd_operaciones),
             CallbackQueryHandler(self.cb_operaciones, pattern=r"^op_fase_\d+$"),
-            CallbackQueryHandler(self.cb_operaciones, pattern=r"^op_planeta_"),
+            # el callback de planeta ya está dentro de cb_operaciones
 
             CommandHandler("operacionesjugador", self.cmd_operaciones_jugador),
             CallbackQueryHandler(self.cb_operaciones_jugador, pattern=r"^opj_fase_\d+$"),
