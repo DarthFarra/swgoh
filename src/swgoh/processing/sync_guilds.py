@@ -1,3 +1,5 @@
+# src/swgoh/processing/sync_guilds.py
+
 from typing import Any, Dict, List, Tuple, Optional, Set
 import json
 
@@ -14,12 +16,13 @@ from ..comlink import fetch_metadata, fetch_data_items, fetch_guild, fetch_playe
 
 
 # ---------------------------
-# Helpers
+# Helpers: lectura de nombres amigables desde Sheets
 # ---------------------------
 
 def _read_friendly_map() -> Dict[str, str]:
     """
     Lee las hojas Characters y Ships para construir baseId -> friendlyName.
+    (No usamos /localization en este script.)
     """
     def read(ws) -> Dict[str, str]:
         mapping = {}
@@ -55,6 +58,10 @@ def _read_friendly_map() -> Dict[str, str]:
     }
 
 
+# ---------------------------
+# Helpers: GAC League unificada
+# ---------------------------
+
 def _gac_league_str(p: Dict[str, Any]) -> str:
     prs = (
         p.get("playerRating", {}).get("playerRankStatus")
@@ -74,10 +81,14 @@ def _gac_league_str(p: Dict[str, Any]) -> str:
     return str(league_id).upper() if league_id else ""
 
 
+# ---------------------------
+# Helpers: indexar roster y formato de reliquia
+# ---------------------------
+
 def _build_roster_index(p: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """
     Devuelve un índice baseId(UPPER)->rosterUnit a partir de p['rosterUnit'].
-    Usa definitionId y corta en ':'.
+    Usa definitionId y corta en ':' (ej: BARRISSOFFEE:SEVEN_STAR → BARRISSOFFEE).
     """
     roster = p.get("rosterUnit") or p.get("payload", {}).get("rosterUnit") or []
     by_unit: Dict[str, Dict[str, Any]] = {}
@@ -106,6 +117,54 @@ def _format_relic_cell(ru: Dict[str, Any]) -> str:
 
 
 # ---------------------------
+# Helpers: construir cabeceras de Player_Units con filtro por baseId
+# ---------------------------
+
+def _collect_unit_headers(units_arr: List[Dict[str, Any]], friendly_map: Dict[str, str]) -> Tuple[List[str], Set[str], List[str]]:
+    """
+    Aplica EXCLUDE_BASEID_CONTAINS sobre baseId (en mayúsculas) ANTES de deduplicar,
+    separa naves (combatType==2) y genera headers con friendly name desde Sheets.
+    Devuelve: (unit_ids_filtrados_y_ordenados, ship_ids, headers_units)
+    """
+    excl = {s.upper() for s in (EXCLUDE_BASEID_CONTAINS or [])}
+
+    all_ids: List[str] = []
+    ship_ids: Set[str] = set()
+
+    for u in units_arr:
+        bid = (u.get("baseId") or u.get("id") or "").strip().upper()
+        if not bid:
+            continue
+        if excl and any(x in bid for x in excl):
+            continue
+        all_ids.append(bid)
+
+        ctype = u.get("combatType") or u.get("combat_type")
+        try:
+            ctype = int(ctype)
+        except Exception:
+            ctype = None
+        if ctype == 2:
+            ship_ids.add(bid)
+
+    # dedup + orden estable
+    unit_ids = sorted(set(all_ids))
+
+    # headers amigables (desambiguando duplicados)
+    headers_units: List[str] = []
+    seen_names: Set[str] = set()
+    for b in unit_ids:
+        name = str(friendly_map.get(b) or b)
+        if name in seen_names:
+            name = f"{name} ({b})"
+        seen_names.add(name)
+        headers_units.append(name)
+
+    print(f"[INFO] Player_Units columnas: {len(unit_ids)} (ships: {len(ship_ids)})")
+    return unit_ids, ship_ids, headers_units
+
+
+# ---------------------------
 # Proceso principal
 # ---------------------------
 
@@ -123,41 +182,11 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
     du = fetch_data_items(version, "units")
     units_arr = du.get("units") or du.get("payload", {}).get("units") or []
 
-    # friendly names desde sheets
+    # friendly names desde Sheets
     friendly_map = _read_friendly_map()
 
-    # unit baseIds + ships
-    unit_ids: List[str] = []
-    ship_ids: Set[str] = set()
-    for u in units_arr:
-        bid = (u.get("baseId") or u.get("id") or "").upper()
-        if not bid:
-            continue
-        unit_ids.append(bid)
-        ctype = u.get("combatType") or u.get("combat_type")
-        try:
-            ctype = int(ctype)
-        except Exception:
-            ctype = None
-        if ctype == 2:
-            ship_ids.add(bid)
-
-    # filtro de EXCLUDE
-    if EXCLUDE_BASEID_CONTAINS:
-        unit_ids = [b for b in set(unit_ids) if all(ex not in b for ex in EXCLUDE_BASEID_CONTAINS)]
-        ship_ids = {b for b in ship_ids if b in set(unit_ids)}
-    else:
-        unit_ids = sorted(list(set(unit_ids)))
-
-    # headers amigables, desambiguando duplicados
-    headers_units: List[str] = []
-    seen_names: Set[str] = set()
-    for b in sorted(unit_ids):
-        name = str(friendly_map.get(b) or b)
-        if name in seen_names:
-            name = f"{name} ({b})"
-        seen_names.add(name)
-        headers_units.append(name)
+    # Construir columnas de Player_Units con filtro por baseId
+    unit_ids, ship_ids, headers_units = _collect_unit_headers(units_arr, friendly_map)
 
     # 2) Preparar hojas
     ws_guilds = open_or_create(SHEET_GUILDS)
@@ -178,6 +207,7 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
 
     # 3) Por cada guild
     for gid in gids:
+        # Nota: en comlink.fetch_guild ya añadimos includeRecentGuildActivityInfo=true
         g = fetch_guild(gid)
         gg = g.get("guild") or g.get("payload", {}).get("guild") or g
         profile = gg.get("profile", {})
@@ -191,12 +221,11 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
         except Exception:
             ggp = 0
 
-        # Last Raid desde /guild.lastRaidPointsSummary
+        # Last Raid desde lastRaidPointsSummary
         last_raid_id, last_raid_points = "", ""
         lrs = gg.get("lastRaidPointsSummary") or profile.get("lastRaidPointsSummary")
         if isinstance(lrs, list) and lrs:
             first = lrs[0] or {}
-            # identifier es un objeto → guardamos JSON textual para ver qué raid es
             last_raid_id = json.dumps(first.get("identifier", {}), ensure_ascii=False)
             pts = first.get("totalPoints")
             if isinstance(pts, (int, float)):
@@ -211,7 +240,6 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
             ally = str(ally) if ally not in (None, "") else ""
 
             # /player con UNA sola clave (playerId si existe; si no, allyCode)
-            p = {}
             try:
                 p = fetch_player(pid if pid else None, None if pid else ally)
             except Exception as e:
@@ -239,9 +267,9 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
             # Índice de roster por baseId (UPPER)
             by_unit = _build_roster_index(p)
 
-            # Fila de unidades: [Guild Name, Player Name, ...units...]
+            # Fila de unidades: [Guild, Player, ...units filtradas y ordenadas...]
             row_u = [gname, pname]
-            for b in sorted(unit_ids):
+            for b in unit_ids:  # usar EXACTAMENTE el mismo orden de columnas
                 ru = by_unit.get(b)
                 if not ru:
                     row_u.append("")
@@ -260,7 +288,7 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
     # 4) Escribir hojas
     write_sheet(ws_guilds, ["Guild Id", "Guild Name", "Number of members", "Guild GP", "Last Raid Id", "Last Raid Score"], guilds_rows)
     write_sheet(ws_players, ["Guild Name", "Player Name", "Player Id", "Ally code", "GP", "Role", "GAC League"], players_rows)
-    write_sheet(ws_units, ["Player Guild", "Player Name", *sorted(headers_units)], units_rows)
+    write_sheet(ws_units, ["Player Guild", "Player Name", *headers_units], units_rows)
 
     return {
         "guilds": len(guilds_rows),
