@@ -20,10 +20,6 @@ from ..comlink import fetch_metadata, fetch_data_items, fetch_guild, fetch_playe
 # ---------------------------
 
 def _read_friendly_map() -> Dict[str, str]:
-    """
-    Lee las hojas Characters y Ships para construir baseId -> friendlyName.
-    (No usamos /localization en este script.)
-    """
     def read(ws) -> Dict[str, str]:
         mapping = {}
         if not ws:
@@ -86,10 +82,6 @@ def _gac_league_str(p: Dict[str, Any]) -> str:
 # ---------------------------
 
 def _build_roster_index(p: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """
-    Devuelve un índice baseId(UPPER)->rosterUnit a partir de p['rosterUnit'].
-    Usa definitionId y corta en ':' (ej: BARRISSOFFEE:SEVEN_STAR → BARRISSOFFEE).
-    """
     roster = p.get("rosterUnit") or p.get("payload", {}).get("rosterUnit") or []
     by_unit: Dict[str, Dict[str, Any]] = {}
     for ru in roster:
@@ -117,15 +109,42 @@ def _format_relic_cell(ru: Dict[str, Any]) -> str:
 
 
 # ---------------------------
-# Helpers: construir cabeceras de Player_Units con filtro por baseId
+# Helpers: allyCode solo desde /player
+# ---------------------------
+
+def _extract_nested(d: Dict[str, Any], path: List[str]) -> Optional[Any]:
+    cur: Any = d
+    for p in path:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return None
+    return cur
+
+def _ally_from_player(p: Dict[str, Any]) -> str:
+    """
+    Busca allyCode SOLO en la respuesta de /player.
+    """
+    paths = [
+        ["allyCode"], ["allycode"], ["ally"],
+        ["profile", "allyCode"],
+        ["payload", "allyCode"],
+        ["payload", "profile", "allyCode"],
+        ["data", "allyCode"],
+        ["data", "profile", "allyCode"],
+    ]
+    for path in paths:
+        v = _extract_nested(p, path)
+        if v not in (None, ""):
+            return str(v)
+    return ""
+
+
+# ---------------------------
+# Helpers: cabeceras Player_Units con filtro por baseId
 # ---------------------------
 
 def _collect_unit_headers(units_arr: List[Dict[str, Any]], friendly_map: Dict[str, str]) -> Tuple[List[str], Set[str], List[str]]:
-    """
-    Aplica EXCLUDE_BASEID_CONTAINS sobre baseId (en mayúsculas) ANTES de deduplicar,
-    separa naves (combatType==2) y genera headers con friendly name desde Sheets.
-    Devuelve: (unit_ids_filtrados_y_ordenados, ship_ids, headers_units)
-    """
     excl = {s.upper() for s in (EXCLUDE_BASEID_CONTAINS or [])}
 
     all_ids: List[str] = []
@@ -147,10 +166,8 @@ def _collect_unit_headers(units_arr: List[Dict[str, Any]], friendly_map: Dict[st
         if ctype == 2:
             ship_ids.add(bid)
 
-    # dedup + orden estable
     unit_ids = sorted(set(all_ids))
 
-    # headers amigables (desambiguando duplicados)
     headers_units: List[str] = []
     seen_names: Set[str] = set()
     for b in unit_ids:
@@ -207,7 +224,6 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
 
     # 3) Por cada guild
     for gid in gids:
-        # Nota: en comlink.fetch_guild ya añadimos includeRecentGuildActivityInfo=true
         g = fetch_guild(gid)
         gg = g.get("guild") or g.get("payload", {}).get("guild") or g
         profile = gg.get("profile", {})
@@ -236,17 +252,20 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
         # Miembros
         for m in members:
             pid = str(m.get("playerId") or m.get("playerID") or m.get("id") or "").strip()
-            ally = m.get("allyCode") or m.get("allycode") or m.get("ally")
-            ally = str(ally) if ally not in (None, "") else ""
+            if not pid:
+                print(f"[WARN] miembro sin playerId en guild {gname}; se omite fila.")
+                continue
 
-            # /player con UNA sola clave (playerId si existe; si no, allyCode)
+            # /player SOLO con playerId (allyCode solo se obtiene desde /player)
             try:
-                p = fetch_player(pid if pid else None, None if pid else ally)
+                p = fetch_player(pid, None)
             except Exception as e:
-                print(f"[WARN] fallo /player pid={pid} ally={ally}: {e}")
+                print(f"[WARN] fallo /player pid={pid}: {e}")
                 p = {}
 
-            pname = (m.get("playerName") or m.get("name") or p.get("name") or "").strip() or (ally or pid or "")
+            ally = _ally_from_player(p)
+
+            pname = (m.get("playerName") or m.get("name") or p.get("name") or "").strip() or (ally or pid)
             role_val = 2
             try:
                 role_val = int(m.get("memberLevel") or 2)
@@ -269,7 +288,7 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
 
             # Fila de unidades: [Guild, Player, ...units filtradas y ordenadas...]
             row_u = [gname, pname]
-            for b in unit_ids:  # usar EXACTAMENTE el mismo orden de columnas
+            for b in unit_ids:
                 ru = by_unit.get(b)
                 if not ru:
                     row_u.append("")
@@ -277,13 +296,11 @@ def run(guild_ids: Optional[List[str]] = None) -> Dict[str, int]:
                     row_u.append("Nave" if b in ship_ids else _format_relic_cell(ru))
             units_rows.append(row_u)
 
-            # Fila de players
-            players_rows.append([gname, pname, pid, ally, str(gp), role, gac])
+            # Fila de players (allycode desde /player)
+            players_rows.append([gname, pname, pid, str(ally or ""), str(gp), role, gac])
 
         # Fila de guilds
-        guilds_rows.append(
-            [gid, gname, str(mcount), str(ggp), last_raid_id, last_raid_points]
-        )
+        guilds_rows.append([gid, gname, str(mcount), str(ggp), last_raid_id, last_raid_points])
 
     # 4) Escribir hojas
     write_sheet(ws_guilds, ["Guild Id", "Guild Name", "Number of members", "Guild GP", "Last Raid Id", "Last Raid Score"], guilds_rows)
