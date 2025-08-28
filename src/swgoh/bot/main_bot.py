@@ -99,16 +99,25 @@ def _headers(ws) -> List[str]:
 
 
 def _ensure_usuarios_headers(ws):
-    hdr = _headers(ws)
-    need = ["user_id", "chat_id", "username", "alias", "rol"]
-    if not hdr:
-        ws.update("A1", [need])
+    """
+    Garantiza que la hoja tenga como mínimo las columnas requeridas,
+    SIN borrar datos. Si falta alguna, la añade al final de la cabecera.
+    """
+    required = ["user_id", "chat_id", "username", "alias", "rol"]
+
+    headers = ws.row_values(1) or []
+    if not headers:
+        ws.update("A1", [required])
         return
-    lower = [h.lower() for h in hdr]
-    if any(c not in lower for c in need):
-        # rehacer cabecera mínima
-        ws.clear()
-        ws.update("A1", [need])
+
+    lower = [h.strip().lower() for h in headers]
+    added = False
+    for col in required:
+        if col not in lower:
+            headers.append(col)   # la añadimos al final
+            added = True
+    if added:
+        ws.update("1:1", [headers])  # actualiza solo la fila de cabecera
 
 
 # =========================
