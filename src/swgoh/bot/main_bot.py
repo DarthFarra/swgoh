@@ -129,9 +129,10 @@ def _header_map(ws) -> Dict[str, int]:
 
 # =========================
 # Registro (/register): LÓGICA EXACTA
+# 0) ENTRADA: comprobar por user_id ANTES de pedir alias.
 # 1) Si hay user_id -> mensaje "ya estás registrado" (NO escribe nada)
-# 2) Si no, busca alias (case-insensitive) con user_id vacío -> rellena user_id/chat_id/username (rol si falta)
-# 3) Si no, inserta nueva fila con esos datos
+# 2) Si no, luego (cuando mande alias) buscar alias (CI) con user_id vacío -> rellenar user_id/chat_id/username (rol si falta)
+# 3) Si no, insertar nueva fila
 # =========================
 PEDIR_ALIAS = 1
 
@@ -140,8 +141,31 @@ class RegistroHandler:
         self.spreadsheet = spreadsheet
 
     async def iniciar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/register: primero comprobar si ya está registrado por user_id; si sí, no pedimos alias."""
         ws = self.spreadsheet.worksheet(SHEET_USUARIOS)
-        _ensure_usuarios_headers(ws)
+        col = _header_map(ws)
+
+        all_vals = ws.get_all_values() or []
+        rows = all_vals[1:] if len(all_vals) > 1 else []
+
+        user_id = str(update.effective_user.id)
+
+        def cell_val(row: List[str], colname: str) -> str:
+            idx = col.get(colname, 0)
+            return (row[idx - 1].strip() if idx and idx - 1 < len(row) else "")
+
+        # Check previo: ¿ya registrado por user_id?
+        for row in rows:
+            if cell_val(row, "user_id") == user_id:
+                alias_actual = cell_val(row, "alias")
+                alias_txt = f" como *{alias_actual}*" if alias_actual else ""
+                await update.message.reply_text(
+                    f"✅ Ya estás registrado{alias_txt}.",
+                    parse_mode="Markdown",
+                )
+                return ConversationHandler.END
+
+        # Si no está registrado, entonces pedimos alias
         await update.message.reply_text(
             "¡Hola! 😊\n"
             "Envíame tu *alias* (como aparecerá en la hoja) para registrarte.",
@@ -169,12 +193,11 @@ class RegistroHandler:
         headers = all_vals[0] if all_vals else []
         rows = all_vals[1:] if len(all_vals) > 1 else []
 
-        # Helper para obtener celda segura por nombre de columna
         def cell_val(row: List[str], colname: str) -> str:
             idx = col.get(colname, 0)
             return (row[idx - 1].strip() if idx and idx - 1 < len(row) else "")
 
-        # === 1) Buscar por user_id exacto → solo mensaje, sin escribir ===
+        # (Defensivo) por si alguien llama recibir_alias manualmente: re-chequear user_id
         for i, row in enumerate(rows, start=2):
             if cell_val(row, "user_id") == user_id:
                 alias_actual = cell_val(row, "alias")
@@ -185,7 +208,7 @@ class RegistroHandler:
                 )
                 return ConversationHandler.END
 
-        # === 2) Buscar por alias (CI) con user_id vacío → vincular rellenando datos ===
+        # 2) Buscar por alias (CI) con user_id vacío → vincular rellenando datos
         row_index_by_alias: Optional[int] = None
         for i, row in enumerate(rows, start=2):
             a = cell_val(row, "alias")
@@ -212,7 +235,7 @@ class RegistroHandler:
             await update.message.reply_text("✅ Alias existente vinculado a tu Telegram.")
             return ConversationHandler.END
 
-        # === 3) No hay coincidencias → insertar nueva fila ===
+        # 3) No hay coincidencias → insertar nueva fila
         new_row = [""] * len(headers)
         if col.get("user_id"):
             new_row[col["user_id"] - 1] = user_id
