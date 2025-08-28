@@ -339,4 +339,119 @@ class AsignacionOperacionesHandler:
                 return
             kb = [[InlineKeyboardButton(p, callback_data=f"op_planeta_{fase}_{p}")] for p in planetas]
             await query.edit_message_text(
-                f"F
+                f"Fase {fase}: elige un planeta",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+            return
+
+    # ---------- /operacionesjugador (oficiales por fase→jugador) ----------
+    async def cmd_operaciones_jugador(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._es_oficial(update.effective_user.id):
+            await update.message.reply_text("⛔ No tienes permisos para usar /operacionesjugador.")
+            return
+        kb = [[InlineKeyboardButton(f"Fase {f}", callback_data=f"opj_fase_{f}")] for f in self.fases]
+        await update.message.reply_text("Elige una fase:", reply_markup=InlineKeyboardMarkup(kb))
+
+    async def cb_operaciones_jugador(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        datos = self._leer_asignaciones()
+        alias_map = self._alias_map()
+
+        if data.startswith("opj_fase_"):
+            fase = data.split("_")[-1]
+            jugadores = []
+            for r in datos:
+                if str(r.get("fase", "")) == str(fase):
+                    uid = str(r.get("user_id", "")).strip()
+                    alias = alias_map.get(uid, uid or "Sin alias")
+                    jugadores.append(alias)
+            jugadores = sorted(set(jugadores))
+            if not jugadores:
+                await query.edit_message_text(f"No hay asignaciones en fase {fase}.")
+                return
+            kb = [[InlineKeyboardButton(j, callback_data=f"opj_jugador_{fase}_{j}")] for j in jugadores]
+            await query.edit_message_text(
+                f"Fase {fase}: elige jugador",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+            return
+
+        if data.startswith("opj_jugador_"):
+            _, _, fase, jugador_alias = data.split("_", 3)
+            lines = [f"Asignaciones de {jugador_alias} (Fase {fase})", ""]
+            por_planeta: Dict[str, List[str]] = {}
+            for r in datos:
+                if str(r.get("fase", "")) != str(fase):
+                    continue
+                uid = str(r.get("user_id", "")).strip()
+                alias = alias_map.get(uid, uid or "Sin alias")
+                if alias != jugador_alias:
+                    continue
+                planeta = str(r.get("planeta", "Sin planeta")).strip()
+                oper = str(r.get("operacion", "Sin operación")).strip()
+                pers = str(r.get("personaje", "Sin personaje")).strip()
+                por_planeta.setdefault(planeta, []).append(f"- {pers} ({oper})")
+            if not por_planeta:
+                await query.edit_message_text(f"Sin asignaciones en Fase {fase} para {jugador_alias}.")
+                return
+            for planeta, asigns in por_planeta.items():
+                lines.append(f" {planeta}:")
+                lines.extend(asigns)
+                lines.append("")
+            await query.edit_message_text("\n".join(lines))
+            return
+
+    def get_handlers(self):
+        return [
+            # Abierto
+            CommandHandler("misoperaciones", self.cmd_misoperaciones),
+            CallbackQueryHandler(self.cb_misoperaciones, pattern=r"^misop_fase_\d+$"),
+
+            # Oficiales
+            CommandHandler("operaciones", self.cmd_operaciones),
+            CallbackQueryHandler(self.cb_operaciones, pattern=r"^op_fase_\d+$"),
+
+            CommandHandler("operacionesjugador", self.cmd_operaciones_jugador),
+            CallbackQueryHandler(self.cb_operaciones_jugador, pattern=r"^opj_fase_\d+$"),
+            CallbackQueryHandler(self.cb_operaciones_jugador, pattern=r"^opj_jugador_"),
+        ]
+
+
+# =========================
+# App
+# =========================
+async def _post_init(app: Application) -> None:
+    # Desactiva cualquier webhook antiguo para que funcione polling
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook eliminado; polling activado.")
+    except Exception as e:
+        log.warning("No pude eliminar webhook (quizá no existía): %s", e)
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN en variables de entorno")
+    if not SPREADSHEET_ID:
+        raise RuntimeError("Falta SPREADSHEET_ID en variables de entorno")
+
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
+
+    # 1) Conectar a Google Sheets
+    spreadsheet = init_spreadsheet()
+
+    # 2) Registro (/register)
+    registro = RegistroHandler(spreadsheet)
+    app.add_handler(registro.get_handler())
+
+    # 3) Operaciones (/misoperaciones, /operaciones, /operacionesjugador)
+    asign = AsignacionOperacionesHandler(spreadsheet)
+    for h in asign.get_handlers():
+        app.add_handler(h)
+
+    log.info("🤖 Bot en marcha (polling)…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
