@@ -250,7 +250,7 @@ class RegistroMultiGuildHandler:
         if data == "reg_method_alias":
             context.user_data["register_method"] = "alias"
             await query.edit_message_text(
-                "Perfecto. Envíame tu *alias de jugador* exactamente como aparece en la pestaña *Players*.",
+                "Perfecto. Envíame tu *alias de jugador* exactamente como en el juego.",
                 parse_mode="Markdown",
             )
             return ASK_ALIAS
@@ -281,7 +281,7 @@ class RegistroMultiGuildHandler:
         ok, row = self._lookup_player(guild_name=guild_name, alias=text, allycode=None)
         if not ok or not row:
             await update.message.reply_text(
-                "❌ No encontré ese *alias* en la pestaña *Players* para el gremio seleccionado.",
+                "❌ No encontré ese *alias* para el gremio seleccionado. Reinicia con /register.",
                 parse_mode="Markdown",
             )
             return ConversationHandler.END
@@ -304,7 +304,7 @@ class RegistroMultiGuildHandler:
         ok, row = self._lookup_player(guild_name=guild_name, alias=None, allycode=text)
         if not ok or not row:
             await update.message.reply_text(
-                "❌ No encontré ese *código de aliado* en la pestaña *Players* para el gremio seleccionado.",
+                "❌ No encontré ese *código de aliado* para el gremio seleccionado. Reinicia con /register.",
                 parse_mode="Markdown",
             )
             return ConversationHandler.END
