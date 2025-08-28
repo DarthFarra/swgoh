@@ -3,6 +3,7 @@ import os
 import json
 import base64
 import logging
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
@@ -116,16 +117,6 @@ def _ensure_usuarios_headers(ws) -> Dict[str, int]:
     return _ensure_headers(ws, ["guild_name", "user_id", "chat_id", "username", "alias", "rol", "allycode"])
 
 
-def _sheet_records_lower(spreadsheet, sheet_name: str) -> List[Dict[str, Any]]:
-    ws = spreadsheet.worksheet(sheet_name)
-    rows = ws.get_all_records()
-    return [{(k or "").strip().lower(): v for k, v in r.items()} for r in rows]
-
-
-def _sanitize_allycode(s: str) -> str:
-    return "".join(ch for ch in str(s) if ch.isdigit())
-
-
 def _read_all_values(ss, sheet_name: str) -> Tuple[List[str], List[List[str]]]:
     ws = ss.worksheet(sheet_name)
     vals = ws.get_all_values() or []
@@ -140,6 +131,69 @@ def _header_index_map(headers: List[str]) -> Dict[str, int]:
     return {h.strip().lower(): i for i, h in enumerate(headers)}
 
 
+def _sanitize_allycode(s: str) -> str:
+    return "".join(ch for ch in str(s) if ch.isdigit())
+
+
+# =========================
+# Helpers UI (botones con nombre abreviado)
+# =========================
+def _clean_label(s: str) -> str:
+    """Normaliza y elimina invisibles; además colapsa espacios."""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFC", str(s))
+    invisibles = ["\u200b", "\u200c", "\u200d", "\ufeff", "\u2066", "\u2067", "\u2068", "\u2069"]
+    for ch in invisibles:
+        s = s.replace(ch, "")
+    s = " ".join(s.split())
+    return s
+
+
+def _build_label_keyboard(labels: List[str], prefix: str, per_row: int = 3) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for i, lab in enumerate(labels):
+        row.append(InlineKeyboardButton(lab, callback_data=f"{prefix}{i}"))
+        if len(row) == per_row:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def _guilds_with_abbrev(ss) -> Tuple[List[str], List[str]]:
+    """
+    Lee Guilds y devuelve (guild_names, display_names) donde display_names usa la columna 'nombre abreviado'
+    si existe, o cae en Guild Name si no.
+    """
+    headers, rows = _read_all_values(ss, SHEET_GUILDS)
+    if not headers:
+        return [], []
+    hmap = _header_index_map(headers)
+    def gv(row: List[str], name: str) -> str:
+        i = hmap.get(name.lower(), -1)
+        return (row[i].strip() if 0 <= i < len(row) else "")
+    guild_names: List[str] = []
+    display_names: List[str] = []
+    for r in rows:
+        gname = gv(r, "Guild Name")
+        if not gname:
+            continue
+        abre = gv(r, "nombre abreviado") or gname
+        guild_names.append(gname)
+        display_names.append(_clean_label(abre))
+    return guild_names, display_names
+
+
+def _abbrev_map(ss) -> Dict[str, str]:
+    """
+    Mapa {Guild Name -> nombre abreviado (o Guild Name si falta)} para mostrar en /misoperaciones.
+    """
+    gnames, dnames = _guilds_with_abbrev(ss)
+    return {g: d for g, d in zip(gnames, dnames)}
+
+
 # =========================
 # Registro multi-gremio
 # =========================
@@ -151,40 +205,21 @@ class RegistroMultiGuildHandler:
     def __init__(self, spreadsheet):
         self.ss = spreadsheet
 
-    # ----- /register: elegir gremio -----
+    # ----- /register: elegir gremio (muestra 'nombre abreviado') -----
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        ws_guilds = self.ss.worksheet(SHEET_GUILDS)
-        guild_rows = ws_guilds.get_all_records()
-        names: List[str] = []
-        for r in guild_rows:
-            name = str(
-                r.get("Guild Name")
-                or r.get("guild name")
-                or r.get("Name")
-                or r.get("name")
-                or ""
-            ).strip()
-            if name:
-                names.append(name)
-
-        if not names:
+        guild_names, display_names = _guilds_with_abbrev(self.ss)
+        if not guild_names:
             await update.message.reply_text("No hay gremios configurados en la hoja Guilds.")
             return ConversationHandler.END
 
-        context.user_data["register_guild_list"] = names
+        # Guardamos ambas listas (mostramos display, usamos guild_names para la lógica)
+        context.user_data["register_guild_names"] = guild_names
+        context.user_data["register_guild_display"] = display_names
 
-        # Teclado inline (3 por fila)
-        buttons: List[List[InlineKeyboardButton]] = []
-        row: List[InlineKeyboardButton] = []
-        for i, name in enumerate(names):
-            row.append(InlineKeyboardButton(name, callback_data=f"reg_guild_idx_{i}"))
-            if len(row) == 3:
-                buttons.append(row)
-                row = []
-        if row:
-            buttons.append(row)
-
-        await update.message.reply_text("Elige tu gremio:", reply_markup=InlineKeyboardMarkup(buttons))
+        await update.message.reply_text(
+            "Elige tu gremio:",
+            reply_markup=_build_label_keyboard(display_names, prefix="reg_guild_idx_", per_row=3),
+        )
         return CHOOSE_GUILD
 
     # ----- Callback elección de gremio -----
@@ -203,12 +238,14 @@ class RegistroMultiGuildHandler:
             await query.edit_message_text("Selección inválida.")
             return ConversationHandler.END
 
-        names: List[str] = context.user_data.get("register_guild_list") or []
-        if idx < 0 or idx >= len(names):
+        gnames: List[str] = context.user_data.get("register_guild_names") or []
+        gdisp:  List[str] = context.user_data.get("register_guild_display") or []
+        if idx < 0 or idx >= len(gnames):
             await query.edit_message_text("Selección inválida.")
             return ConversationHandler.END
 
-        guild_name = names[idx]
+        guild_name = gnames[idx]
+        guild_disp = gdisp[idx] if idx < len(gdisp) else guild_name
         context.user_data["register_guild_name"] = guild_name
 
         # Ya registrado en (user_id + guild_name)?
@@ -227,7 +264,7 @@ class RegistroMultiGuildHandler:
         for row in rows:
             if cell_val(row, "user_id") == user_id and cell_val(row, "guild_name") == guild_name:
                 await query.edit_message_text(
-                    f"✅ Ya estás registrado en el gremio: *{guild_name}*.",
+                    f"✅ Ya estás registrado en el gremio: *{guild_disp}*.",
                     parse_mode="Markdown",
                 )
                 return ConversationHandler.END
@@ -237,7 +274,7 @@ class RegistroMultiGuildHandler:
             [InlineKeyboardButton("Registrar por Allycode", callback_data="reg_method_ally")],
         ]
         await query.edit_message_text(
-            f"Gremio seleccionado: *{guild_name}*\n\n¿Cómo quieres registrarte?",
+            f"Gremio seleccionado: *{guild_disp}*\n\n¿Cómo quieres registrarte?",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -412,34 +449,40 @@ class MisOperacionesHandler:
         self.fases = [str(i) for i in range(1, 7)]  # "1".."6"
 
     async def cmd_misoperaciones(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Permite elegir gremio (si hay varios) y luego fase."""
+        """Permite elegir gremio (si hay varios) y luego fase. Muestra 'nombre abreviado' en botones."""
         user_id = str(update.effective_user.id)
-        guilds = self._user_guilds(user_id)
+        guilds = self._user_guilds(user_id)  # Guild Name completos almacenados en Usuarios
         if not guilds:
             await update.message.reply_text("No encuentro tu registro en ningún gremio. Usa /register primero.")
             return ConversationHandler.END
 
+        # Construir mapa de abreviados para mostrar
+        amap = _abbrev_map(self.ss)
+        labels = [_clean_label(amap.get(g, g)) for g in guilds]
+
         if len(guilds) == 1:
             guild_name = guilds[0]
             context.user_data["misop_guild"] = guild_name
-            await self._ask_phase(update, context, guild_name)
+            await self._ask_phase(update, context, amap.get(guild_name, guild_name))
             return ConversationHandler.END
 
-        # Varios gremios -> elegir
-        buttons = [[InlineKeyboardButton(g, callback_data=f"misop_guild_{i}")] for i, g in enumerate(guilds)]
-        context.user_data["misop_guild_list"] = guilds
-        await update.message.reply_text("Elige el gremio:", reply_markup=InlineKeyboardMarkup(buttons))
+        # Varios gremios -> elegir por botones (abreviados)
+        context.user_data["misop_guild_list"] = guilds  # seguimos guardando nombres completos
+        await update.message.reply_text(
+            "Elige el gremio:",
+            reply_markup=_build_label_keyboard(labels, prefix="misop_guild_idx_", per_row=3),
+        )
         return MISOP_CHOOSE_GUILD
 
     async def cb_choose_guild(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
         data = query.data
-        if not data.startswith("misop_guild_"):
+        if not data.startswith("misop_guild_idx_"):
             await query.edit_message_text("Selección inválida.")
             return ConversationHandler.END
         try:
-            idx = int(data.split("misop_guild_", 1)[1])
+            idx = int(data.split("misop_guild_idx_", 1)[1])
         except Exception:
             await query.edit_message_text("Selección inválida.")
             return ConversationHandler.END
@@ -449,9 +492,11 @@ class MisOperacionesHandler:
             return ConversationHandler.END
         guild_name = guilds[idx]
         context.user_data["misop_guild"] = guild_name
-        await query.edit_message_text(f"Gremio: *{guild_name}*", parse_mode="Markdown")
+
+        amap = _abbrev_map(self.ss)
+        await query.edit_message_text(f"Gremio: *{amap.get(guild_name, guild_name)}*", parse_mode="Markdown")
         # preguntar fase
-        await self._ask_phase(query, context, guild_name)
+        await self._ask_phase(query, context, amap.get(guild_name, guild_name))
         return ConversationHandler.END
 
     async def cb_choose_phase(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,17 +516,17 @@ class MisOperacionesHandler:
         text = self._build_assignments_text(guild_name, str(update.effective_user.id), fase)
         await query.edit_message_text(text, disable_web_page_preview=True, parse_mode="Markdown")
 
-    async def _ask_phase(self, update_or_query: Update, context: ContextTypes.DEFAULT_TYPE, guild_name: str):
+    async def _ask_phase(self, update_or_query: Update, context: ContextTypes.DEFAULT_TYPE, guild_label: str):
         kb = [[InlineKeyboardButton(f"Fase {f}", callback_data=f"misop_fase_{f}")] for f in self.fases]
         if isinstance(update_or_query, Update) and update_or_query.message:
             await update_or_query.message.reply_text(
-                f"Gremio activo: *{guild_name}*\nElige una fase:",
+                f"Gremio activo: *{guild_label}*\nElige una fase:",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb),
             )
         else:
             await update_or_query.edit_message_text(
-                f"Gremio activo: *{guild_name}*\nElige una fase:",
+                f"Gremio activo: *{guild_label}*\nElige una fase:",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb),
             )
@@ -511,22 +556,6 @@ class MisOperacionesHandler:
             if g not in seen:
                 out.append(g); seen.add(g)
         return out
-
-    def _alias_for_user(self, user_id: str, guild_name: str) -> Optional[str]:
-        ws = self.ss.worksheet(SHEET_USUARIOS)
-        col = _ensure_usuarios_headers(ws)
-        vals = ws.get_all_values() or []
-        rows = vals[1:] if len(vals) > 1 else []
-
-        def cv(row: List[str], name: str) -> str:
-            idx = col.get(name, 0)
-            return (row[idx - 1].strip() if idx and idx - 1 < len(row) else "")
-
-        for r in rows:
-            if cv(r, "user_id") == user_id and cv(r, "guild_name") == guild_name:
-                a = cv(r, "alias")
-                return a.strip() if a else None
-        return None
 
     def _assignments_sheet_for_guild(self, guild_name: str) -> Optional[str]:
         """Busca en Guilds la pestaña ROTE asociada al guild_name."""
@@ -567,10 +596,24 @@ class MisOperacionesHandler:
             return (row[i].strip() if 0 <= i < len(row) else "")
 
         # Alias del usuario para fallback
-        alias = (self._alias_for_user(user_id, guild_name) or "").strip().lower()
+        # (si tu hoja de asignaciones tiene 'user_id', lo usamos; si no, comparamos por alias==jugador)
+        # Buscamos alias en Usuarios:
+        alias = ""
+        try:
+            ws_u = self.ss.worksheet(SHEET_USUARIOS)
+            col_u = _ensure_usuarios_headers(ws_u)
+            vals_u = ws_u.get_all_values() or []
+            rows_u = vals_u[1:] if len(vals_u) > 1 else []
+            def cv_u(row: List[str], name: str) -> str:
+                idx = col_u.get(name, 0)
+                return (row[idx - 1].strip() if idx and idx - 1 < len(row) else "")
+            for r in rows_u:
+                if cv_u(r, "user_id") == user_id and cv_u(r, "guild_name") == guild_name:
+                    alias = cv_u(r, "alias")
+                    break
+        except Exception:
+            pass
 
-        # Normaliza nombres de columnas esperadas
-        # fase, planeta, operacion, personaje, jugador, user_id (si existe)
         por_planeta: Dict[str, List[str]] = {}
 
         for row in rows:
@@ -578,14 +621,13 @@ class MisOperacionesHandler:
             if f != str(fase):
                 continue
 
-            # match por user_id si existe, si no por alias==jugador
             uid_cell = gv(row, "user_id")
             if uid_cell:
                 if uid_cell != user_id:
                     continue
             else:
-                jugador = gv(row, "jugador").lower()
-                if not jugador or not alias or jugador != alias.lower():
+                jugador = gv(row, "jugador")
+                if not jugador or not alias or jugador.strip().lower() != alias.strip().lower():
                     continue
 
             planeta = gv(row, "planeta") or "Sin planeta"
@@ -619,7 +661,7 @@ async def _post_init(app: Application) -> None:
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Comandos:\n"
-        "/register – registrar usuario en un gremio\n"
+        "/register o /registrar – registrar usuario en un gremio\n"
         "/misoperaciones – ver tus asignaciones (elige gremio/fase)\n"
         "/help – ayuda"
     )
@@ -637,7 +679,10 @@ def main():
     # Registro
     reg = RegistroMultiGuildHandler(ss)
     conv_reg = ConversationHandler(
-        entry_points=[CommandHandler("register", reg.start)],
+        entry_points=[
+            CommandHandler("register", reg.start),
+            CommandHandler("registrar", reg.start),
+        ],
         states={
             CHOOSE_GUILD: [CallbackQueryHandler(reg.choose_guild_cb, pattern=r"^reg_guild_idx_\d+$")],
             CHOOSE_METHOD: [CallbackQueryHandler(reg.choose_method_cb, pattern=r"^reg_method_(alias|ally)$")],
@@ -654,7 +699,7 @@ def main():
     conv_misop = ConversationHandler(
         entry_points=[CommandHandler("misoperaciones", misop.cmd_misoperaciones)],
         states={
-            MISOP_CHOOSE_GUILD: [CallbackQueryHandler(misop.cb_choose_guild, pattern=r"^misop_guild_\d+$")],
+            MISOP_CHOOSE_GUILD: [CallbackQueryHandler(misop.cb_choose_guild, pattern=r"^misop_guild_idx_\d+$")],
         },
         fallbacks=[],
         allow_reentry=True,
