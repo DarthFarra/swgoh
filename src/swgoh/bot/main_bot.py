@@ -735,16 +735,16 @@ async def cmd_diagcomlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ No autorizado.")
         return
 
-    base = os.getenv("COMLINK_BASE", "")
+    base = os.getenv("COMLINK_BASE_URL", "")
     if not base:
-        await update.message.reply_text("COMLINK_BASE no está definido en el entorno de LiveBot.")
+        await update.message.reply_text("COMLINK_BASE_URL no está definido en el entorno de LiveBot.")
         return
 
     parsed = urlparse(base)
     host = parsed.hostname or base
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     lines = []
-    lines.append(f"COMLINK_BASE = {base}")
+    lines.append(f"COMLINK_BASE_URL = {base}")
     lines.append(f"Host = {host}  Port = {port}  Scheme = {parsed.scheme or 'http'}")
 
     # DNS
