@@ -289,7 +289,7 @@ class RegistroMultiGuildHandler:
         if data == "reg_method_alias":
             context.user_data["register_method"] = "alias"
             await query.edit_message_text(
-                "Perfecto. Envíame tu *alias de jugador* exactamente como aparece en la pestaña *Players*.",
+                "Perfecto. Envíame tu *alias de jugador* exactamente como en el juego.",
                 parse_mode="Markdown",
             )
             return ASK_ALIAS
@@ -320,7 +320,7 @@ class RegistroMultiGuildHandler:
         ok, row = self._lookup_player(guild_name=guild_name, alias=text, allycode=None)
         if not ok or not row:
             await update.message.reply_text(
-                "❌ No encontré ese *alias* en la pestaña *Players* para el gremio seleccionado.",
+                "❌ No encontré ese *alias* para el gremio seleccionado.",
                 parse_mode="Markdown",
             )
             return ConversationHandler.END
@@ -343,7 +343,7 @@ class RegistroMultiGuildHandler:
         ok, row = self._lookup_player(guild_name=guild_name, alias=None, allycode=text)
         if not ok or not row:
             await update.message.reply_text(
-                "❌ No encontré ese *código de aliado* en la pestaña *Players* para el gremio seleccionado.",
+                "❌ No encontré ese *código de aliado* para el gremio seleccionado.",
                 parse_mode="Markdown",
             )
             return ConversationHandler.END
@@ -585,10 +585,10 @@ class MisOperacionesHandler:
         try:
             headers, rows = _read_all_values(self.ss, sheet_name)
         except Exception:
-            return f"No encuentro la pestaña de asignaciones para *{guild_name}*."
+            return f"No encuentro las asignaciones para *{guild_name}*."
 
         if not headers:
-            return f"No hay datos en la pestaña de asignaciones de *{guild_name}*."
+            return f"No hay datos en las asignaciones de *{guild_name}*."
 
         hmap = _header_index_map(headers)
         def gv(row: List[str], name: str) -> str:
