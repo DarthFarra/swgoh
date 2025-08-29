@@ -12,18 +12,15 @@ def fetch_metadata() -> Dict[str, Any]:
     return post_json_retry("/metadata", payloads, attempts=8, base_sleep=1.5)
 
 # --- /data ---
-def fetch_data_items(version: str, kind: str, request_segment: int | None = 0, include_pve_units: bool = False) -> Dict[str, Any]:
-    """
-    Ejemplo para /data (unidades, skills, etc.)
-    """
+def fetch_data_items(version: str, kind: str, request_segment: int | None = 0, include_pve_units: bool = False) -> dict:
     payload = {
         "version": version,
         "data": [{"type": kind}],
-        # requestSegment e items son excluyentes; usamos requestSegment=0 por defecto
-        "requestSegment": request_segment,
+        "requestSegment": request_segment,  # requestSegment e items son excluyentes
         "includePveUnits": include_pve_units,
     }
-    return post_json("/data", payload)
+    # reintentos por si hay cold-start/5xx
+    return post_json_retry("/data", [payload], attempts=8, base_sleep=1.5)
 
 # --- /guild ---
 def fetch_guild(identifier: Dict[str, Any]) -> Dict[str, Any]:
