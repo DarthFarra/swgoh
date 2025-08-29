@@ -4,6 +4,8 @@ import json
 import base64
 import logging
 import unicodedata
+import asyncio
+from asyncio.subprocess import PIPE
 from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
@@ -31,6 +33,20 @@ SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"              # JSON directo / base6
 SHEET_USUARIOS = os.getenv("USUARIOS_SHEET", "Usuarios")
 SHEET_GUILDS   = os.getenv("GUILDS_SHEET", "Guilds")
 SHEET_PLAYERS  = os.getenv("PLAYERS_SHEET", "Players")
+
+def _parse_csv_ints(s: str) -> set[int]:
+    out = set()
+    for part in (s or "").split(","):
+        part = part.strip()
+        if part:
+            try:
+                out.add(int(part))
+            except ValueError:
+                pass
+    return out
+
+# Permitir override por env: SYNC_CHAT_IDS="123,456"
+ALLOWED_SYNC_CHAT_IDS = _parse_csv_ints(os.getenv("SYNC_CHAT_IDS", "7367477801,30373681"))
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -289,7 +305,7 @@ class RegistroMultiGuildHandler:
         if data == "reg_method_alias":
             context.user_data["register_method"] = "alias"
             await query.edit_message_text(
-                "Perfecto. Envíame tu *alias de jugador* exactamente como en el juego.",
+                "Perfecto. Envíame tu *alias de jugador* exactamente como aparece en la pestaña *Players*.",
                 parse_mode="Markdown",
             )
             return ASK_ALIAS
@@ -320,7 +336,7 @@ class RegistroMultiGuildHandler:
         ok, row = self._lookup_player(guild_name=guild_name, alias=text, allycode=None)
         if not ok or not row:
             await update.message.reply_text(
-                "❌ No encontré ese *alias* para el gremio seleccionado.",
+                "❌ No encontré ese *alias* en la pestaña *Players* para el gremio seleccionado.",
                 parse_mode="Markdown",
             )
             return ConversationHandler.END
@@ -343,7 +359,7 @@ class RegistroMultiGuildHandler:
         ok, row = self._lookup_player(guild_name=guild_name, alias=None, allycode=text)
         if not ok or not row:
             await update.message.reply_text(
-                "❌ No encontré ese *código de aliado* para el gremio seleccionado.",
+                "❌ No encontré ese *código de aliado* en la pestaña *Players* para el gremio seleccionado.",
                 parse_mode="Markdown",
             )
             return ConversationHandler.END
@@ -585,19 +601,17 @@ class MisOperacionesHandler:
         try:
             headers, rows = _read_all_values(self.ss, sheet_name)
         except Exception:
-            return f"No encuentro las asignaciones para *{guild_name}*."
+            return f"No encuentro la pestaña de asignaciones para *{guild_name}*."
 
         if not headers:
-            return f"No hay datos en las asignaciones de *{guild_name}*."
+            return f"No hay datos en la pestaña de asignaciones de *{guild_name}*."
 
         hmap = _header_index_map(headers)
         def gv(row: List[str], name: str) -> str:
             i = hmap.get(name.lower(), -1)
             return (row[i].strip() if 0 <= i < len(row) else "")
 
-        # Alias del usuario para fallback
-        # (si tu hoja de asignaciones tiene 'user_id', lo usamos; si no, comparamos por alias==jugador)
-        # Buscamos alias en Usuarios:
+        # Alias del usuario para fallback (si no hay user_id en asignaciones)
         alias = ""
         try:
             ws_u = self.ss.worksheet(SHEET_USUARIOS)
@@ -647,6 +661,69 @@ class MisOperacionesHandler:
 
 
 # =========================
+# /syncdata: ejecutar swgoh.processing.sync_data (chats autorizados)
+# =========================
+
+class SyncDataRunner:
+    def __init__(self):
+        self._lock = asyncio.Lock()
+
+    async def _run_subprocess(self, *args: str) -> tuple[int, str, str]:
+        # Asegura PYTHONPATH=src para -m swgoh.processing.sync_data
+        env = os.environ.copy()
+        pp = env.get("PYTHONPATH", "")
+        if "src" not in (pp.split(":") if pp else []):
+            env["PYTHONPATH"] = f"src:{pp}" if pp else "src"
+
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=PIPE, stderr=PIPE, env=env
+        )
+        stdout_b, stderr_b = await proc.communicate()
+        return proc.returncode, stdout_b.decode("utf-8", "replace"), stderr_b.decode("utf-8", "replace")
+
+    async def cmd_syncdata(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id if update.effective_chat else None
+        if chat_id not in ALLOWED_SYNC_CHAT_IDS:
+            await update.message.reply_text("⛔ No autorizado para ejecutar /syncdata en este chat.")
+            return
+
+        if self._lock.locked():
+            await update.message.reply_text("⚙️ Ya hay una sincronización en curso. Inténtalo más tarde.")
+            return
+
+        await update.message.reply_text("🚀 Iniciando *sync_data*…", parse_mode="Markdown")
+
+        async with self._lock:
+            try:
+                # Intenta como módulo; si falla, cae a script directo.
+                rc, out, err = await self._run_subprocess("python", "-m", "swgoh.processing.sync_data")
+            except FileNotFoundError:
+                rc, out, err = await self._run_subprocess("python", "src/swgoh/processing/sync_data.py")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error al lanzar el proceso: {e}")
+                return
+
+        # Prepara resumen (últimas líneas para no saturar Telegram)
+        def tail(txt: str, lines: int = 60) -> str:
+            arr = txt.strip().splitlines()
+            return "\n".join(arr[-lines:])
+
+        if rc == 0:
+            summary = tail(out) or "(sin salida)"
+            msg = "✅ *sync_data* finalizado correctamente.\n\n*Últimas líneas:*\n```\n" + summary + "\n```"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            summary_out = tail(out)
+            summary_err = tail(err) or "(sin errores capturados)"
+            msg = (
+                f"❌ *sync_data* terminó con código {rc}.\n\n"
+                f"*STDOUT (tail):*\n```\n{summary_out}\n```\n"
+                f"*STDERR (tail):*\n```\n{summary_err}\n```"
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# =========================
 # App básica
 # =========================
 async def _post_init(app: Application) -> None:
@@ -663,6 +740,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Comandos:\n"
         "/register o /registrar – registrar usuario en un gremio\n"
         "/misoperaciones – ver tus asignaciones (elige gremio/fase)\n"
+        "/syncdata – ejecutar la sincronización de datos (autorizados)\n"
         "/help – ayuda"
     )
 
@@ -706,6 +784,10 @@ def main():
     )
     app.add_handler(conv_misop)
     app.add_handler(CallbackQueryHandler(misop.cb_choose_phase, pattern=r"^misop_fase_\d+$"))
+
+    # /syncdata
+    sync_runner = SyncDataRunner()
+    app.add_handler(CommandHandler("syncdata", sync_runner.cmd_syncdata))
 
     app.add_handler(CommandHandler("help", help_cmd))
 
