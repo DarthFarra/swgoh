@@ -1,27 +1,47 @@
-from typing import Any, Dict, Optional
-from .http import post_json
+# src/swgoh/comlink.py
+from typing import Any, Dict, List
+from .http import post_json, post_json_retry
 
+# --- /metadata ---
 def fetch_metadata() -> Dict[str, Any]:
+    # Ajustado a tu llamada original
     return post_json("/metadata", {"payload": {}, "enums": False})
 
-def fetch_data_items(version: str, items: str) -> Dict[str, Any]:
-    return post_json("/data", {"payload": {
+# --- /data ---
+def fetch_data_items(version: str, kind: str, request_segment: int | None = 0, include_pve_units: bool = False) -> Dict[str, Any]:
+    """
+    Ejemplo para /data (unidades, skills, etc.)
+    """
+    payload = {
         "version": version,
-        "items": items,
-        "includePveUnits": False,
-        "devicePlatform": "Android",
-        "requestSegment": 0,
-    }, "enums": False})
+        "data": [{"type": kind}],
+        # requestSegment e items son excluyentes; usamos requestSegment=0 por defecto
+        "requestSegment": request_segment,
+        "includePveUnits": include_pve_units,
+    }
+    return post_json("/data", payload)
 
-def fetch_guild(guild_id: str) -> Dict[str, Any]:
-    return post_json("/guild", {"payload": {"guildId": str(guild_id), "includeRecentGuildActivityInfo": True}, "enums": False})
+# --- /guild ---
+def fetch_guild(identifier: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Soporta guildId directo o dentro de "identifier".
+    Fuerza includeRecentGuildActivityInfo=true.
+    """
+    payloads = [
+        {**identifier, "includeRecentGuildActivityInfo": True},
+        {"identifier": identifier, "includeRecentGuildActivityInfo": True},
+    ]
+    return post_json_retry("/guild", payloads)
 
-def fetch_player(player_id: Optional[str], ally_code: Optional[str]) -> Dict[str, Any]:
-    if player_id:
-        return post_json("/player", {"payload": {"playerId": str(player_id)}, "enums": False})
-    if ally_code:
-        return post_json("/player", {"payload": {"allyCode": str(ally_code)}, "enums": False})
-    raise SystemExit("/player sin playerId ni allyCode")
-
-def fetch_events() -> Dict[str, Any]:
-    return post_json("/getEvents", {"payload": {}, "enums": False})
+# --- /player ---
+def fetch_player(identifier: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Idealmente sólo playerId; si no, allycode. No mandes los dos a la vez.
+    """
+    if "playerId" in identifier and "allycode" in identifier:
+        identifier = {"playerId": identifier["playerId"]}
+    payloads = [
+        identifier,
+        {"identifier": identifier},  # fallback si la API lo requiere
+    ]
+    return post_json_retry("/player", payloads)
