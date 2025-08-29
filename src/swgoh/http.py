@@ -5,6 +5,33 @@ import json
 import urllib.request
 import urllib.error
 from typing import Any, Dict
+import socket
+from urllib.parse import urlparse
+
+def _preflight_tcp(url: str, timeout: float = 2.0) -> None:
+    """Intenta conectar por TCP antes de hacer el POST para dar un error claro."""
+    u = urlparse(url)
+    host = u.hostname
+    port = u.port or (443 if u.scheme == "https" else 80)
+    if not host:
+        return
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return
+    except Exception as e:
+        raise ConnectionError(f"No puedo conectar con {host}:{port} ({e}). ¿Servicio Comlink caído o puerto incorrecto?")
+
+def post_json(path: str, payload: Dict[str, Any], timeout: float = 45.0) -> Dict[str, Any]:
+    url = _join_url(COMLINK_BASE, path)
+    # Preflight: opcional; si te molesta, comenta la siguiente línea
+    _preflight_tcp(url)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=HEADERS, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+        if not body:
+            return {}
+        return json.loads(body.decode("utf-8"))
 
 # Base del servicio Comlink (con esquema http/https)
 # Ejemplo en Railway (Private Networking): http://swgoh-comlink:3000
