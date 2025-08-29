@@ -4,8 +4,12 @@ from .http import post_json, post_json_retry
 
 # --- /metadata ---
 def fetch_metadata() -> Dict[str, Any]:
-    # Ajustado a tu llamada original
-    return post_json("/metadata", {"payload": {}, "enums": False})
+    # reintentos con backoff por si el servicio despierta
+    payloads = [
+        {"payload": {}, "enums": False},
+        {"payload": {}},  # fallback por si 'enums' causara 4xx en alguna versión
+    ]
+    return post_json_retry("/metadata", payloads, attempts=8, base_sleep=1.5)
 
 # --- /data ---
 def fetch_data_items(version: str, kind: str, request_segment: int | None = 0, include_pve_units: bool = False) -> Dict[str, Any]:
