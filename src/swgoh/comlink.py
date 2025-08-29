@@ -1,67 +1,79 @@
 # src/swgoh/comlink.py
-from typing import Any, Dict, List
+from typing import Any, Dict
 from .http import post_json_retry
 
+# --- /metadata ---
 def fetch_metadata() -> Dict[str, Any]:
+    """
+    /metadata con 'payload' vacío; 'enums' opcional.
+    """
     payloads = [
         {"payload": {}, "enums": False},
         {"payload": {}},
     ]
     return post_json_retry("/metadata", payloads, attempts=8, base_sleep=1.3)
 
-def _compact(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Elimina claves con valor None (no toca False/0)."""
-    return {k: v for k, v in d.items() if v is not None}
-
-def fetch_data_items(version: str, kind: str, request_segment: int | None = 0, include_pve_units: bool = False) -> Dict[str, Any]:
+# --- /data ---
+def fetch_data_items(
+    version: str,
+    kind: str,                     # "units", "skill", ...
+    include_pve_units: bool = False,
+    request_segment: int = 0,
+    device_platform: str = "Android",
+) -> Dict[str, Any]:
     """
-    Llama a /data con 'payload' (requerido por el schema).
-    Probaremos varias formas compatibles según el despliegue de Comlink.
-    """
-    base_payload = {
-        "version": version or "latest",
-        "language": "ENG_US",
-        "requestSegment": request_segment,            # requestSegment e items son excluyentes; usamos RS por defecto
-        "includePveUnits": include_pve_units,
+    Llama a /data usando el esquema:
+    {
+      "payload": {
+        "version": "<version>",
+        "includePveUnits": <bool>,
+        "devicePlatform": "Android",
+        "requestSegment": 0,
+        "items": "<kind>"
+      },
+      "enums": false
     }
 
-    # Variantes (todas dentro de {"payload": ...})
-    variants: List[Dict[str, Any]] = []
+    Notas:
+    - 'items' es STRING (no array).
+    - 'requestSegment' y 'items' pueden coexistir en este schema, pero no usamos 'data' ni 'language'.
+    """
+    v = version or "latest"
+    payloads = [
+        {
+            "payload": {
+                "version": v,
+                "includePveUnits": bool(include_pve_units),
+                "devicePlatform": device_platform,
+                "requestSegment": int(request_segment),
+                "items": str(kind),
+            },
+            "enums": False,
+        }
+    ]
+    return post_json_retry("/data", payloads, attempts=8, base_sleep=1.5)
 
-    # v1: data [{type}]
-    variants.append({"payload": _compact({**base_payload, "data": [{"type": kind}]})})
-    # v2: data [{id,type}]
-    variants.append({"payload": _compact({**base_payload, "data": [{"id": kind, "type": kind}]})})
-    # v3: igual que v1 pero sin includePveUnits (por si el schema no lo acepta)
-    v3 = dict(base_payload)
-    v3.pop("includePveUnits", None)
-    variants.append({"payload": _compact({**v3, "data": [{"type": kind}]})})
-    # v4: igual que v1 pero sin requestSegment (por si RS no es admitido)
-    v4 = dict(base_payload)
-    v4.pop("requestSegment", None)
-    variants.append({"payload": _compact({**v4, "data": [{"type": kind}]})})
-    # v5: items [{type}] (fallback absoluto, aunque RS y items son excluyentes)
-    v5 = dict(base_payload)
-    v5.pop("requestSegment", None)
-    variants.append({"payload": _compact({**v5, "items": [{"type": kind}]})})
-    # v6: items [{id}]
-    variants.append({"payload": _compact({**v5, "items": [{"id": kind}]})})
-
-    return post_json_retry("/data", variants, attempts=8, base_sleep=1.5)
-
+# --- /guild ---
 def fetch_guild(identifier: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fuerza includeRecentGuildActivityInfo=true.
+    Acepta tanto plano como dentro de 'identifier' por compatibilidad.
+    """
     payloads = [
         {**identifier, "includeRecentGuildActivityInfo": True},
         {"identifier": identifier, "includeRecentGuildActivityInfo": True},
     ]
     return post_json_retry("/guild", payloads, attempts=8, base_sleep=1.3)
 
+# --- /player ---
 def fetch_player(identifier: Dict[str, Any]) -> Dict[str, Any]:
-    # Idealmente solo playerId; si viene allycode también, nos quedamos con playerId.
+    """
+    Idealmente sólo playerId; si también viene allycode, priorizamos playerId.
+    """
     if "playerId" in identifier and "allycode" in identifier:
         identifier = {"playerId": identifier["playerId"]}
     payloads = [
-        identifier,
-        {"identifier": identifier},
+        identifier,                 # plano
+        {"identifier": identifier}  # fallback
     ]
     return post_json_retry("/player", payloads, attempts=8, base_sleep=1.3)
