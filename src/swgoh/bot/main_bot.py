@@ -8,6 +8,10 @@ import asyncio
 from asyncio.subprocess import PIPE
 from typing import Any, Dict, List, Optional, Tuple
 
+import socket
+import urllib.request, urllib.error
+from urllib.parse import urlparse
+
 import gspread
 from google.oauth2.service_account import Credentials
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -703,7 +707,6 @@ class SyncDataRunner:
                 await update.message.reply_text(f"❌ Error al lanzar el proceso: {e}")
                 return
 
-        # Prepara resumen (últimas líneas para no saturar Telegram)
         def tail(txt: str, lines: int = 60) -> str:
             arr = txt.strip().splitlines()
             return "\n".join(arr[-lines:])
@@ -724,6 +727,69 @@ class SyncDataRunner:
 
 
 # =========================
+# /diagcomlink: diagnóstico de conectividad a COMLINK (chats autorizados)
+# =========================
+async def cmd_diagcomlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id not in ALLOWED_SYNC_CHAT_IDS:
+        await update.message.reply_text("⛔ No autorizado.")
+        return
+
+    base = os.getenv("COMLINK_BASE", "")
+    if not base:
+        await update.message.reply_text("COMLINK_BASE no está definido en el entorno de LiveBot.")
+        return
+
+    parsed = urlparse(base)
+    host = parsed.hostname or base
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    lines = []
+    lines.append(f"COMLINK_BASE = {base}")
+    lines.append(f"Host = {host}  Port = {port}  Scheme = {parsed.scheme or 'http'}")
+
+    # DNS
+    try:
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)}
+        lines.append("DNS -> " + (", ".join(sorted(addrs)) or "(sin direcciones)"))
+    except Exception as e:
+        lines.append(f"DNS -> error: {e}")
+
+    # TCP check
+    try:
+        socket.create_connection((host, port), timeout=3.0).close()
+        lines.append("TCP -> open")
+    except Exception as e:
+        lines.append(f"TCP -> closed ({e})")
+
+    # Warm-up GET raíz
+    try:
+        req0 = urllib.request.Request(base, method="GET")
+        with urllib.request.urlopen(req0, timeout=10) as resp0:
+            lines.append(f"GET / -> {resp0.status} {resp0.reason}")
+    except Exception as e:
+        lines.append(f"GET / -> ERROR {e}")
+
+    # POST /metadata (dos intentos)
+    url = base.rstrip("/") + "/metadata"
+    payload = b'{"payload":{},"enums":false}'
+    headers = {"content-type": "application/json"}
+
+    for i in (1, 2):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = resp.read(200).decode("utf-8", "replace")
+                lines.append(f"POST /metadata (#{i}) -> {resp.status} {resp.reason}  body(200B)='{body}'")
+        except Exception as e:
+            lines.append(f"POST /metadata (#{i}) -> ERROR {e}")
+
+    msg = "\n".join(lines)
+    if len(msg) > 3500:
+        msg = msg[:3500] + "\n…(truncado)…"
+    await update.message.reply_text("```\n" + msg + "\n```", parse_mode="Markdown")
+
+
+# =========================
 # App básica
 # =========================
 async def _post_init(app: Application) -> None:
@@ -741,6 +807,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/register o /registrar – registrar usuario en un gremio\n"
         "/misoperaciones – ver tus asignaciones (elige gremio/fase)\n"
         "/syncdata – ejecutar la sincronización de datos (autorizados)\n"
+        "/diagcomlink – diagnóstico de conectividad a Comlink (autorizados)\n"
         "/help – ayuda"
     )
 
@@ -788,6 +855,9 @@ def main():
     # /syncdata
     sync_runner = SyncDataRunner()
     app.add_handler(CommandHandler("syncdata", sync_runner.cmd_syncdata))
+
+    # /diagcomlink
+    app.add_handler(CommandHandler("diagcomlink", cmd_diagcomlink))
 
     app.add_handler(CommandHandler("help", help_cmd))
 
