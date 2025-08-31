@@ -91,19 +91,44 @@ def _norm(s: str) -> str:
 # =========================
 # Cálculo de fase (como el original)
 # =========================
-def obtener_fase_actual() -> Optional[str]:
+def _truthy(envval: str | None) -> bool:
+    return str(envval or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+def obtener_fase_actual() -> str | None:
     """
-    - Si es domingo -> None (no se envía)
-    - Si la semana ISO es PAR -> fase = weekday+1 (L=1..S=6)
-    - Si la semana es IMPAR -> None (no se envía)
+    Comportamiento:
+      - Si FORCE_PHASE está definido (1..6) -> devuelve esa fase.
+      - Si ALLOW_SUNDAY no es true y es domingo -> None.
+      - Comprueba paridad de semana contra TB_WEEK_PARITY (even/odd). Si no coincide -> None.
+      - Devuelve fase '1'..'6' (lunes=1..sábado=6). Si ALLOW_SUNDAY=true y es domingo, devuelve '6'.
     """
+    # 1) Override manual
+    force = os.getenv("FORCE_PHASE")
+    if force and force.strip() in {"1","2","3","4","5","6"}:
+        return force.strip()
+
     tz = pytz.timezone(ID_ZONA)
     hoy = datetime.datetime.now(tz)
-    if hoy.weekday() >= 6:  # domingo (0=lunes .. 6=domingo)
-        return None
-    semana_par = (hoy.isocalendar()[1] % 2) == 0
-    return str(hoy.weekday() + 1) if semana_par else None
+    iso_week = hoy.isocalendar()[1]      # p.ej. 35
+    weekday = hoy.weekday()              # 0=lun .. 6=dom
 
+    # 2) Domingo
+    if not _truthy(os.getenv("ALLOW_SUNDAY")) and weekday == 6:
+        return None
+
+    # 3) Paridad de semana
+    desired = (os.getenv("TB_WEEK_PARITY", "even").strip().lower())  # 'even' | 'odd'
+    is_even = (iso_week % 2 == 0)
+    if (desired == "even" and not is_even) or (desired == "odd" and is_even):
+        return None
+
+    # 4) Fase
+    phase = weekday + 1  # lun=1..dom=7
+    if weekday == 6:     # si permitimos domingo, reutilizamos fase 6
+        phase = 6
+    if phase > 6:
+        phase = 6
+    return str(phase)
 # =========================
 # Lógica de asignaciones
 # =========================
