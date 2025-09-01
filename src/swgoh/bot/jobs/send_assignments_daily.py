@@ -2,13 +2,17 @@
 import os
 import json
 import base64
+import time
+import random
 import datetime
 import unicodedata
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, DefaultDict
+from collections import defaultdict
 
 import pytz
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 # ==========
@@ -18,6 +22,7 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"  # JSON directo / base64 / ruta
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ID_ZONA = os.getenv("ID_ZONA", "Europe/Madrid")  # zona horaria para fase
+DEBUG_MODE = os.getenv("DEBUG_ASSIGNMENTS", "").strip().lower() in ("1", "true", "yes", "on")
 
 SHEET_USUARIOS = os.getenv("USUARIOS_SHEET", "Usuarios")
 SHEET_GUILDS   = os.getenv("GUILDS_SHEET", "Guilds")
@@ -67,126 +72,161 @@ def _open_sheet():
     client = gspread.authorize(_load_service_account_creds())
     return client.open_by_key(SPREADSHEET_ID)
 
+# ===== Reintentos con backoff para lecturas gspread =====
+def _with_backoff(fn, *args, **kwargs):
+    """
+    Ejecuta una función gspread con reintentos en 429/5xx.
+    """
+    max_attempts = kwargs.pop("_attempts", 6)
+    base_sleep = kwargs.pop("_base_sleep", 0.6)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            # Detecta 429 o 5xx
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            msg = str(e)
+            transient = (status in (429, 500, 502, 503, 504)) or ("429" in msg) or ("Rate Limit" in msg)
+            if transient and attempt < max_attempts:
+                sleep = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                if DEBUG_MODE:
+                    print(f"[DEBUG] gspread retry {attempt}/{max_attempts} tras {status or '??'}; durmiendo {sleep:.2f}s")
+                time.sleep(sleep)
+                continue
+            raise
+
 def _read_all_values(ss, sheet_name: str) -> Tuple[List[str], List[List[str]]]:
-    ws = ss.worksheet(sheet_name)
-    vals = ws.get_all_values() or []
+    ws = _with_backoff(ss.worksheet, sheet_name)
+    vals = _with_backoff(ws.get_all_values)
     headers = [h.strip() for h in (vals[0] if vals else [])]
     rows = vals[1:] if len(vals) > 1 else []
     return headers, rows
 
-def _hmap(headers: List[str]) -> Dict[str, int]:
-    return {h.strip().lower(): i for i, h in enumerate(headers)}
+# ==========
+# Normalización (acento-insensible)
+# ==========
+def _strip_accents(s: str) -> str:
+    return "".join(ch for ch in unicodedata.normalize("NFD", s or "") if unicodedata.category(ch) != "Mn")
 
-def _gv(row: List[str], hmap: Dict[str, int], name: str) -> str:
-    i = hmap.get(name.lower(), -1)
-    return (row[i].strip() if 0 <= i < len(row) else "")
+def _slug(s: str) -> str:
+    return " ".join(_strip_accents(str(s or "")).lower().split())
+
+def _norm_cell(s: str) -> str:
+    return _slug(s)
 
 def _sanitize_ally(s: str) -> str:
     return "".join(ch for ch in str(s or "") if ch.isdigit())
 
-def _norm(s: str) -> str:
-    s = unicodedata.normalize("NFC", str(s or ""))
-    return " ".join(s.split()).strip().lower()
+def _hmap(headers: List[str]) -> Dict[str, int]:
+    # Mapea slug(header) -> índice (0-based)
+    return {_slug(h): i for i, h in enumerate(headers)}
+
+def _find_col(hm: Dict[str, int], aliases: List[str]) -> int:
+    for a in aliases:
+        idx = hm.get(_slug(a), -1)
+        if idx != -1:
+            return idx
+    return -1
+
+def _gv_by_idx(row: List[str], idx: int) -> str:
+    return (row[idx].strip() if 0 <= idx < len(row) else "")
+
+# Alias de cabeceras (ES/EN + variantes con acentos)
+HEADERS_ASSIGN = {
+    "fase":      ["fase", "phase"],
+    "planeta":   ["planeta", "planet"],
+    "operacion": ["operacion", "operación", "operation"],
+    "personaje": ["personaje", "character", "unit"],
+    "jugador":   ["jugador", "player"],
+    "user_id":   ["user_id", "userid", "user id", "telegram_user_id"],
+}
+
+HEADERS_USUARIOS = {
+    "guild_name": ["guild_name", "guild name", "gremio", "nombre de gremio"],
+    "chat_id":    ["chat_id", "chat id"],
+    "user_id":    ["user_id", "userid", "user id", "telegram_user_id"],
+    "alias":      ["alias", "player name", "jugador"],
+}
 
 # =========================
-# Cálculo de fase (como el original)
+# Cálculo de fase (original)
 # =========================
-def _truthy(envval: str | None) -> bool:
-    return str(envval or "").strip().lower() in ("1", "true", "yes", "y", "on")
-
-def obtener_fase_actual() -> str | None:
+def obtener_fase_actual() -> Optional[str]:
     """
-    Comportamiento:
-      - Si FORCE_PHASE está definido (1..6) -> devuelve esa fase.
-      - Si ALLOW_SUNDAY no es true y es domingo -> None.
-      - Comprueba paridad de semana contra TB_WEEK_PARITY (even/odd). Si no coincide -> None.
-      - Devuelve fase '1'..'6' (lunes=1..sábado=6). Si ALLOW_SUNDAY=true y es domingo, devuelve '6'.
+    - Si es domingo -> None (no se envía)
+    - Si la semana ISO es PAR -> fase = weekday+1 (L=1..S=6)
+    - Si la semana es IMPAR -> None (no se envía)
     """
-    # 1) Override manual
-    force = os.getenv("FORCE_PHASE")
-    if force and force.strip() in {"1","2","3","4","5","6"}:
-        return force.strip()
-
     tz = pytz.timezone(ID_ZONA)
     hoy = datetime.datetime.now(tz)
-    iso_week = hoy.isocalendar()[1]      # p.ej. 35
-    weekday = hoy.weekday()              # 0=lun .. 6=dom
-
-    # 2) Domingo
-    if not _truthy(os.getenv("ALLOW_SUNDAY")) and weekday == 6:
+    if hoy.weekday() >= 6:  # domingo (0=lunes .. 6=domingo)
+        if DEBUG_MODE:
+            print("[DEBUG] Domingo: no se envía.")
         return None
+    semana_par = (hoy.isocalendar()[1] % 2) == 0
+    fase = str(hoy.weekday() + 1) if semana_par else None
+    if DEBUG_MODE:
+        print(f"[DEBUG] Fecha={hoy.isoformat()} semana_par={semana_par} -> fase={fase}")
+    return fase
 
-    # 3) Paridad de semana
-    desired = (os.getenv("TB_WEEK_PARITY", "even").strip().lower())  # 'even' | 'odd'
-    is_even = (iso_week % 2 == 0)
-    if (desired == "even" and not is_even) or (desired == "odd" and is_even):
-        return None
-
-    # 4) Fase
-    phase = weekday + 1  # lun=1..dom=7
-    if weekday == 6:     # si permitimos domingo, reutilizamos fase 6
-        phase = 6
-    if phase > 6:
-        phase = 6
-    return str(phase)
 # =========================
-# Lógica de asignaciones
+# Índice de asignaciones por gremio (una sola lectura por gremio)
 # =========================
-def _assignments_sheet_for_guild(ss, guild_name: str) -> Optional[str]:
-    headers, rows = _read_all_values(ss, SHEET_GUILDS)
-    if not headers:
-        return None
-    hm = _hmap(headers)
-    for r in rows:
-        gname = _gv(r, hm, "Guild Name")
-        rote  = _gv(r, hm, "ROTE")
-        if gname and rote and gname == guild_name:
-            try:
-                ss.worksheet(rote)
-                return rote
-            except Exception:
-                return None
-    return None
+class AssignIndex:
+    def __init__(self, sheet_name: str, idxs: Dict[str, int], rows: List[List[str]], fase: str):
+        self.sheet_name = sheet_name
+        self.fase = str(fase)
+        # índices de columnas
+        self.idx_fase    = idxs["fase"]
+        self.idx_planeta = idxs["planeta"]
+        self.idx_oper    = idxs["operacion"]
+        self.idx_pers    = idxs["personaje"]
+        self.idx_userid  = idxs["user_id"]
+        self.idx_jugador = idxs["jugador"]
 
-def _build_assignments_text(ss, sheet_name: str, guild_name: str, fase: str, user_id: str, alias: str) -> Optional[str]:
-    try:
-        headers, rows = _read_all_values(ss, sheet_name)
-    except Exception:
-        return None
-    if not headers:
-        return None
+        # Estructuras: una pasada
+        self.by_uid: DefaultDict[str, List[Tuple[str, str, str]]] = defaultdict(list)
+        self.by_alias_norm: DefaultDict[str, List[Tuple[str, str, str]]] = defaultdict(list)
 
-    hm = _hmap(headers)
-
-    por_planeta: Dict[str, List[str]] = {}
-    for row in rows:
-        f = _gv(row, hm, "fase")
-        if f != str(fase):
-            continue
-
-        uid_cell = _gv(row, hm, "user_id")
-        if uid_cell:
-            if uid_cell != user_id:
+        total_fase = 0
+        for r in rows:
+            f = _gv_by_idx(r, self.idx_fase)
+            if f != self.fase:
                 continue
-        else:
-            jugador = _gv(row, hm, "jugador")
-            if not jugador or not alias or _norm(jugador) != _norm(alias):
-                continue
+            total_fase += 1
 
-        planeta = _gv(row, hm, "planeta") or "Sin planeta"
-        oper    = _gv(row, hm, "operacion") or "Sin operación"
-        pers    = _gv(row, hm, "personaje") or "Sin personaje"
-        por_planeta.setdefault(planeta, []).append(f"- {pers} ({oper})")
+            planeta = _gv_by_idx(r, self.idx_planeta) or "Sin planeta"
+            oper    = _gv_by_idx(r, self.idx_oper)    or "Sin operación"
+            pers    = _gv_by_idx(r, self.idx_pers)    or "Sin personaje"
+            uid     = _gv_by_idx(r, self.idx_userid)
+            if uid:
+                self.by_uid[uid].append((planeta, oper, pers))
+            else:
+                jug = _gv_by_idx(r, self.idx_jugador)
+                if jug:
+                    self.by_alias_norm[_norm_cell(jug)].append((planeta, oper, pers))
 
-    if not por_planeta:
-        return None
+        if DEBUG_MODE:
+            print(f"[DEBUG] Índice '{sheet_name}' fase={fase}: filas_fase={total_fase} "
+                  f"uids={len(self.by_uid)} aliases={len(self.by_alias_norm)}")
 
-    lines = [f"Asignaciones de *{alias or 'tu usuario'}* — *{guild_name}* (Fase {fase})", ""]
-    for planeta, asigns in por_planeta.items():
-        lines.append(f" {planeta}:")
-        lines.extend(asigns)
-        lines.append("")
-    return "\n".join(lines)
+    def build_message_for(self, guild_name: str, user_id: str, alias: str) -> Optional[str]:
+        items = self.by_uid.get(user_id)
+        if not items and alias:
+            items = self.by_alias_norm.get(_norm_cell(alias))
+        if not items:
+            return None
+
+        por_planeta: DefaultDict[str, List[str]] = defaultdict(list)
+        for (planeta, oper, pers) in items:
+            por_planeta[planeta].append(f"- {pers} ({oper})")
+
+        lines = [f"Asignaciones de *{alias or 'tu usuario'}* — *{guild_name}* (Fase {self.fase})", ""]
+        for planeta, asigns in por_planeta.items():
+            lines.append(f" {planeta}:")
+            lines.extend(asigns)
+            lines.append("")
+        return "\n".join(lines)
 
 # =========================
 # Telegram
@@ -215,43 +255,117 @@ def main() -> int:
     if not fase:
         print("[send_assignments_daily] Hoy no se envía (fuera de ventana de fases).")
         return 0
+    if DEBUG_MODE:
+        print(f"[DEBUG] Fase actual: {fase}")
 
-    # Leer usuarios
-    ws_u = ss.worksheet(SHEET_USUARIOS)
-    u_vals = ws_u.get_all_values() or []
-    if len(u_vals) < 2:
+    # --- Leer USUARIOS una vez ---
+    u_headers, u_rows = _read_all_values(ss, SHEET_USUARIOS)
+    if not u_rows:
         print("[send_assignments_daily] No hay usuarios registrados.")
         return 0
-    u_headers = [h.strip() for h in u_vals[0]]
-    um = _hmap(u_headers)
+    uhm = _hmap(u_headers)
+    idx_gname = _find_col(uhm, HEADERS_USUARIOS["guild_name"])
+    idx_chat  = _find_col(uhm, HEADERS_USUARIOS["chat_id"])
+    idx_uid   = _find_col(uhm, HEADERS_USUARIOS["user_id"])
+    idx_alias = _find_col(uhm, HEADERS_USUARIOS["alias"])
+    if DEBUG_MODE:
+        print(f"[DEBUG] Usuarios headers idx: guild_name={idx_gname} chat_id={idx_chat} user_id={idx_uid} alias={idx_alias}")
 
+    users: List[Tuple[str, str, str, str]] = []
+    for r in u_rows:
+        g  = _gv_by_idx(r, idx_gname)
+        ch = _gv_by_idx(r, idx_chat)
+        ui = _gv_by_idx(r, idx_uid)
+        al = _gv_by_idx(r, idx_alias)
+        if g and ch and ui:
+            users.append((g, ch, ui, al))
+    if DEBUG_MODE:
+        print(f"[DEBUG] Usuarios válidos: {len(users)}")
+
+    # --- Leer GUILDS una vez y mapear Guild Name -> ROTE ---
+    g_headers, g_rows = _read_all_values(ss, SHEET_GUILDS)
+    ghm = _hmap(g_headers)
+    idx_guild_name = _find_col(ghm, ["Guild Name", "guild_name", "gremio"])
+    idx_rote       = _find_col(ghm, ["ROTE"])
+
+    guild_to_rote: Dict[str, str] = {}
+    for r in g_rows:
+        gname = _gv_by_idx(r, idx_guild_name)
+        rote  = _gv_by_idx(r, idx_rote)
+        if gname and rote:
+            guild_to_rote[gname] = rote
+    if DEBUG_MODE:
+        print(f"[DEBUG] Guilds con ROTE configurado: {len(guild_to_rote)}")
+
+    # --- Agrupar usuarios por gremio ---
+    per_guild: DefaultDict[str, List[Tuple[str, str, str]]] = defaultdict(list)
+    for (g, ch, ui, al) in users:
+        per_guild[g].append((ch, ui, al))
+    if DEBUG_MODE:
+        print(f"[DEBUG] Gremios con usuarios: {len(per_guild)}")
+
+    # --- Construir índice de asignaciones por gremio (una lectura por gremio) ---
     sent = 0
     skipped = 0
 
-    for row in u_vals[1:]:
+    for guild_name, lst in per_guild.items():
+        sheet_name = guild_to_rote.get(guild_name) or "Asignaciones ROTE"
+
+        # Leer la pestaña de asignaciones UNA vez
         try:
-            guild_name = _gv(row, um, "guild_name")
-            chat_id    = _gv(row, um, "chat_id")
-            user_id    = _gv(row, um, "user_id")
-            alias      = _gv(row, um, "alias")
-
-            if not guild_name or not chat_id or not user_id:
-                skipped += 1
-                continue
-
-            sheet_name = _assignments_sheet_for_guild(ss, guild_name) or "Asignaciones ROTE"
-            msg = _build_assignments_text(ss, sheet_name, guild_name, fase, user_id, alias)
-            if not msg:
-                skipped += 1
-                continue
-
-            _tg_send_message(TELEGRAM_BOT_TOKEN, chat_id, msg, parse_mode="Markdown")
-            sent += 1
+            a_headers, a_rows = _read_all_values(ss, sheet_name)
         except Exception as e:
-            # No paramos todo el job por un usuario que falle
-            print(f"[WARN] Fallo enviando a chat { _gv(row, um, 'chat_id') }: {e}")
-            skipped += 1
+            if DEBUG_MODE:
+                print(f"[DEBUG] No puedo abrir hoja '{sheet_name}' para '{guild_name}': {e}")
+            # No abortamos todo; omitimos usuarios de este gremio
+            skipped += len(lst)
             continue
+
+        if not a_rows:
+            if DEBUG_MODE:
+                print(f"[DEBUG] Hoja '{sheet_name}' vacía para '{guild_name}'")
+            skipped += len(lst)
+            continue
+
+        ahm = _hmap(a_headers)
+        # Resolver índices de columnas con alias
+        idxs = {
+            "fase":      _find_col(ahm, HEADERS_ASSIGN["fase"]),
+            "planeta":   _find_col(ahm, HEADERS_ASSIGN["planeta"]),
+            "operacion": _find_col(ahm, HEADERS_ASSIGN["operacion"]),
+            "personaje": _find_col(ahm, HEADERS_ASSIGN["personaje"]),
+            "user_id":   _find_col(ahm, HEADERS_ASSIGN["user_id"]),
+            "jugador":   _find_col(ahm, HEADERS_ASSIGN["jugador"]),
+        }
+        if DEBUG_MODE:
+            print(f"[DEBUG] '{sheet_name}' idxs={idxs}")
+
+        # Si faltan columnas clave, omitimos a los usuarios de este gremio
+        if min(idxs.values()) == -1:
+            if DEBUG_MODE:
+                print(f"[DEBUG] Faltan columnas requeridas en '{sheet_name}' para '{guild_name}'")
+            skipped += len(lst)
+            continue
+
+        # Crear índice (una pasada)
+        assign_index = AssignIndex(sheet_name, idxs, a_rows, fase)
+
+        # Construir y enviar mensajes para los usuarios de este gremio
+        for (chat_id, user_id, alias) in lst:
+            try:
+                msg = assign_index.build_message_for(guild_name, user_id, alias)
+                if not msg:
+                    skipped += 1
+                    if DEBUG_MODE:
+                        print(f"[DEBUG] (guild={guild_name}) user_id={user_id} alias='{alias}': sin asignaciones")
+                    continue
+                _tg_send_message(TELEGRAM_BOT_TOKEN, chat_id, msg, parse_mode="Markdown")
+                sent += 1
+                # Pequeño respiro para evitar picos (Telegram y logs)
+                time.sleep(0.05)
+            except Exception as e:
+                print(f"[WARN] Fallo enviando a chat {chat_id}: {e}")
+                skipped += 1
 
     print(f"[send_assignments_daily] Fase {fase}: enviados={sent}, omitidos={skipped}")
     return 0
