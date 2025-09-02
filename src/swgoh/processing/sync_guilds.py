@@ -15,7 +15,13 @@ from typing import Any, Dict, List, Tuple, Optional
 import gspread
 from google.oauth2.service_account import Credentials
 
-from ..comlink import fetch_guild, fetch_player
+from ..comlink import fetch_guild
+# Compat: si aún no añadiste fetch_player_by_id en comlink.py, usamos fetch_player
+try:
+    from ..comlink import fetch_player_by_id
+except Exception:  # pragma: no cover
+    from ..comlink import fetch_player as fetch_player_by_id  # type: ignore
+
 from ..http import COMLINK_BASE  # valida formato al importar
 
 # ==========
@@ -202,6 +208,7 @@ def _to_compact_json(obj: Any) -> str:
 def _parse_last_raid(guild_data: Dict[str, Any]) -> Tuple[str, int]:
     """
     Devuelve (lastRaidId_str, totalPoints)
+    Si no existe en la respuesta, devuelve ("", 0).
     """
     arr = _safe_get(guild_data, ["lastRaidPointsSummary"], default=None)
     if arr is None:
@@ -270,10 +277,20 @@ def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List
     headers_now = _headers(ws)
     row = prev_row[:] if prev_row else [""] * len(headers_now)
 
+    def should_set(val: Any) -> bool:
+        if val is None:
+            return False
+        # permitir 0 (número), pero evitar strings vacíos
+        if isinstance(val, (int, float)):
+            return True
+        return str(val).strip() != ""
+
     def setv(colname: str, val: Any):
+        if not should_set(val):
+            return
         idx = colmap.get(colname.lower())
         if idx:
-            row[idx - 1] = "" if val is None else str(val)
+            row[idx - 1] = str(val)
 
     for key in ("Guild Name", "Members", "GP", "Last Raid Id", "Last Raid Score"):
         if key in newvals:
@@ -448,9 +465,6 @@ def process_guild(
     Procesa un guild:
       - actualiza fila en Guilds
       - devuelve (guild_name, num_miembros_procesados, players_data_by_playerId)
-        donde players_data_by_playerId[playerId] = {
-            "playerId", "name", "ally", "level", "gp", "role", "gac", "roster": [...]
-        }
     """
     # 1) /guild  (fetch_guild ya envía {payload:{guildId, includeRecentGuildActivityInfo}, enums:false})
     try:
@@ -460,11 +474,25 @@ def process_guild(
         raise
 
     guild_obj = gdata.get("guild") if isinstance(gdata.get("guild"), dict) else gdata
+
+    # Nombre de guild: si no viene, conservamos el que ya haya en la fila
     guild_name = _safe_get(guild_obj, ["profile", "name"], "") or guild_obj.get("name", "")
+    if not guild_name and guild_row_vals:
+        # Mantener el existente en hoja si no viene en respuesta
+        try:
+            hdrs = _headers(ws_guilds)
+            idx_name = hdrs.index("Guild Name")
+            guild_name = guild_row_vals[idx_name] if idx_name < len(guild_row_vals) else guild_name
+        except Exception:
+            pass
+
+    # GP del guild (tolerante)
     guild_gp = _safe_get(guild_obj, ["profile", "guildGalacticPower"], None)
     if guild_gp is None:
         guild_gp = guild_obj.get("galacticPower", 0)
-    members_arr = gdata.get("member") or _safe_get(gdata, ["guild", "memberList"], []) or []
+
+    # *** Miembros según tu esquema: gdata["guild"]["member"] ***
+    members_arr = _safe_get(gdata, ["guild", "member"], []) or []
     members_count = len(members_arr)
 
     last_raid_id, last_raid_points = _parse_last_raid(gdata)
@@ -481,29 +509,33 @@ def process_guild(
     }
     upsert_guild_row(ws_guilds, gcol, guild_row_idx_1b, guild_row_vals, newvals)
 
-    # 3) Obtener detalle por jugador (/player una vez por miembro)
+    # 3) Obtener detalle por jugador (/player UNA vez por miembro, siempre por playerId)
     players_data: Dict[str, Dict[str, Any]] = {}
     for m in members_arr:
-        pid = str(m.get("playerId") or m.get("playerID") or "").strip()
-        name_guess = str(m.get("name") or m.get("playerName") or "").strip()
-        role = str(m.get("guildMemberLevel") or m.get("role") or "").strip()
+        pid = str(m.get("playerId") or "").strip()
+        name_guess = str(m.get("playerName") or "").strip()
+        # en tu esquema es "memberLevel"
+        role = str(m.get("memberLevel") or "").strip()
+
+        if not pid:
+            log.warning("Miembro %r sin playerId; no se puede consultar /player", name_guess)
+            continue
+
         p_resp: Dict[str, Any] = {}
         try:
-            ident: Dict[str, Any] = {"playerId": pid} if pid else {}
-            if ident:
-                p_resp = fetch_player(ident)
+            p_resp = fetch_player_by_id(pid)
         except Exception as e:
-            log.warning("Error /player (%s %s): %s", pid, name_guess, e)
+            log.warning("Error /player playerId=%s (%s): %s", pid, name_guess, e)
             p_resp = {}
 
         name = str(p_resp.get("name") or _safe_get(p_resp, ["player", "name"], "") or name_guess).strip()
-        ally = _parse_allycode(p_resp)
+        ally = _parse_allycode(p_resp)  # lo sacamos de /player si viene
         level = str(_safe_get(p_resp, ["level"], "") or _safe_get(p_resp, ["player", "level"], ""))
         gp = _safe_get(p_resp, ["galacticPower"], "") or _safe_get(p_resp, ["player", "galacticPower"], "")
         gac = _parse_player_rating(p_resp)
         roster = p_resp.get("rosterUnit") or _safe_get(p_resp, ["player", "rosterUnit"], []) or []
 
-        players_data[pid or f"(noid){name}"] = {
+        players_data[pid] = {
             "playerId": pid,
             "name": name,
             "ally": ally,
@@ -579,7 +611,7 @@ def run() -> str:
     def new_pu_row() -> List[str]:
         return [""] * len(pu_headers)
 
-    # También prepararemos upsert para Players (como antes)
+    # También prepararemos upsert para Players
     p_headers = _headers(ws_players)
     pcol = {h.lower(): i for i, h in enumerate(p_headers, start=1)}
     _, players_existing_rows = _get_all(ws_players)
@@ -628,8 +660,7 @@ def run() -> str:
             continue
 
         # Para cada jugador del gremio: actualizar Players y Player_Units
-        for key, pdata in players_data.items():
-            pid = pdata.get("playerId", "") or ""
+        for pid, pdata in players_data.items():
             pname = pdata.get("name", "") or ""
             ally = pdata.get("ally", "") or ""
             level = pdata.get("level", "") or ""
@@ -725,11 +756,9 @@ def run() -> str:
         processed += 1
 
     # ---- Volcado final a Sheets ----
-    # Players
     if final_players_rows != players_existing_rows:
         ws_update(ws_players, f"2:{len(final_players_rows)+1}", final_players_rows)
 
-    # Player_Units
     if final_pu_rows != pu_existing_rows:
         ws_update(ws_pu, f"2:{len(final_pu_rows)+1}", final_pu_rows)
 
