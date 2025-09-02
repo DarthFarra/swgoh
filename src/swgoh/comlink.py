@@ -54,16 +54,16 @@ def fetch_data_items(
     return post_json_retry("/data", payloads, attempts=8, base_sleep=1.5)
 
 # --- /guild ---
-def fetch_guild(identifier: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Fuerza includeRecentGuildActivityInfo=true.
-    Acepta tanto plano como dentro de 'identifier' por compatibilidad.
-    """
-    payloads = [
-        {**identifier, "includeRecentGuildActivityInfo": True},
-        {"identifier": identifier, "includeRecentGuildActivityInfo": True},
-    ]
-    return post_json_retry("/guild", payloads, attempts=8, base_sleep=1.3)
+def fetch_guild(identifier: dict | str) -> dict:
+    guild_id = identifier["guildId"] if isinstance(identifier, dict) else str(identifier)
+    payload = {
+        "payload": {
+            "guildId": guild_id,
+            "includeRecentGuildActivityInfo": True,  # pon False si lo quieres así
+        },
+        "enums": False,
+    }
+    return post_json_retry("/guild", [payload], attempts=8, base_sleep=1.3)
 
 # --- /player ---
 def fetch_player(identifier: Dict[str, Any]) -> Dict[str, Any]:
