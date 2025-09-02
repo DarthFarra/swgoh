@@ -1,7 +1,10 @@
 # src/swgoh/comlink.py
+from __future__ import annotations
+import json
 import logging
+import urllib.request
 from typing import Any, Dict
-from .http import post_json_retry
+from .http import COMLINK_BASE  # usamos la URL base ya validada
 
 log = logging.getLogger("comlink")
 
@@ -69,20 +72,34 @@ def fetch_guild(identifier: dict | str) -> dict:
     return post_json_retry("/guild", [payload], attempts=8, base_sleep=1.3)
 
 # --- /player ---
-def fetch_player_by_id(player_id: str) -> dict:
+def fetch_player_by_id(player_id: str) -> Dict[str, Any]:
     """
-    Llama a /player usando SIEMPRE playerId.
-    Payload: {"payload":{"playerId": "<id>"},"enums": false}
+    Llama a /player usando SIEMPRE playerId con el esquema:
+    {"payload":{"playerId":"..."},"enums":false}
+    Evitamos doble-serialización y forzamos Content-Type correcto.
     """
     pid = str(player_id or "").strip()
     if not pid:
         raise ValueError("fetch_player_by_id: player_id vacío")
 
-    payload = {
-        "payload": { "playerId": pid },
-        "enums": False
-    }
-    # Útil para ver el JSON exacto en logs (sube el nivel a DEBUG si quieres verlo)
-    log.debug("POST /player payload=%s", payload)
+    url = COMLINK_BASE.rstrip("/") + "/player"
+    body_obj = {"payload": {"playerId": pid}, "enums": False}
+    body_bytes = json.dumps(body_obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-    return post_json_retry("/player", payload, attempts=8, base_sleep=1.3)
+    req = urllib.request.Request(
+        url,
+        data=body_bytes,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+
+    # Log DEBUG para inspección del payload real
+    log.debug("POST %s payload=%s", url, body_obj)
+
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            log.error("Respuesta no JSON de /player: %s | body=%s", e, raw[:300])
+            raise
