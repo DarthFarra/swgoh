@@ -24,6 +24,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 # Filtros / otros
 EXCLUDE_BASEID_CONTAINS = [x.strip().upper() for x in os.getenv("EXCLUDE_BASEID_CONTAINS", "").split(",") if x.strip()]
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Madrid")
+OMICRON_MODE_MAP_JSON = os.getenv("OMICRON_MODE_MAP_JSON", "").strip()
+OMICRON_MODE_MAP = os.getenv("OMICRON_MODE_MAP", "").strip()
 
 # HTTP
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "5"))
