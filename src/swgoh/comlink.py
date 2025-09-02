@@ -1,6 +1,9 @@
 # src/swgoh/comlink.py
+import logging
 from typing import Any, Dict
 from .http import post_json_retry
+
+log = logging.getLogger("comlink")
 
 # --- /metadata ---
 def fetch_metadata() -> Dict[str, Any]:
@@ -66,14 +69,20 @@ def fetch_guild(identifier: dict | str) -> dict:
     return post_json_retry("/guild", [payload], attempts=8, base_sleep=1.3)
 
 # --- /player ---
-def fetch_player(identifier: Dict[str, Any]) -> Dict[str, Any]:
+def fetch_player_by_id(player_id: str) -> dict:
     """
-    Idealmente sólo playerId; si también viene allycode, priorizamos playerId.
+    Llama a /player usando SIEMPRE playerId.
+    Payload: {"payload":{"playerId": "<id>"},"enums": false}
     """
-    if "playerId" in identifier and "allycode" in identifier:
-        identifier = {"playerId": identifier["playerId"]}
-    payloads = [
-        identifier,                 # plano
-        {"identifier": identifier}  # fallback
-    ]
-    return post_json_retry("/player", payloads, attempts=8, base_sleep=1.3)
+    pid = str(player_id or "").strip()
+    if not pid:
+        raise ValueError("fetch_player_by_id: player_id vacío")
+
+    payload = {
+        "payload": { "playerId": pid },
+        "enums": False
+    }
+    # Útil para ver el JSON exacto en logs (sube el nivel a DEBUG si quieres verlo)
+    log.debug("POST /player payload=%s", payload)
+
+    return post_json_retry("/player", payload, attempts=8, base_sleep=1.3)
