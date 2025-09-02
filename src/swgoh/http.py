@@ -5,7 +5,10 @@ import urllib.request
 import urllib.error
 from typing import Any, Dict
 
-COMLINK_BASE = os.getenv("COMLINK_BASE", "").rstrip("/")
+COMLINK_BASE = (os.getenv("COMLINK_BASE", "").strip().rstrip("/"))
+if not COMLINK_BASE or not COMLINK_BASE.startswith(("http://", "https://")):
+    raise RuntimeError(f"COMLINK_BASE inválido o ausente: {repr(os.getenv('COMLINK_BASE', ''))}")
+
 
 HEADERS = {
     "Content-Type": "application/json",
