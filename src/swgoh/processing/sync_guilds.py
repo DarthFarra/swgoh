@@ -89,6 +89,10 @@ def _headers(ws) -> List[str]:
     vals = ws.row_values(1) or []
     return [h.strip() for h in vals]
 
+def ws_update(ws, range_name: str, values: List[List[str]]):
+    """Wrapper que usa argumentos nombrados (compat gspread 6.x+)."""
+    return ws.update(values=values, range_name=range_name)
+
 def _ensure_headers(ws, required: List[str]) -> Dict[str, int]:
     """
     Asegura columnas; añade al final si faltan (no borra datos).
@@ -96,7 +100,7 @@ def _ensure_headers(ws, required: List[str]) -> Dict[str, int]:
     """
     headers = _headers(ws)
     if not headers:
-        ws.update("A1", [required])
+        ws_update(ws, "A1", [required])
         headers = required[:]
     else:
         low = [h.strip().lower() for h in headers]
@@ -106,7 +110,7 @@ def _ensure_headers(ws, required: List[str]) -> Dict[str, int]:
                 headers.append(col)
                 changed = True
         if changed:
-            ws.update("1:1", [headers])
+            ws_update(ws, "1:1", [headers])
     return {h.strip().lower(): i for i, h in enumerate(headers, start=1)}
 
 def _get_all(ws) -> Tuple[List[str], List[List[str]]]:
@@ -242,7 +246,7 @@ GUILDS_REQUIRED = [
     "Guild Id",
     "Guild Name",
     "Members",
-    "Guild GP",
+    "GP",
     "Last Raid Id",
     "Last Raid Score",
     # (Preservamos si existen: "ROTE", "nombre abreviado")
@@ -259,8 +263,7 @@ PLAYERS_REQUIRED = [
     "GAC League",
 ]
 
-# Player_Units: mantenemos compat con Apps Script (B=Player Name, C+=unidades).
-# No forzamos A, pero si existe "Player Id" lo usamos como clave del upsert; si no, usamos "Player Name".
+# Player_Units: compat con Apps Script (B=Player Name, C+=unidades).
 PLAYER_UNITS_MIN_PREFIX = ["Player Id", "Player Name"]
 
 def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List[str], newvals: Dict[str, Any]):
@@ -272,11 +275,11 @@ def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List
         if idx:
             row[idx - 1] = "" if val is None else str(val)
 
-    for key in ("Guild Name", "Members", "Guild GP", "Last Raid Id", "Last Raid Score"):
+    for key in ("Guild Name", "Members", "GP", "Last Raid Id", "Last Raid Score"):
         if key in newvals:
             setv(key, newvals[key])
 
-    ws.update(f"{row_idx_1b}:{row_idx_1b}", [row])
+    ws_update(ws, f"{row_idx_1b}:{row_idx_1b}", [row])
 
 def upsert_player_rows(ws, colmap: Dict[str, int], existing_rows: List[List[str]], rows_by_playerid: Dict[str, List[str]]):
     headers_now = _headers(ws)
@@ -299,14 +302,13 @@ def upsert_player_rows(ws, colmap: Dict[str, int], existing_rows: List[List[str]
                     merged[j] = newrow[j]
             final_rows[i] = merged
         else:
-            # añadir nuevo
             row = [""] * len(headers_now)
             for j in range(min(len(row), len(newrow))):
                 row[j] = newrow[j]
             final_rows.append(row)
 
     if final_rows != existing_rows:
-        ws.update(f"2:{len(final_rows)+1}", final_rows)
+        ws_update(ws, f"2:{len(final_rows)+1}", final_rows)
 
 # ==========
 # Catálogo de unidades (Characters + Ships)
@@ -361,7 +363,6 @@ def read_unit_catalog(ss) -> Tuple[List[str], Dict[str, str], Dict[str, bool]]:
     except Exception as e:
         log.warning("No se pudo leer Ships: %s", e)
 
-    # Orden por friendly name ascendente
     unit_base_ids = sorted(base_to_name.keys(), key=lambda b: base_to_name[b].lower())
     return unit_base_ids, base_to_name, is_ship
 
@@ -379,7 +380,7 @@ def ensure_player_units_headers(ws, unit_base_ids: List[str], base_to_name: Dict
     headers = _headers(ws)
     if not headers:
         headers = PLAYER_UNITS_MIN_PREFIX[:] + [base_to_name[b] for b in unit_base_ids]
-        ws.update("A1", [headers])
+        ws_update(ws, "A1", [headers])
     else:
         lower = [h.lower() for h in headers]
         changed = False
@@ -395,7 +396,7 @@ def ensure_player_units_headers(ws, unit_base_ids: List[str], base_to_name: Dict
                 lower.append(fname.lower())
                 changed = True
         if changed:
-            ws.update("1:1", [headers])
+            ws_update(ws, "1:1", [headers])
 
     colmap = {h.strip().lower(): i for i, h in enumerate(headers, start=1)}
     unit_col_by_friendly = {base_to_name[b].strip().lower(): colmap[base_to_name[b].strip().lower()] for b in unit_base_ids if base_to_name[b].strip().lower() in colmap}
@@ -451,7 +452,7 @@ def process_guild(
             "playerId", "name", "ally", "level", "gp", "role", "gac", "roster": [...]
         }
     """
-    # 1) /guild
+    # 1) /guild  (fetch_guild ya envía {payload:{guildId, includeRecentGuildActivityInfo}, enums:false})
     try:
         gdata = fetch_guild({"guildId": guild_id})
     except Exception as e:
@@ -468,13 +469,13 @@ def process_guild(
 
     last_raid_id, last_raid_points = _parse_last_raid(gdata)
 
-    # 2) Actualizar Guilds
+    # 2) Actualizar Guilds (preservando ROTE y nombre abreviado)
     gheaders, _ = _get_all(ws_guilds)
     gcol = {h.lower(): i for i, h in enumerate(gheaders, start=1)}
     newvals = {
         "Guild Name": guild_name,
         "Members": members_count,
-        "Guild GP": guild_gp,
+        "GP": guild_gp,
         "Last Raid Id": last_raid_id,
         "Last Raid Score": last_raid_points,
     }
@@ -557,7 +558,7 @@ def run() -> str:
     idx_pu_pid = colmap_pu.get("player id")        # puede no existir si la hoja era antigua
     idx_pu_pname = colmap_pu.get("player name")    # Apps Script espera B=Player Name
 
-    # Leer todo Player_Units (para upsert másivo al final)
+    # Leer todo Player_Units (para upsert masivo al final)
     _, pu_existing_rows = _get_all(ws_pu)
 
     # Índices para encontrar filas existentes
@@ -659,7 +660,6 @@ def run() -> str:
                 final_players_rows[idx_row] = merged
                 players_upd += 1
             else:
-                # nueva fila
                 rowp = [""] * len(p_headers)
                 def setp(col: str, val: Any):
                     j = pcol.get(col.lower())
@@ -679,10 +679,8 @@ def run() -> str:
                 players_upd += 1
 
             # ---- Player_Units ----
-            # Mapa baseId -> valor (R#/G12/<G12/Nave)
             base_to_val = roster_to_unit_values(roster, is_ship)
 
-            # Construir/actualizar fila destino
             # Encontrar índice de fila existente (por Player Id si existe, si no por Player Name)
             idx_row_pu: Optional[int] = None
             if idx_pu_pid and pid and pid in current_by_pid:
@@ -729,11 +727,11 @@ def run() -> str:
     # ---- Volcado final a Sheets ----
     # Players
     if final_players_rows != players_existing_rows:
-        ws_players.update(f"2:{len(final_players_rows)+1}", final_players_rows)
+        ws_update(ws_players, f"2:{len(final_players_rows)+1}", final_players_rows)
 
     # Player_Units
     if final_pu_rows != pu_existing_rows:
-        ws_pu.update(f"2:{len(final_pu_rows)+1}", final_pu_rows)
+        ws_update(ws_pu, f"2:{len(final_pu_rows)+1}", final_pu_rows)
 
     if processed == 0:
         log.info("No hay filas nuevas para escribir.")
