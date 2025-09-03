@@ -24,16 +24,7 @@ SHEET_OMICRONS = getattr(cfg, "SHEET_CHARACTERS_OMICRONS", "CharactersOmicrons")
 
 # (Opcional) mapeo de omicronMode → texto
 
-OMICRON_MODE_MAP_JSON = getattr (cfg, "OMICRON_MODE_MAP_JSON", "{
-    "4":"Raid",
-    "7":"Territory Battles",
-    "8":"Territory Wars",
-    "9":"Grand Arena",
-    "11":"Conquest",
-    "12":"Challenges",
-    "14":"Grand Arena 3v3",
-    "15":"Grand Arena 5v5"
-}")
+OMICRON_MODE_MAP_JSON = getattr (cfg, "OMICRON_MODE_MAP_JSON", "")
 OMICRON_MODE_MAP = getattr (cfg, "OMICRON_MODE_MAP", "")
 
 
