@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from .http import post_json_retry
+from .http import post_json_retry  # <- IMPORTANTE para evitar NameError
 
 log = logging.getLogger("comlink")
 
