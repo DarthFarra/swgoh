@@ -50,17 +50,12 @@ SHEET_SHIPS = os.getenv("SHIPS_SHEET", "Ships")
 # Unidades a excluir por substrings en baseId (coma-separado)
 EXCLUDE_BASEID_CONTAINS = [s.strip().upper() for s in os.getenv("EXCLUDE_BASEID_CONTAINS", "").split(",") if s.strip()]
 
-
-# ==========
-# Date/Time Settings
-# ==========
+# Zona horaria para Last Update
 TZ = ZoneInfo(os.getenv("ID_ZONA", "Europe/Madrid"))
 
 def now_ts() -> str:
-    # 2025-09-03T21:37:45+02:00
+    # Ej: 2025-09-03T21:37:45+02:00
     return datetime.now(TZ).isoformat(timespec="seconds")
-
-
 
 # ==========
 # Google Sheets helpers
@@ -113,26 +108,6 @@ def ws_update(ws, range_name: str, values: List[List[str]]):
     """Wrapper que usa argumentos nombrados (compat gspread 6.x+)."""
     return ws.update(values=values, range_name=range_name)
 
-def _ensure_headers(ws, required: List[str]) -> Dict[str, int]:
-    """
-    Asegura columnas; añade al final si faltan (no borra datos).
-    Devuelve mapa header_lower -> idx 1-based.
-    """
-    headers = _headers(ws)
-    if not headers:
-        ws_update(ws, "A1", [required])
-        headers = required[:]
-    else:
-        low = [h.strip().lower() for h in headers]
-        changed = False
-        for col in required:
-            if col.lower() not in low:
-                headers.append(col)
-                changed = True
-        if changed:
-            ws_update(ws, "1:1", [headers])
-    return {h.strip().lower(): i for i, h in enumerate(headers, start=1)}
-
 def _get_all(ws) -> Tuple[List[str], List[List[str]]]:
     vals = ws.get_all_values() or []
     if not vals:
@@ -183,16 +158,6 @@ def preflight_comlink() -> bool:
 # ==========
 DIV_MAP = {25: "1", 20: "2", 15: "3", 10: "4", 5: "5"}
 
-ROLE_MAP = {
-    2: "Miembro",
-    3: "Oficial",
-    4: "Lider",  # (sin tilde, como pediste)
-}
-
-def map_member_level(val) -> str:
-    c = _to_int(val, 0)
-    return ROLE_MAP.get(c, (str(c) if c else ""))
-
 RELIC_MAP = {
     11: "R9",
     10: "R8",
@@ -207,6 +172,23 @@ RELIC_MAP = {
     1:  "G12",
     0:  "<G12",
 }
+
+ROLE_MAP = {
+    2: "Miembro",
+    3: "Oficial",
+    4: "Lider",
+}
+
+def map_member_level(val) -> str:
+    c = 0
+    try:
+        c = int(val)
+    except Exception:
+        try:
+            c = int(str(val).strip())
+        except Exception:
+            c = 0
+    return ROLE_MAP.get(c, (str(c) if c else ""))
 
 def _safe_get(d: Any, path: List[Any], default=None):
     cur = d
@@ -273,15 +255,19 @@ def _exclude_baseid(base_id: str) -> bool:
 # ==========
 # Escritura segura en hojas
 # ==========
+# Sinónimos para evitar duplicados GP/Guild GP
+GUILDS_HEADER_SYNONYMS = {
+    "GP": ["GP", "Guild GP"],
+}
+
 GUILDS_REQUIRED = [
     "Guild Id",
     "Guild Name",
     "Members",
-    "Guild GP",
+    "Guild GP",       # preferimos esta etiqueta si existe
     "Last Raid Id",
     "Last Raid Score",
     "Last Update",
-    # (Preservamos si existen: "ROTE", "nombre abreviado")
 ]
 
 PLAYERS_REQUIRED = [
@@ -298,6 +284,48 @@ PLAYERS_REQUIRED = [
 # Player_Units: compat con Apps Script (B=Player Name, C+=unidades).
 PLAYER_UNITS_MIN_PREFIX = ["Player Id", "Player Name"]
 
+def _ensure_headers(ws, required: List[str], synonyms: Dict[str, List[str]] | None = None) -> Dict[str, int]:
+    """
+    Asegura columnas; añade al final si faltan (no borra datos).
+    Usa 'synonyms' para no duplicar cabeceras equivalentes (ej: GP vs Guild GP).
+    Devuelve mapa header_lower -> idx 1-based.
+    """
+    headers = _headers(ws)
+    if not headers:
+        ws_update(ws, "A1", [required])
+        headers = required[:]
+    else:
+        existing_lower = [h.strip().lower() for h in headers]
+        changed = False
+        for req in required:
+            req_l = req.lower()
+            if req_l in existing_lower:
+                continue
+            has_syn = False
+            if synonyms and req in synonyms:
+                for alt in synonyms[req]:
+                    if alt.strip().lower() in existing_lower:
+                        has_syn = True
+                        break
+            if not has_syn:
+                headers.append(req)
+                existing_lower.append(req_l)
+                changed = True
+        if changed:
+            ws_update(ws, "1:1", [headers])
+    return {h.strip().lower(): i for i, h in enumerate(headers, start=1)}
+
+def _resolve_col(colmap: Dict[str, int], name: str, synonyms: Dict[str, List[str]] | None = None) -> int | None:
+    key = name.strip().lower()
+    if key in colmap:
+        return colmap[key]
+    if synonyms and name in synonyms:
+        for alt in synonyms[name]:
+            k = alt.strip().lower()
+            if k in colmap:
+                return colmap[k]
+    return None
+
 def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List[str], newvals: Dict[str, Any]):
     headers_now = _headers(ws)
     row = prev_row[:] if prev_row else [""] * len(headers_now)
@@ -305,7 +333,6 @@ def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List
     def should_set(val: Any) -> bool:
         if val is None:
             return False
-        # permitir 0 (número), pero evitar strings vacíos
         if isinstance(val, (int, float)):
             return True
         return str(val).strip() != ""
@@ -313,17 +340,18 @@ def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List
     def setv(colname: str, val: Any):
         if not should_set(val):
             return
-        idx = colmap.get(colname.lower())
+        idx = _resolve_col(colmap, colname, GUILDS_HEADER_SYNONYMS)
         if idx:
             row[idx - 1] = str(val)
 
-    for key in ("Guild Name", "Members", "Guild GP", "Last Raid Id", "Last Raid Score"):
+    for key in ("Guild Name", "Members", "GP", "Last Raid Id", "Last Raid Score"):
         if key in newvals:
             setv(key, newvals[key])
 
+    # Marca de tiempo de última actualización
     setv("Last Update", now_ts())
 
-    ws.update(range_name=f"{row_idx_1b}:{row_idx_1b}", values=[row])
+    ws_update(ws, f"{row_idx_1b}:{row_idx_1b}", [row])
 
 def upsert_player_rows(ws, colmap: Dict[str, int], existing_rows: List[List[str]], rows_by_playerid: Dict[str, List[str]]):
     headers_now = _headers(ws)
@@ -505,7 +533,6 @@ def process_guild(
     # Nombre de guild: si no viene, conservamos el que ya haya en la fila
     guild_name = _safe_get(guild_obj, ["profile", "name"], "") or guild_obj.get("name", "")
     if not guild_name and guild_row_vals:
-        # Mantener el existente en hoja si no viene en respuesta
         try:
             hdrs = _headers(ws_guilds)
             idx_name = hdrs.index("Guild Name")
@@ -518,7 +545,7 @@ def process_guild(
     if guild_gp is None:
         guild_gp = guild_obj.get("galacticPower", 0)
 
-    # *** Miembros según tu esquema: gdata["guild"]["member"] ***
+    # Miembros según tu esquema: gdata["guild"]["member"]
     members_arr = _safe_get(gdata, ["guild", "member"], []) or []
     members_count = len(members_arr)
 
@@ -530,7 +557,7 @@ def process_guild(
     newvals = {
         "Guild Name": guild_name,
         "Members": members_count,
-        "Guild GP": guild_gp,
+        "GP": guild_gp,
         "Last Raid Id": last_raid_id,
         "Last Raid Score": last_raid_points,
     }
@@ -538,42 +565,42 @@ def process_guild(
 
     # 3) Obtener detalle por jugador (/player UNA vez por miembro, siempre por playerId)
     players_data: Dict[str, Dict[str, Any]] = {}
-for m in members_arr:
-    pid = str(m.get("playerId") or "").strip()
-    name_guess = str(m.get("playerName") or "").strip()
+    for m in members_arr:
+        pid = str(m.get("playerId") or "").strip()
+        name_guess = str(m.get("playerName") or "").strip()
 
-    # >>> NUEVO: role en texto y GP desde /guild.member
-    role_text = map_member_level(m.get("memberLevel"))
-    gp_member = _to_int(m.get("galacticPower"), 0)
+        # >>> Role mapeado y GP desde /guild.member
+        role_text = map_member_level(m.get("memberLevel"))
+        gp_member = _to_int(m.get("galacticPower"), 0)
 
-    if not pid:
-        log.warning("Miembro %r sin playerId; no se puede consultar /player", name_guess)
-        continue
+        if not pid:
+            log.warning("Miembro %r sin playerId; no se puede consultar /player", name_guess)
+            continue
 
-    p_resp: Dict[str, Any] = {}
-    try:
-        p_resp = fetch_player_by_id(pid)
-    except Exception as e:
-        log.warning("Error /player playerId=%s (%s): %s", pid, name_guess, e)
-        p_resp = {}
+        p_resp: Dict[str, Any] = {}
+        try:
+            p_resp = fetch_player_by_id(pid)
+        except Exception as e:
+            log.warning("Error /player playerId=%s (%s): %s", pid, name_guess, e)
+            p_resp = {}
 
-    name = str(p_resp.get("name") or _safe_get(p_resp, ["player", "name"], "") or name_guess).strip()
-    ally = _parse_allycode(p_resp)
-    level = str(_safe_get(p_resp, ["level"], "") or _safe_get(p_resp, ["player", "level"], ""))
-    gac = _parse_player_rating(p_resp)
-    roster = p_resp.get("rosterUnit") or _safe_get(p_resp, ["player", "rosterUnit"], []) or []
+        name = str(p_resp.get("name") or _safe_get(p_resp, ["player", "name"], "") or name_guess).strip()
+        ally = _parse_allycode(p_resp)  # lo sacamos de /player si viene
+        level = str(_safe_get(p_resp, ["level"], "") or _safe_get(p_resp, ["player", "level"], ""))
+        gac = _parse_player_rating(p_resp)
+        roster = p_resp.get("rosterUnit") or _safe_get(p_resp, ["player", "rosterUnit"], []) or []
 
-    players_data[pid] = {
-        "playerId": pid,
-        "name": name,
-        "ally": ally,
-        "level": level,
-        "gp": gp_member,        # <<< GP de /guild.member
-        "role": role_text,      # <<< Role mapeado
-        "gac": gac,
-        "roster": roster,
-        "guild_name": guild_name,
-    }
+        players_data[pid] = {
+            "playerId": pid,
+            "name": name,
+            "ally": ally,
+            "level": level,
+            "gp": gp_member,       # <<< GP correcto desde /guild.member
+            "role": role_text,     # <<< Role mapeado
+            "gac": gac,
+            "roster": roster,
+            "guild_name": guild_name,
+        }
 
     return guild_name, members_count, players_data
 
@@ -591,7 +618,7 @@ def run() -> str:
     ws_pu = ss.worksheet(SHEET_PLAYER_UNITS)
 
     # Asegurar cabeceras base en Guilds y Players
-    _ensure_headers(ws_guilds, GUILDS_REQUIRED)
+    _ensure_headers(ws_guilds, GUILDS_REQUIRED, GUILDS_HEADER_SYNONYMS)
     _ensure_headers(ws_players, PLAYERS_REQUIRED)
 
     # Leer Guilds
@@ -696,6 +723,7 @@ def run() -> str:
             role = pdata.get("role", "") or ""
             gac = pdata.get("gac", "") or ""
             roster = pdata.get("roster", []) or []
+            guild_name = pdata.get("guild_name", "") or ""
 
             # ---- Players (upsert por Player Id si posible) ----
             if idx_pid_players and pid and pid in players_index_by_pid:
