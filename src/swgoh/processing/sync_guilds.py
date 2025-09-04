@@ -18,81 +18,74 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from ..comlink import fetch_guild
-# Compat: si aún no añadiste fetch_player_by_id en comlink.py, usamos fetch_player
 try:
     from ..comlink import fetch_player_by_id
-except Exception:  # pragma: no cover
+except Exception:
     from ..comlink import fetch_player as fetch_player_by_id  # type: ignore
 
 from ..http import COMLINK_BASE  # valida formato al importar
 
-# ==========
-# Logging
-# ==========
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("sync_guilds")
 
-# ==========
-# Config (env)
-# ==========
+# ----------------- ENV / CONFIG -----------------
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"  # JSON directo / base64 / ruta
+SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"
 
 SHEET_GUILDS = os.getenv("GUILDS_SHEET", "Guilds")
 SHEET_PLAYERS = os.getenv("PLAYERS_SHEET", "Players")
 SHEET_PLAYER_UNITS = os.getenv("PLAYER_UNITS_SHEET", "Player_Units")
 SHEET_PLAYER_SKILLS = os.getenv("PLAYER_SKILLS_SHEET", "Player_Skills")
+
 SHEET_CHARACTERS = os.getenv("CHARACTERS_SHEET", "Characters")
 SHEET_SHIPS = os.getenv("SHIPS_SHEET", "Ships")
+SHEET_ZETAS = os.getenv("CHAR_ZETAS_SHEET", "CharactersZetas")
+SHEET_OMIS  = os.getenv("CHAR_OMICRONS_SHEET", "CharactersOmicrons")
 
-# Unidades/skills a excluir por substrings (coma-separado)
 EXCLUDE_BASEID_CONTAINS = [s.strip().upper() for s in os.getenv("EXCLUDE_BASEID_CONTAINS", "").split(",") if s.strip()]
 
-# Zona horaria para Last Update
 TZ = ZoneInfo(os.getenv("ID_ZONA", "Europe/Madrid"))
 
-# Filtrado opcional por guild(s) concretos (coma-separados)
 FILTER_GUILD_IDS = {
     s.strip() for s in os.getenv("FILTER_GUILD_IDS", "").split(",") if s.strip()
 }
 
+DIV_MAP = {25: "1", 20: "2", 15: "3", 10: "4", 5: "5"}
+RELIC_MAP = {11:"R9",10:"R8",9:"R7",8:"R6",7:"R5",6:"R4",5:"R3",4:"R2",3:"R1",2:"R0",1:"G12",0:"<G12"}
+ROLE_MAP  = {2:"Miembro",3:"Oficial",4:"Lider"}
+
+GUILDS_HEADER_SYNONYMS = {"GP": ["GP", "Guild GP"]}
+GUILDS_REQUIRED = ["Guild Id","Guild Name","Members","Guild GP","Last Raid Id","Last Raid Score","Last Update"]
+PLAYERS_REQUIRED = ["Player Id","Player Name","Ally code","Guild Name","Role","Level","GP","GAC League"]
+PLAYER_UNITS_MIN_PREFIX = ["Player Id","Player Name"]
+
+# ----------------- HELPERS -----------------
 def now_ts() -> str:
-    # Ej: 2025-09-03T21:37:45+02:00
     return datetime.now(TZ).isoformat(timespec="seconds")
 
-# ==========
-# Google Sheets helpers
-# ==========
 def _load_service_account_creds():
     raw = os.getenv(SERVICE_ACCOUNT_ENV)
     if not raw:
         raise RuntimeError(f"Variable de entorno {SERVICE_ACCOUNT_ENV} no definida")
 
     def try_json(s: str) -> Optional[dict]:
-        try:
-            return json.loads(s)
-        except Exception:
-            return None
+        try: return json.loads(s)
+        except Exception: return None
 
     info = try_json(raw)
     if info is None:
         try:
-            decoded = base64.b64decode(raw).decode("utf-8")
-            info = try_json(decoded)
+            info = try_json(base64.b64decode(raw).decode("utf-8"))
         except Exception:
             info = None
-
     if info is None:
         with open(raw, "r", encoding="utf-8") as f:
             info = json.load(f)
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive.readonly"]
     return Credentials.from_service_account_info(info, scopes=scopes)
 
 def _open_spreadsheet():
@@ -106,7 +99,6 @@ def _headers(ws) -> List[str]:
     return [h.strip() for h in vals]
 
 def ws_update(ws, range_name: str, values: List[List[str]]):
-    """Wrapper que usa argumentos nombrados (compat gspread 6.x+)."""
     return ws.update(values=values, range_name=range_name)
 
 def _get_all(ws) -> Tuple[List[str], List[List[str]]]:
@@ -117,9 +109,6 @@ def _get_all(ws) -> Tuple[List[str], List[List[str]]]:
     rows = vals[1:] if len(vals) > 1 else []
     return headers, rows
 
-# ==========
-# Preflight COMLINK (diagnóstico rápido)
-# ==========
 def preflight_comlink() -> bool:
     base = os.getenv("COMLINK_BASE", "").strip()
     log.info("COMLINK_BASE=%r", base)
@@ -131,7 +120,6 @@ def preflight_comlink() -> bool:
         log.error("URL inválida en COMLINK_BASE: %s", e)
         return False
 
-    # DNS
     try:
         addrs = {ai[4][0] for ai in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)}
         log.info("DNS %s -> %s", host, ", ".join(sorted(addrs)))
@@ -139,7 +127,6 @@ def preflight_comlink() -> bool:
         log.error("No se puede resolver %s: %s", host, e)
         return False
 
-    # POST /metadata mínimo
     try:
         req = urllib.request.Request(
             base.rstrip("/") + "/metadata",
@@ -154,42 +141,6 @@ def preflight_comlink() -> bool:
         log.error("Fallo en preflight /metadata: %s", e)
         return False
 
-# ==========
-# Utilidades de parsing y mapeos
-# ==========
-DIV_MAP = {25: "1", 20: "2", 15: "3", 10: "4", 5: "5"}
-
-RELIC_MAP = {
-    11: "R9",
-    10: "R8",
-    9:  "R7",
-    8:  "R6",
-    7:  "R5",
-    6:  "R4",
-    5:  "R3",
-    4:  "R2",
-    3:  "R1",
-    2:  "R0",
-    1:  "G12",
-    0:  "<G12",
-}
-
-ROLE_MAP = {
-    2: "Miembro",
-    3: "Oficial",
-    4: "Lider",
-}
-
-def map_member_level(val) -> str:
-    try:
-        c = int(val)
-    except Exception:
-        try:
-            c = int(str(val).strip())
-        except Exception:
-            c = 0
-    return ROLE_MAP.get(c, (str(c) if c else ""))
-
 def _safe_get(d: Any, path: List[Any], default=None):
     cur = d
     for k in path:
@@ -200,25 +151,17 @@ def _safe_get(d: Any, path: List[Any], default=None):
     return cur
 
 def _to_int(x: Any, default: int = 0) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
+    try: return int(x)
+    except Exception: return default
 
 def _to_compact_json(obj: Any) -> str:
-    try:
-        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-    except Exception:
-        return ""
+    try: return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    except Exception: return ""
 
 def _parse_last_raid(guild_data: Dict[str, Any]) -> Tuple[str, int]:
-    """
-    Devuelve (lastRaidId_str, totalPoints)
-    Si no existe en la respuesta, devuelve ("", 0).
-    """
-    arr = _safe_get(guild_data, ["lastRaidPointsSummary"], default=None)
+    arr = _safe_get(guild_data, ["lastRaidPointsSummary"], None)
     if arr is None:
-        arr = _safe_get(guild_data, ["guild", "lastRaidPointsSummary"], default=[])
+        arr = _safe_get(guild_data, ["guild","lastRaidPointsSummary"], [])
     if isinstance(arr, list) and arr:
         first = arr[0] or {}
         ident = first.get("identifier", {})
@@ -227,187 +170,82 @@ def _parse_last_raid(guild_data: Dict[str, Any]) -> Tuple[str, int]:
     return "", 0
 
 def _parse_player_rating(p: Dict[str, Any]) -> str:
-    league = _safe_get(p, ["playerRating", "playerRankStatus", "leagueId"], "")
-    div_raw = _safe_get(p, ["playerRating", "playerRankStatus", "divisionId"], None)
-    div_num = _to_int(div_raw, 0)
-    div = DIV_MAP.get(div_num, "")
-    if league and div:
-        return f"{league} {div}"
-    if league:
-        return league
-    return ""
+    league = _safe_get(p, ["playerRating","playerRankStatus","leagueId"], "")
+    div_raw = _safe_get(p, ["playerRating","playerRankStatus","divisionId"], None)
+    div = DIV_MAP.get(_to_int(div_raw, 0), "")
+    return f"{league} {div}".strip()
 
 def _parse_allycode(p: Dict[str, Any]) -> str:
-    v = p.get("allycode")
-    if v is None:
-        v = p.get("allyCode")
-    if v is None:
-        v = _safe_get(p, ["player", "allyCode"], None)
+    v = p.get("allycode") or p.get("allyCode") or _safe_get(p, ["player","allyCode"], None)
     s = str(v or "").strip()
     return "".join(ch for ch in s if ch.isdigit())
 
 def _exclude_baseid(base_id: str) -> bool:
-    if not EXCLUDE_BASEID_CONTAINS:
-        return False
+    if not EXCLUDE_BASEID_CONTAINS: return False
     b = (base_id or "").upper()
     return any(sub in b for sub in EXCLUDE_BASEID_CONTAINS)
 
 def _exclude_skillid(skill_id: str) -> bool:
-    if not EXCLUDE_BASEID_CONTAINS:
-        return False
+    if not EXCLUDE_BASEID_CONTAINS: return False
     s = (skill_id or "").upper()
     return any(sub in s for sub in EXCLUDE_BASEID_CONTAINS)
 
-# ==========
-# Escritura segura en hojas
-# ==========
-# Sinónimos para evitar duplicados GP/Guild GP
-GUILDS_HEADER_SYNONYMS = {
-    "GP": ["GP", "Guild GP"],
-}
+def map_member_level(val) -> str:
+    try: c = int(val)
+    except Exception:
+        try: c = int(str(val).strip())
+        except Exception: c = 0
+    return ROLE_MAP.get(c, (str(c) if c else ""))
 
-GUILDS_REQUIRED = [
-    "Guild Id",
-    "Guild Name",
-    "Members",
-    "Guild GP",       # preferimos esta etiqueta si existe
-    "Last Raid Id",
-    "Last Raid Score",
-    "Last Update",
-]
-
-PLAYERS_REQUIRED = [
-    "Player Id",
-    "Player Name",
-    "Ally code",
-    "Guild Name",
-    "Role",
-    "Level",
-    "GP",
-    "GAC League",
-]
-
-PLAYER_SKILLS_HEADERS = [
-    "Player Id",
-    "Player Name",
-    "Guild Name",
-    "Unit base_id",
-    "Skill Id",
-    "Tier",
-]
-
-# Player_Units: compat con Apps Script (B=Player Name, C+=unidades).
-PLAYER_UNITS_MIN_PREFIX = ["Player Id", "Player Name"]
-
+# ----------------- GUILDS / PLAYERS UPSERT -----------------
 def _ensure_headers(ws, required: List[str], synonyms: Dict[str, List[str]] | None = None) -> Dict[str, int]:
-    """
-    Asegura columnas; añade al final si faltan (no borra datos).
-    Usa 'synonyms' para no duplicar cabeceras equivalentes (ej: GP vs Guild GP).
-    Devuelve mapa header_lower -> idx 1-based.
-    """
     headers = _headers(ws)
     if not headers:
-        ws_update(ws, "A1", [required])
-        headers = required[:]
+        ws_update(ws, "A1", [required]); headers = required[:]
     else:
         existing_lower = [h.strip().lower() for h in headers]
         changed = False
         for req in required:
             req_l = req.lower()
-            if req_l in existing_lower:
-                continue
+            if req_l in existing_lower: continue
             has_syn = False
             if synonyms and req in synonyms:
                 for alt in synonyms[req]:
                     if alt.strip().lower() in existing_lower:
-                        has_syn = True
-                        break
+                        has_syn = True; break
             if not has_syn:
-                headers.append(req)
-                existing_lower.append(req_l)
-                changed = True
+                headers.append(req); existing_lower.append(req_l); changed = True
         if changed:
             ws_update(ws, "1:1", [headers])
     return {h.strip().lower(): i for i, h in enumerate(headers, start=1)}
 
-def _resolve_col(colmap: Dict[str, int], name: str, synonyms: Dict[str, List[str]] | None = None) -> int | None:
+def _resolve_col(colmap: Dict[str,int], name: str, synonyms: Dict[str, List[str]] | None = None) -> Optional[int]:
     key = name.strip().lower()
-    if key in colmap:
-        return colmap[key]
+    if key in colmap: return colmap[key]
     if synonyms and name in synonyms:
         for alt in synonyms[name]:
             k = alt.strip().lower()
-            if k in colmap:
-                return colmap[k]
+            if k in colmap: return colmap[k]
     return None
 
-def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List[str], newvals: Dict[str, Any]):
+def upsert_guild_row(ws, colmap: Dict[str,int], row_idx_1b: int, prev_row: List[str], newvals: Dict[str, Any]):
     headers_now = _headers(ws)
     row = prev_row[:] if prev_row else [""] * len(headers_now)
-
     def should_set(val: Any) -> bool:
-        if val is None:
-            return False
-        if isinstance(val, (int, float)):
-            return True
+        if val is None: return False
+        if isinstance(val, (int,float)): return True
         return str(val).strip() != ""
-
     def setv(colname: str, val: Any):
-        if not should_set(val):
-            return
+        if not should_set(val): return
         idx = _resolve_col(colmap, colname, GUILDS_HEADER_SYNONYMS)
-        if idx:
-            row[idx - 1] = str(val)
-
-    for key in ("Guild Name", "Members", "GP", "Last Raid Id", "Last Raid Score"):
-        if key in newvals:
-            setv(key, newvals[key])
-
-    # Marca de tiempo de última actualización
+        if idx: row[idx-1] = str(val)
+    for key in ("Guild Name","Members","GP","Last Raid Id","Last Raid Score"):
+        if key in newvals: setv(key, newvals[key])
     setv("Last Update", now_ts())
-
     ws_update(ws, f"{row_idx_1b}:{row_idx_1b}", [row])
 
-def upsert_player_rows(ws, colmap: Dict[str, int], existing_rows: List[List[str]], rows_by_playerid: Dict[str, List[str]]):
-    headers_now = _headers(ws)
-    idx_pid = colmap.get("player id")
-    current_index: Dict[str, int] = {}
-    if idx_pid:
-        for i, r in enumerate(existing_rows):
-            pid = (r[idx_pid - 1] if idx_pid - 1 < len(r) else "").strip()
-            if pid:
-                current_index[pid] = i
-
-    final_rows = existing_rows[:]
-    for pid, newrow in rows_by_playerid.items():
-        if pid in current_index:
-            i = current_index[pid]
-            prev = final_rows[i]
-            merged = prev[:] + [""] * (len(headers_now) - len(prev))
-            for j in range(min(len(merged), len(newrow))):
-                if newrow[j] != "":
-                    merged[j] = newrow[j]
-            final_rows[i] = merged
-        else:
-            row = [""] * len(headers_now)
-            for j in range(min(len(row), len(newrow))):
-                row[j] = newrow[j]
-            final_rows.append(row)
-
-    if final_rows != existing_rows:
-        ws_update(ws, f"2:{len(final_rows)+1}", final_rows)
-
-# ==========
-# Catálogo de unidades (Characters + Ships)
-# ==========
+# ----------------- UNIT CATALOG FOR Player_Units -----------------
 def read_unit_catalog(ss) -> Tuple[List[str], Dict[str, str], Dict[str, bool]]:
-    """
-    Devuelve:
-      unit_base_ids (ordenadas por friendly name asc),
-      baseId_to_friendly,
-      is_ship_by_baseId
-    Lee de las hojas Characters y Ships. Aplica EXCLUDE_BASEID_CONTAINS.
-    """
     def _read(sheet_name: str) -> Tuple[List[str], List[List[str]]]:
         ws = ss.worksheet(sheet_name)
         vals = ws.get_all_values() or []
@@ -415,55 +253,39 @@ def read_unit_catalog(ss) -> Tuple[List[str], Dict[str, str], Dict[str, bool]]:
         rows = vals[1:] if len(vals) > 1 else []
         return headers, rows
 
-    base_to_name: Dict[str, str] = {}
-    is_ship: Dict[str, bool] = {}
+    base_to_name: Dict[str,str] = {}
+    is_ship: Dict[str,bool] = {}
 
     # Characters
     try:
         h, rows = _read(SHEET_CHARACTERS)
-        idx_base = h.index("base_id") if "base_id" in h else [i for i, v in enumerate(h) if v.lower() == "base_id"][0]
-        idx_name = h.index("Name") if "Name" in h else [i for i, v in enumerate(h) if v.lower() == "name"][0]
+        idx_base = h.index("base_id") if "base_id" in h else [i for i,v in enumerate(h) if v.lower()=="base_id"][0]
+        idx_name = h.index("Name") if "Name" in h else [i for i,v in enumerate(h) if v.lower()=="name"][0]
         for r in rows:
             base = (r[idx_base] if idx_base < len(r) else "").strip()
-            if not base or _exclude_baseid(base):
-                continue
+            if not base or _exclude_baseid(base): continue
             name = (r[idx_name] if idx_name < len(r) else "").strip()
-            if name:
-                base_to_name[base] = name
-                is_ship[base] = False
+            if name: base_to_name[base]=name; is_ship[base]=False
     except Exception as e:
         log.warning("No se pudo leer Characters: %s", e)
 
     # Ships
     try:
         h, rows = _read(SHEET_SHIPS)
-        idx_base = h.index("base_id") if "base_id" in h else [i for i, v in enumerate(h) if v.lower() == "base_id"][0]
-        idx_name = h.index("Name") if "Name" in h else [i for i, v in enumerate(h) if v.lower() == "name"][0]
+        idx_base = h.index("base_id") if "base_id" in h else [i for i,v in enumerate(h) if v.lower()=="base_id"][0]
+        idx_name = h.index("Name") if "Name" in h else [i for i,v in enumerate(h) if v.lower()=="name"][0]
         for r in rows:
             base = (r[idx_base] if idx_base < len(r) else "").strip()
-            if not base or _exclude_baseid(base):
-                continue
+            if not base or _exclude_baseid(base): continue
             name = (r[idx_name] if idx_name < len(r) else "").strip()
-            if name:
-                base_to_name[base] = name
-                is_ship[base] = True
+            if name: base_to_name[base]=name; is_ship[base]=True
     except Exception as e:
         log.warning("No se pudo leer Ships: %s", e)
 
     unit_base_ids = sorted(base_to_name.keys(), key=lambda b: base_to_name[b].lower())
     return unit_base_ids, base_to_name, is_ship
 
-def ensure_player_units_headers(ws, unit_base_ids: List[str], base_to_name: Dict[str, str]) -> Tuple[Dict[str, int], Dict[str, int], List[str]]:
-    """
-    Asegura cabecera en Player_Units:
-      - Mantiene lo existente
-      - Garantiza que están "Player Id" y "Player Name"
-      - Añade columnas de cada unidad por friendly name (si falta, la añade al final)
-    Devuelve:
-      colmap_lower -> idx(1-based),
-      unit_col_by_friendly -> idx(1-based),
-      headers_actualizados
-    """
+def ensure_player_units_headers(ws, unit_base_ids: List[str], base_to_name: Dict[str,str]) -> Tuple[Dict[str,int], Dict[str,int], List[str]]:
     headers = _headers(ws)
     if not headers:
         headers = PLAYER_UNITS_MIN_PREFIX[:] + [base_to_name[b] for b in unit_base_ids]
@@ -473,46 +295,26 @@ def ensure_player_units_headers(ws, unit_base_ids: List[str], base_to_name: Dict
         changed = False
         for col in PLAYER_UNITS_MIN_PREFIX:
             if col.lower() not in lower:
-                headers.append(col)
-                lower.append(col.lower())
-                changed = True
+                headers.append(col); lower.append(col.lower()); changed = True
         for b in unit_base_ids:
             fname = base_to_name[b]
             if fname.lower() not in lower:
-                headers.append(fname)
-                lower.append(fname.lower())
-                changed = True
+                headers.append(fname); lower.append(fname.lower()); changed = True
         if changed:
             ws_update(ws, "1:1", [headers])
-
     colmap = {h.strip().lower(): i for i, h in enumerate(headers, start=1)}
     unit_col_by_friendly = {base_to_name[b].strip().lower(): colmap[base_to_name[b].strip().lower()] for b in unit_base_ids if base_to_name[b].strip().lower() in colmap}
     return colmap, unit_col_by_friendly, headers
 
-# ==========
-# Player_Units: conversión roster -> valores por columna
-# ==========
-def roster_to_unit_values(
-    roster_units: List[Dict[str, Any]],
-    is_ship_by_base: Dict[str, bool],
-) -> Dict[str, str]:
-    """
-    Devuelve: baseId -> valor_celda ("R#" / "G12" / "<G12" / "Nave")
-    Usa definitionId antes de ":" para obtener baseId.
-    """
-    out: Dict[str, str] = {}
+def roster_to_unit_values(roster_units: List[Dict[str,Any]], is_ship_by_base: Dict[str,bool]) -> Dict[str,str]:
+    out: Dict[str,str] = {}
     for ru in roster_units or []:
         defid = str(ru.get("definitionId") or "").strip()
-        if not defid:
-            continue
+        if not defid: continue
         base = defid.split(":")[0]
-        if not base or _exclude_baseid(base):
-            continue
-
+        if not base or _exclude_baseid(base): continue
         if is_ship_by_base.get(base, False):
-            out[base] = "Nave"
-            continue
-
+            out[base] = "Nave"; continue
         relic = 0
         rel_obj = ru.get("relic") or {}
         if isinstance(rel_obj, dict):
@@ -520,74 +322,49 @@ def roster_to_unit_values(
         out[base] = RELIC_MAP.get(relic, RELIC_MAP[0])
     return out
 
-# ==========
-# Player_Skills: extracción desde roster
-# ==========
-def extract_player_skills_rows(
-    players_data: Dict[str, Dict[str, Any]]
-) -> List[List[str]]:
+# ----------------- SKILL CATALOG (Zetas + Omicrons) -----------------
+def read_skill_catalog(ss) -> Tuple[Dict[str,str], Dict[str,List[str]], List[str]]:
     """
-    Recorre players_data[pid]['roster'] y genera filas:
-    [Player Id, Player Name, Guild Name, Unit base_id, Skill Id, Tier]
-    Aplica EXCLUDE_BASEID_CONTAINS a base_id y skill_id.
+    Lee CharactersZetas y CharactersOmicrons y devuelve:
+      - skill_id_to_name
+      - skill_name_to_ids
+      - skill_names (ordenados alfabéticamente, únicos por nombre)
+    Aplica EXCLUDE_BASEID_CONTAINS al skillId.
     """
-    rows: List[List[str]] = []
+    skill_id_to_name: Dict[str,str] = {}
+    def _ingest(sheet_name: str):
+        try:
+            ws = ss.worksheet(sheet_name)
+        except Exception:
+            return
+        headers, rows = _get_all(ws)
+        if not rows: return
+        cm = {h.lower(): i for i, h in enumerate(headers)}
+        i_sid = cm.get("skill id") or cm.get("skillid") or cm.get("id")  # tolerante
+        i_name = cm.get("name")
+        if i_sid is None or i_name is None:
+            return
+        for r in rows:
+            sid = (r[i_sid] if i_sid < len(r) else "").strip()
+            name = (r[i_name] if i_name < len(r) else "").strip()
+            if not sid or not name: continue
+            if _exclude_skillid(sid): continue
+            # skillId puede repetirse entre hojas; prioriza primero visto
+            skill_id_to_name.setdefault(sid, name)
 
-    for pid, pdata in players_data.items():
-        pname = str(pdata.get("name") or "").strip()
-        gname = str(pdata.get("guild_name") or "").strip()
-        roster = pdata.get("roster") or []
+    _ingest(SHEET_ZETAS)
+    _ingest(SHEET_OMIS)
 
-        for ru in roster:
-            defid = str(ru.get("definitionId") or "").strip()
-            if not defid:
-                continue
-            base = defid.split(":")[0]
-            if not base or _exclude_baseid(base):
-                continue
+    skill_name_to_ids: Dict[str,List[str]] = {}
+    for sid, nm in skill_id_to_name.items():
+        skill_name_to_ids.setdefault(nm, []).append(sid)
 
-            # skills puede venir en distintas keys; cubrimos las más comunes
-            skills = (ru.get("skill") or ru.get("skills") or ru.get("skillList") or [])
-            if not isinstance(skills, list):
-                continue
+    # orden por nombre (únicos)
+    skill_names = sorted(skill_name_to_ids.keys(), key=lambda s: s.lower())
+    return skill_id_to_name, skill_name_to_ids, skill_names
 
-            for s in skills:
-                if not isinstance(s, dict):
-                    continue
-                sid = s.get("id") or s.get("skillId") or s.get("idRef")
-                if not sid or _exclude_skillid(str(sid)):
-                    continue
-
-                tier = s.get("tier")
-                if tier is None:
-                    tier = s.get("currentTier", s.get("selectedTier", s.get("tierIndex", 0)))
-
-                try:
-                    tier_int = int(tier)
-                except Exception:
-                    tier_int = 0
-
-                rows.append([pid, pname, gname, base, str(sid), str(tier_int)])
-
-    return rows
-
-# ==========
-# Procesado de un gremio
-# ==========
-def process_guild(
-    ss,
-    ws_guilds,
-    ws_players,
-    guild_id: str,
-    guild_row_idx_1b: int,
-    guild_row_vals: List[str],
-) -> Tuple[str, int, Dict[str, Dict[str, Any]]]:
-    """
-    Procesa un guild:
-      - actualiza fila en Guilds
-      - devuelve (guild_name, num_miembros_procesados, players_data_by_playerId)
-    """
-    # 1) /guild
+# ----------------- PROCESO DE GREMIO -----------------
+def process_guild(ss, ws_guilds, ws_players, guild_id: str, guild_row_idx_1b: int, guild_row_vals: List[str]) -> Tuple[str, int, Dict[str, Dict[str, Any]]]:
     try:
         gdata = fetch_guild({"guildId": guild_id})
     except Exception as e:
@@ -596,8 +373,7 @@ def process_guild(
 
     guild_obj = gdata.get("guild") if isinstance(gdata.get("guild"), dict) else gdata
 
-    # Nombre de guild
-    guild_name = _safe_get(guild_obj, ["profile", "name"], "") or guild_obj.get("name", "")
+    guild_name = _safe_get(guild_obj, ["profile","name"], "") or guild_obj.get("name", "")
     if not guild_name and guild_row_vals:
         try:
             hdrs = _headers(ws_guilds)
@@ -606,39 +382,26 @@ def process_guild(
         except Exception:
             pass
 
-    # GP del guild (tolerante)
-    guild_gp = _safe_get(guild_obj, ["profile", "guildGalacticPower"], None)
+    guild_gp = _safe_get(guild_obj, ["profile","guildGalacticPower"], None)
     if guild_gp is None:
         guild_gp = guild_obj.get("galacticPower", 0)
 
-    # Miembros
-    members_arr = _safe_get(gdata, ["guild", "member"], []) or []
+    members_arr = _safe_get(gdata, ["guild","member"], []) or []
     members_count = len(members_arr)
 
     last_raid_id, last_raid_points = _parse_last_raid(gdata)
 
-    # 2) Actualizar Guilds
     gheaders, _ = _get_all(ws_guilds)
     gcol = {h.lower(): i for i, h in enumerate(gheaders, start=1)}
-    newvals = {
-        "Guild Name": guild_name,
-        "Members": members_count,
-        "GP": guild_gp,
-        "Last Raid Id": last_raid_id,
-        "Last Raid Score": last_raid_points,
-    }
+    newvals = {"Guild Name": guild_name, "Members": members_count, "GP": guild_gp, "Last Raid Id": last_raid_id, "Last Raid Score": last_raid_points}
     upsert_guild_row(ws_guilds, gcol, guild_row_idx_1b, guild_row_vals, newvals)
 
-    # 3) Obtener detalle por jugador (/player UNA vez por miembro, siempre por playerId)
     players_data: Dict[str, Dict[str, Any]] = {}
     for m in members_arr:
         pid = str(m.get("playerId") or "").strip()
         name_guess = str(m.get("playerName") or "").strip()
-
-        # Role mapeado y GP desde /guild.member
         role_text = map_member_level(m.get("memberLevel"))
         gp_member = _to_int(m.get("galacticPower"), 0)
-
         if not pid:
             log.warning("Miembro %r sin playerId; no se puede consultar /player", name_guess)
             continue
@@ -650,19 +413,19 @@ def process_guild(
             log.warning("Error /player playerId=%s (%s): %s", pid, name_guess, e)
             p_resp = {}
 
-        name = str(p_resp.get("name") or _safe_get(p_resp, ["player", "name"], "") or name_guess).strip()
+        name = str(p_resp.get("name") or _safe_get(p_resp, ["player","name"], "") or name_guess).strip()
         ally = _parse_allycode(p_resp)
-        level = str(_safe_get(p_resp, ["level"], "") or _safe_get(p_resp, ["player", "level"], ""))
+        level = str(_safe_get(p_resp, ["level"], "") or _safe_get(p_resp, ["player","level"], ""))
         gac = _parse_player_rating(p_resp)
-        roster = p_resp.get("rosterUnit") or _safe_get(p_resp, ["player", "rosterUnit"], []) or []
+        roster = p_resp.get("rosterUnit") or _safe_get(p_resp, ["player","rosterUnit"], []) or []
 
         players_data[pid] = {
             "playerId": pid,
             "name": name,
             "ally": ally,
             "level": level,
-            "gp": gp_member,       # GP correcto desde /guild.member
-            "role": role_text,     # Role mapeado
+            "gp": gp_member,
+            "role": role_text,
             "gac": gac,
             "roster": roster,
             "guild_name": guild_name,
@@ -670,9 +433,7 @@ def process_guild(
 
     return guild_name, members_count, players_data
 
-# ==========
-# Main
-# ==========
+# ----------------- MAIN -----------------
 def run() -> str:
     if not preflight_comlink():
         log.error("Abortando: COMLINK_BASE no accesible desde este servicio.")
@@ -684,18 +445,57 @@ def run() -> str:
     ws_pu = ss.worksheet(SHEET_PLAYER_UNITS)
     ws_ps = ss.worksheet(SHEET_PLAYER_SKILLS)
 
-    # Asegurar cabeceras base
     _ensure_headers(ws_guilds, GUILDS_REQUIRED, GUILDS_HEADER_SYNONYMS)
     _ensure_headers(ws_players, PLAYERS_REQUIRED)
-    _ensure_headers(ws_ps, PLAYER_SKILLS_HEADERS)
 
-    # Leer Guilds
+    # --- Catálogo de unidades (para Player_Units)
+    unit_base_ids, base_to_name, is_ship = read_unit_catalog(ss)
+    colmap_pu, unit_col_by_friendly, pu_headers = ensure_player_units_headers(ws_pu, unit_base_ids, base_to_name)
+    idx_pu_pid   = colmap_pu.get("player id")
+    idx_pu_pname = colmap_pu.get("player name")
+    _, pu_existing_rows = _get_all(ws_pu)
+
+    current_by_pid: Dict[str,int] = {}
+    current_by_pname: Dict[str,int] = {}
+    if idx_pu_pid:
+        for i, r in enumerate(pu_existing_rows):
+            pid = (r[idx_pu_pid-1] if idx_pu_pid-1 < len(r) else "").strip()
+            if pid: current_by_pid[pid] = i
+    if idx_pu_pname:
+        for i, r in enumerate(pu_existing_rows):
+            pname = (r[idx_pu_pname-1] if idx_pu_pname-1 < len(r) else "").strip().lower()
+            if pname: current_by_pname[pname] = i
+
+    # --- Índices Players
+    p_headers = _headers(ws_players)
+    pcol = {h.lower(): i for i, h in enumerate(p_headers, start=1)}
+    _, players_existing_rows = _get_all(ws_players)
+    players_index_by_pid: Dict[str,int] = {}
+    idx_pid_players = pcol.get("player id")
+    if idx_pid_players:
+        for i, r in enumerate(players_existing_rows):
+            pid = (r[idx_pid_players-1] if idx_pid_players-1 < len(r) else "").strip()
+            if pid: players_index_by_pid[pid] = i
+
+    final_pu_rows = pu_existing_rows[:]
+    final_players_rows = players_existing_rows[:]
+
+    # --- NUEVO: preparar matriz de skills por jugador (guild, name) ---
+    # Leemos catálogo de skills (zetas + omicrones) para definir columnas por NOMBRE.
+    skill_id_to_name, skill_name_to_ids, skill_names = read_skill_catalog(ss)
+    # Diccionario final: (guild_name, player_name) -> { skill_name: tier_str }
+    skills_matrix: Dict[Tuple[str,str], Dict[str,str]] = {}
+
+    # --- Procesar Guilds ---
     g_headers, g_rows = _get_all(ws_guilds)
     if not g_rows:
         log.info("No hay filas en Guilds.")
+        # Aún así, aseguramos cabecera en Player_Skills como matriz vacía
+        matrix_headers = ["Player Guild", "Player Name"] + skill_names
+        ws_update(ws_ps, "1:1", [matrix_headers])
+        ws_ps.resize(1, len(matrix_headers))
         return "ok: 0 guilds"
 
-    # Índice de columna Guild Id
     try:
         idx_gid = g_headers.index("Guild Id")
     except ValueError:
@@ -705,105 +505,52 @@ def run() -> str:
         else:
             raise RuntimeError("La hoja Guilds no contiene la columna 'Guild Id'")
 
-    # ---- Preparar Player_Units: catálogo de unidades y cabecera ----
-    unit_base_ids, base_to_name, is_ship = read_unit_catalog(ss)
-    colmap_pu, unit_col_by_friendly, pu_headers = ensure_player_units_headers(ws_pu, unit_base_ids, base_to_name)
-
-    # Índices útiles en Player_Units
-    idx_pu_pid = colmap_pu.get("player id")
-    idx_pu_pname = colmap_pu.get("player name")
-
-    # Leer todo Player_Units (para upsert masivo al final)
-    _, pu_existing_rows = _get_all(ws_pu)
-
-    # Índices para encontrar filas existentes
-    current_by_pid: Dict[str, int] = {}
-    current_by_pname: Dict[str, int] = {}
-    if idx_pu_pid:
-        for i, r in enumerate(pu_existing_rows):
-            pid = (r[idx_pu_pid - 1] if idx_pu_pid - 1 < len(r) else "").strip()
-            if pid:
-                current_by_pid[pid] = i
-    if idx_pu_pname:
-        for i, r in enumerate(pu_existing_rows):
-            pname = (r[idx_pu_pname - 1] if idx_pu_pname - 1 < len(r) else "").strip().lower()
-            if pname:
-                current_by_pname[pname] = i
-
-    # También prepararemos upsert para Players
-    p_headers = _headers(ws_players)
-    pcol = {h.lower(): i for i, h in enumerate(p_headers, start=1)}
-    _, players_existing_rows = _get_all(ws_players)
-    players_index_by_pid: Dict[str, int] = {}
-    idx_pid_players = pcol.get("player id")
-    if idx_pid_players:
-        for i, r in enumerate(players_existing_rows):
-            pid = (r[idx_pid_players - 1] if idx_pid_players - 1 < len(r) else "").strip()
-            if pid:
-                players_index_by_pid[pid] = i
-
-    # Matrices finales
-    final_pu_rows = pu_existing_rows[:]  # sin cabecera
-    final_players_rows = players_existing_rows[:]
-    all_skill_rows: List[List[str]] = []
-
     processed = 0
     players_upd = 0
 
     log.info("Procesando %d gremio(s)…", len(g_rows))
-    for i, row in enumerate(g_rows, start=2):  # filas 2..N
+    for i, row in enumerate(g_rows, start=2):
         gid = (row[idx_gid].strip() if idx_gid < len(row) else "")
-        if not gid:
-            continue
-
-        # Filtrar por ENV si procede
+        if not gid: continue
         if FILTER_GUILD_IDS and gid not in FILTER_GUILD_IDS:
             continue
 
-        # Reintentos alrededor de /guild
         attempts = 4
         delay = 1.2
         last_exc: Optional[Exception] = None
         players_data: Dict[str, Dict[str, Any]] = {}
-        for a in range(1, attempts + 1):
+        for _try in range(attempts):
             try:
-                _, _, players_data = process_guild(
-                    ss, ws_guilds, ws_players, gid, i, row
-                )
+                _, _, players_data = process_guild(ss, ws_guilds, ws_players, gid, i, row)
                 last_exc = None
                 break
             except Exception as e:
                 log.warning("Error en POST /guild: %s", e)
                 last_exc = e
-                time.sleep(delay)
-                delay *= 1.6
-                continue
+                time.sleep(delay); delay *= 1.6
         if last_exc:
             log.error("Error obteniendo guildId=%s: %s", gid, last_exc)
             continue
 
-        # Para cada jugador del gremio: actualizar Players y Player_Units
+        # Actualizar Players y Player_Units; acumular skills para matriz.
         for pid, pdata in players_data.items():
-            pname = pdata.get("name", "") or ""
-            ally = pdata.get("ally", "") or ""
-            level = pdata.get("level", "") or ""
-            gp = pdata.get("gp", "") or ""
-            role = pdata.get("role", "") or ""
-            gac = pdata.get("gac", "") or ""
-            roster = pdata.get("roster", []) or []
-            guild_name = pdata.get("guild_name", "") or ""
+            pname = pdata.get("name","") or ""
+            ally  = pdata.get("ally","") or ""
+            level = pdata.get("level","") or ""
+            gp    = pdata.get("gp","") or ""
+            role  = pdata.get("role","") or ""
+            gac   = pdata.get("gac","") or ""
+            roster= pdata.get("roster",[]) or []
+            guild_name = pdata.get("guild_name","") or ""
 
-            # ---- Players (upsert por Player Id si posible) ----
+            # ---- Players upsert por Player Id
             if idx_pid_players and pid and pid in players_index_by_pid:
                 idx_row = players_index_by_pid[pid]
                 prev = final_players_rows[idx_row]
                 merged = prev[:] + [""] * (len(p_headers) - len(prev))
-
                 def setp(col: str, val: Any):
                     j = pcol.get(col.lower())
-                    if j:
-                        merged[j - 1] = "" if val is None else str(val)
-
+                    if j: merged[j-1] = "" if val is None else str(val)
                 setp("Player Id", pid)
                 setp("Player Name", pname)
                 setp("Ally code", ally)
@@ -816,12 +563,9 @@ def run() -> str:
                 players_upd += 1
             else:
                 rowp = [""] * len(p_headers)
-
                 def setp(col: str, val: Any):
                     j = pcol.get(col.lower())
-                    if j:
-                        rowp[j - 1] = "" if val is None else str(val)
-
+                    if j: rowp[j-1] = "" if val is None else str(val)
                 setp("Player Id", pid)
                 setp("Player Name", pname)
                 setp("Ally code", ally)
@@ -837,77 +581,107 @@ def run() -> str:
 
             # ---- Player_Units ----
             base_to_val = roster_to_unit_values(roster, is_ship)
-
-            # Encontrar índice de fila existente (por Player Id si existe, si no por Player Name)
+            # localizar fila existente por Player Id o Name
             idx_row_pu: Optional[int] = None
             if idx_pu_pid and pid and pid in current_by_pid:
                 idx_row_pu = current_by_pid[pid]
             elif idx_pu_pname and pname and pname.lower() in current_by_pname:
                 idx_row_pu = current_by_pname[pname.lower()]
-
-            # Asegurar longitud de fila
+            # asegurar fila base
             if idx_row_pu is not None:
                 prev = final_pu_rows[idx_row_pu]
                 merged = prev[:] + [""] * (len(pu_headers) - len(prev))
             else:
                 merged = [""] * len(pu_headers)
-                # registrar nuevo índice
-                if idx_pu_pid and pid:
-                    current_by_pid[pid] = len(final_pu_rows)
-                if idx_pu_pname and pname:
-                    current_by_pname[pname.lower()] = len(final_pu_rows)
-
-            # Setear prefijo ("Player Id", "Player Name") si existen
-            if idx_pu_pid:
-                merged[idx_pu_pid - 1] = pid
-            if idx_pu_pname:
-                merged[idx_pu_pname - 1] = pname
-
-            # Rellenar unidades por friendly name -> columna
+                if idx_pu_pid and pid: current_by_pid[pid] = len(final_pu_rows)
+                if idx_pu_pname and pname: current_by_pname[pname.lower()] = len(final_pu_rows)
+            # prefijo
+            if idx_pu_pid:   merged[idx_pu_pid-1] = pid
+            if idx_pu_pname: merged[idx_pu_pname-1] = pname
+            # unidades
             for base_id, val in base_to_val.items():
                 fname = base_to_name.get(base_id)
-                if not fname:
-                    continue
+                if not fname: continue
                 col = unit_col_by_friendly.get(fname.strip().lower())
-                if not col:
-                    continue
-                merged[col - 1] = val
-
-            # Guardar en matriz final
+                if not col: continue
+                merged[col-1] = val
             if idx_row_pu is not None:
                 final_pu_rows[idx_row_pu] = merged
             else:
                 final_pu_rows.append(merged)
 
-        # ---- Player_Skills (acumula para todos los gremios) ----
-        all_skill_rows.extend(extract_player_skills_rows(players_data))
+            # ---- NUEVO: acumular skills del jugador para matriz ----
+            if skill_id_to_name:
+                key = (guild_name, pname)
+                rowdict = skills_matrix.setdefault(key, {})
+                # extrae skills de cada unidad
+                for ru in roster:
+                    skills = (ru.get("skill") or ru.get("skills") or ru.get("skillList") or [])
+                    if not isinstance(skills, list): continue
+                    for s in skills:
+                        if not isinstance(s, dict): continue
+                        sid = s.get("id") or s.get("skillId") or s.get("idRef")
+                        if not sid: continue
+                        sid = str(sid).strip()
+                        if sid not in skill_id_to_name:  # solo las del catálogo (zetas/omicrons)
+                            continue
+                        if _exclude_skillid(sid):  # seguridad adicional
+                            continue
+                        tier = s.get("tier")
+                        if tier is None:
+                            tier = s.get("currentTier", s.get("selectedTier", s.get("tierIndex", 0)))
+                        try:
+                            tier_int = int(tier)
+                        except Exception:
+                            tier_int = 0
+                        sname = skill_id_to_name[sid]
+                        # Si hay colisión de nombre con varias skills, guarda el máximo tier
+                        prev = rowdict.get(sname)
+                        if prev is None or tier_int > _to_int(prev, 0):
+                            rowdict[sname] = str(tier_int)
+
         processed += 1
 
-    # ---- Volcado final a Sheets ----
+    # ---- Volcado final a Sheets: Players / Player_Units ----
     if final_players_rows != players_existing_rows:
         ws_update(ws_players, f"2:{len(final_players_rows)+1}", final_players_rows)
-
     if final_pu_rows != pu_existing_rows:
         ws_update(ws_pu, f"2:{len(final_pu_rows)+1}", final_pu_rows)
 
-    # Player_Skills: reescribir hoja completa
-    ps_cols = len(PLAYER_SKILLS_HEADERS)  # 6 columnas
-    if all_skill_rows:
-        needed_rows = len(all_skill_rows) + 1  # + cabecera
-        # Expande primero para que A2 exista
-        ws_ps.resize(max(needed_rows, 2), ps_cols)
-        # Escribe las filas (A2 …)
-        ws_update(ws_ps, "A2", all_skill_rows)
-        # Ajusta filas exactamente a lo necesario (opcional)
-        ws_ps.resize(needed_rows, ps_cols)
+    # ---- NUEVO: escribir matriz de Player_Skills ----
+    # Cabecera: Player Guild, Player Name, <skills...>
+    matrix_headers = ["Player Guild", "Player Name"] + skill_names
+    ws_update(ws_ps, "1:1", [matrix_headers])
+
+    # Construir filas ordenadas por gremio y nombre
+    keys_sorted = sorted(skills_matrix.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
+    data_rows: List[List[str]] = []
+    for (gname, pname) in keys_sorted:
+        row = ["", ""] + [""] * len(skill_names)
+        row[0] = gname
+        row[1] = pname
+        vals = skills_matrix[(gname, pname)]
+        # rellenar columnas por nombre de skill
+        for idx, sname in enumerate(skill_names, start=2):
+            v = vals.get(sname)
+            if v is not None:
+                row[idx] = v
+        data_rows.append(row)
+
+    # Redimensionar y escribir (evitar Range exceeds)
+    cols_needed = len(matrix_headers)
+    if data_rows:
+        rows_needed = len(data_rows) + 1
+        ws_ps.resize(max(rows_needed, 2), cols_needed)
+        ws_update(ws_ps, "A2", data_rows)
+        ws_ps.resize(rows_needed, cols_needed)
     else:
-        # Sin datos: deja solo cabecera y el nº correcto de columnas
-        ws_ps.resize(1, ps_cols)
+        ws_ps.resize(1, cols_needed)
 
     if processed == 0:
         log.info("No hay filas nuevas para escribir.")
 
-    return f"ok: guilds={processed}, players_upserted~={players_upd}, player_units_rows={len(final_pu_rows)}, player_skills_rows={len(all_skill_rows)}"
+    return f"ok: guilds={processed}, players_upserted~={len(final_players_rows)}, player_units_rows={len(final_pu_rows)}, skill_matrix_rows={len(data_rows)}, skill_cols={len(skill_names)}"
 
 if __name__ == "__main__":
     print(run())
