@@ -669,6 +669,28 @@ async def cb_syncguild_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await q.edit_message_text(f"❌ Fallo ejecutando la sincronización: {e}")
 
+
+
+# -----------------------------------------------------------------------------
+# Error Monitoring
+# -----------------------------------------------------------------------------
+
+async def cmd_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _is_allowed_syncguild(update):
+            await update.effective_message.reply_text("❌ No tienes permiso para usar /syncguild.")
+            return
+        ss = _open_spreadsheet()
+        guilds = _user_guilds(ss, update.effective_user.id)
+        if not guilds:
+            await update.effective_message.reply_text("No estás registrado en ningún gremio.")
+            return
+        buttons = [[InlineKeyboardButton(g, callback_data=f"syncguild|{g}")] for g in guilds]
+        kb = InlineKeyboardMarkup(buttons)
+        await update.effective_message.reply_text("Elige el gremio a sincronizar:", reply_markup=kb)
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ Error preparando /syncguild: {e}")
+
 # -----------------------------------------------------------------------------
 # /start y /help
 # -----------------------------------------------------------------------------
