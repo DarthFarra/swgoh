@@ -4,12 +4,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from .http import post_json_retry  # <- IMPORTANTE para evitar NameError
+from .http import post_json_retry
 
 log = logging.getLogger("comlink")
 
 # ----- /metadata -------------------------------------------------------------
-
 def fetch_metadata() -> Dict[str, Any]:
     """
     POST /metadata
@@ -20,7 +19,6 @@ def fetch_metadata() -> Dict[str, Any]:
     return post_json_retry("/metadata", body, attempts=6, base_sleep=1.2)
 
 # ----- /data -----------------------------------------------------------------
-
 def fetch_data_items(version: str, items: str) -> Dict[str, Any]:
     """
     POST /data
@@ -35,7 +33,8 @@ def fetch_data_items(version: str, items: str) -> Dict[str, Any]:
       },
       "enums": false
     }
-    Nota: 'requestSegment' y 'items' son mutuamente excluyentes; usamos siempre requestSegment=0.
+    Nota: 'requestSegment' y 'items' son excluyentes en algunos esquemas,
+    pero con requestSegment=0 y 'items' funciona como catálogo concreto.
     """
     body = {
         "payload": {
@@ -51,7 +50,6 @@ def fetch_data_items(version: str, items: str) -> Dict[str, Any]:
     return post_json_retry("/data", body, attempts=8, base_sleep=1.5)
 
 # ----- /guild ----------------------------------------------------------------
-
 def fetch_guild(identifier: Dict[str, Any] | str) -> Dict[str, Any]:
     """
     POST /guild
@@ -82,7 +80,6 @@ def fetch_guild(identifier: Dict[str, Any] | str) -> Dict[str, Any]:
     return post_json_retry("/guild", body, attempts=8, base_sleep=1.3)
 
 # ----- /player ---------------------------------------------------------------
-
 def fetch_player_by_id(player_id: str) -> Dict[str, Any]:
     """
     POST /player usando SIEMPRE playerId.
@@ -104,7 +101,7 @@ def fetch_player_by_id(player_id: str) -> Dict[str, Any]:
 def fetch_player(identifier: Dict[str, Any]) -> Dict[str, Any]:
     """
     Compatibilidad: acepta {"playerId": "..."} y llama a /player con el schema correcto.
-    (No acepta allycode; a partir de ahora siempre trabajamos por playerId)
+    (No acepta allycode; a partir de ahora siempre trabajamos por playerId).
     """
     if not isinstance(identifier, dict) or "playerId" not in identifier:
         raise ValueError("fetch_player requiere {'playerId': '<id>'}")
