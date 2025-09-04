@@ -890,12 +890,20 @@ def run() -> str:
     if final_pu_rows != pu_existing_rows:
         ws_update(ws_pu, f"2:{len(final_pu_rows)+1}", final_pu_rows)
 
-    # Player_Skills: reescribir hoja completa (con redimensionado)
-    # Mantener cabecera y ajustar filas a lo justo
-    ws_ps.resize(1)  # deja solo la fila de headers
+    # PlayerSkills: reescribir hoja completa
+    # 1) Asegura capacidad (filas y columnas) ANTES de escribir A2
+    ps_cols = len(PLAYER_SKILLS_HEADERS)  # 6 columnas
     if all_skill_rows:
+        needed_rows = len(all_skill_rows) + 1  # + cabecera
+        # Expande primero para que A2 exista
+        ws_ps.resize(max(needed_rows, 2), ps_cols)
+        # Escribe las filas (A2 …)
         ws_update(ws_ps, "A2", all_skill_rows)
-        ws_ps.resize(len(all_skill_rows) + 1)
+        # Ajusta filas exactamente a lo necesario (opcional)
+        ws_ps.resize(needed_rows, ps_cols)
+    else:
+        # Sin datos: deja solo cabecera y el nº correcto de columnas
+        ws_ps.resize(1, ps_cols)
 
     if processed == 0:
         log.info("No hay filas nuevas para escribir.")
