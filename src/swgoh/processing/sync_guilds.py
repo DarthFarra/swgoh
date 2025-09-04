@@ -44,7 +44,7 @@ SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"  # JSON directo / base64 / ruta
 SHEET_GUILDS = os.getenv("GUILDS_SHEET", "Guilds")
 SHEET_PLAYERS = os.getenv("PLAYERS_SHEET", "Players")
 SHEET_PLAYER_UNITS = os.getenv("PLAYER_UNITS_SHEET", "Player_Units")
-SHEET_PLAYER_SKILLS = os.getenv("PLAYER_SKILLS_SHEET", "PlayerSkills")
+SHEET_PLAYER_SKILLS = os.getenv("PLAYER_SKILLS_SHEET", "Player_Skills")
 SHEET_CHARACTERS = os.getenv("CHARACTERS_SHEET", "Characters")
 SHEET_SHIPS = os.getenv("SHIPS_SHEET", "Ships")
 
@@ -521,7 +521,7 @@ def roster_to_unit_values(
     return out
 
 # ==========
-# PlayerSkills: extracción desde roster
+# Player_Skills: extracción desde roster
 # ==========
 def extract_player_skills_rows(
     players_data: Dict[str, Dict[str, Any]]
@@ -879,7 +879,7 @@ def run() -> str:
             else:
                 final_pu_rows.append(merged)
 
-        # ---- PlayerSkills (acumula para todos los gremios) ----
+        # ---- Player_Skills (acumula para todos los gremios) ----
         all_skill_rows.extend(extract_player_skills_rows(players_data))
         processed += 1
 
@@ -890,7 +890,7 @@ def run() -> str:
     if final_pu_rows != pu_existing_rows:
         ws_update(ws_pu, f"2:{len(final_pu_rows)+1}", final_pu_rows)
 
-    # PlayerSkills: reescribir hoja completa
+    # Player_Skills: reescribir hoja completa
     ps_cols = len(PLAYER_SKILLS_HEADERS)  # 6 columnas
     if all_skill_rows:
         needed_rows = len(all_skill_rows) + 1  # + cabecera
