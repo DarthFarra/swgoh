@@ -253,7 +253,7 @@ GUILDS_REQUIRED = [
     "Guild Id",
     "Guild Name",
     "Members",
-    "GP",
+    "Guild GP",
     "Last Raid Id",
     "Last Raid Score",
     # (Preservamos si existen: "ROTE", "nombre abreviado")
@@ -292,7 +292,7 @@ def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List
         if idx:
             row[idx - 1] = str(val)
 
-    for key in ("Guild Name", "Members", "GP", "Last Raid Id", "Last Raid Score"):
+    for key in ("Guild Name", "Members", "Guild GP", "Last Raid Id", "Last Raid Score"):
         if key in newvals:
             setv(key, newvals[key])
 
@@ -503,7 +503,7 @@ def process_guild(
     newvals = {
         "Guild Name": guild_name,
         "Members": members_count,
-        "GP": guild_gp,
+        "Guild GP": guild_gp,
         "Last Raid Id": last_raid_id,
         "Last Raid Score": last_raid_points,
     }
