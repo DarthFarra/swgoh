@@ -444,7 +444,7 @@ async def cmd_misoperaciones(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.effective_message.reply_text("No estás registrado en ningún gremio.")
         return
     if len(guilds) > 1:
-        buttons = [[InlineKeyboardButton(g, callback_data=f"ops|{g}")]]  # una fila por opción
+        buttons = [[InlineKeyboardButton(g, callback_data=f"ops|{g}")] for g in guilds]
         kb = InlineKeyboardMarkup(buttons)
         await update.effective_message.reply_text("Elige el gremio:", reply_markup=kb)
         return
@@ -613,7 +613,7 @@ async def cmd_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not guilds:
         await update.effective_message.reply_text("No estás registrado en ningún gremio.")
         return
-    buttons = [[InlineKeyboardButton(g, callback_data=f"syncguild|{g}")]]  # una fila por gremio
+    buttons = [[InlineKeyboardButton(g, callback_data=f"syncguild|{g}")] for g in guilds]
     kb = InlineKeyboardMarkup(buttons)
     await update.effective_message.reply_text("Elige el gremio a sincronizar:", reply_markup=kb)
 
