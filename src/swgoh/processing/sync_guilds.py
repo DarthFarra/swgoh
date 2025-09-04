@@ -41,15 +41,10 @@ log = logging.getLogger("sync_guilds")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"  # JSON directo / base64 / ruta
 
-# Filtrado opcional por guild(s) concretos (coma-separados)
-FILTER_GUILD_IDS = {
-    s.strip() for s in os.getenv("FILTER_GUILD_IDS", "").split(",") if s.strip()
-}
-
 SHEET_GUILDS = os.getenv("GUILDS_SHEET", "Guilds")
 SHEET_PLAYERS = os.getenv("PLAYERS_SHEET", "Players")
 SHEET_PLAYER_UNITS = os.getenv("PLAYER_UNITS_SHEET", "Player_Units")
-SHEET_PLAYER_SKILLS = os.getenv("PLAYER_SKILLS_SHEET", "Player_Skills")
+SHEET_PLAYER_SKILLS = os.getenv("PLAYER_SKILLS_SHEET", "PlayerSkills")
 SHEET_CHARACTERS = os.getenv("CHARACTERS_SHEET", "Characters")
 SHEET_SHIPS = os.getenv("SHIPS_SHEET", "Ships")
 
@@ -58,6 +53,11 @@ EXCLUDE_BASEID_CONTAINS = [s.strip().upper() for s in os.getenv("EXCLUDE_BASEID_
 
 # Zona horaria para Last Update
 TZ = ZoneInfo(os.getenv("ID_ZONA", "Europe/Madrid"))
+
+# Filtrado opcional por guild(s) concretos (coma-separados)
+FILTER_GUILD_IDS = {
+    s.strip() for s in os.getenv("FILTER_GUILD_IDS", "").split(",") if s.strip()
+}
 
 def now_ts() -> str:
     # Ej: 2025-09-03T21:37:45+02:00
@@ -86,13 +86,8 @@ def _load_service_account_creds():
             info = None
 
     if info is None:
-        try:
-            with open(raw, "r", encoding="utf-8") as f:
-                info = json.load(f)
-        except Exception as e:
-            raise RuntimeError(
-                f"No pude interpretar {SERVICE_ACCOUNT_ENV} como JSON/base64/ruta: {e}"
-            )
+        with open(raw, "r", encoding="utf-8") as f:
+            info = json.load(f)
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -186,7 +181,6 @@ ROLE_MAP = {
 }
 
 def map_member_level(val) -> str:
-    c = 0
     try:
         c = int(val)
     except Exception:
@@ -527,7 +521,7 @@ def roster_to_unit_values(
     return out
 
 # ==========
-# Player_Skills: extracción desde roster
+# PlayerSkills: extracción desde roster
 # ==========
 def extract_player_skills_rows(
     players_data: Dict[str, Dict[str, Any]]
@@ -736,10 +730,6 @@ def run() -> str:
             if pname:
                 current_by_pname[pname] = i
 
-    # Plantilla de fila Player_Units
-    def new_pu_row() -> List[str]:
-        return [""] * len(pu_headers)
-
     # También prepararemos upsert para Players
     p_headers = _headers(ws_players)
     pcol = {h.lower(): i for i, h in enumerate(p_headers, start=1)}
@@ -765,18 +755,19 @@ def run() -> str:
         gid = (row[idx_gid].strip() if idx_gid < len(row) else "")
         if not gid:
             continue
-    if FILTER_GUILD_IDS and gid not in FILTER_GUILD_IDS:
-        continue
-        
+
+        # Filtrar por ENV si procede
+        if FILTER_GUILD_IDS and gid not in FILTER_GUILD_IDS:
+            continue
+
         # Reintentos alrededor de /guild
         attempts = 4
         delay = 1.2
         last_exc: Optional[Exception] = None
-        guild_name = ""
         players_data: Dict[str, Dict[str, Any]] = {}
         for a in range(1, attempts + 1):
             try:
-                guild_name, _, players_data = process_guild(
+                _, _, players_data = process_guild(
                     ss, ws_guilds, ws_players, gid, i, row
                 )
                 last_exc = None
@@ -825,10 +816,12 @@ def run() -> str:
                 players_upd += 1
             else:
                 rowp = [""] * len(p_headers)
+
                 def setp(col: str, val: Any):
                     j = pcol.get(col.lower())
                     if j:
                         rowp[j - 1] = "" if val is None else str(val)
+
                 setp("Player Id", pid)
                 setp("Player Name", pname)
                 setp("Ally code", ally)
@@ -886,7 +879,7 @@ def run() -> str:
             else:
                 final_pu_rows.append(merged)
 
-        # ---- Player_Skills (acumula para todos los gremios) ----
+        # ---- PlayerSkills (acumula para todos los gremios) ----
         all_skill_rows.extend(extract_player_skills_rows(players_data))
         processed += 1
 
@@ -898,7 +891,6 @@ def run() -> str:
         ws_update(ws_pu, f"2:{len(final_pu_rows)+1}", final_pu_rows)
 
     # PlayerSkills: reescribir hoja completa
-    # 1) Asegura capacidad (filas y columnas) ANTES de escribir A2
     ps_cols = len(PLAYER_SKILLS_HEADERS)  # 6 columnas
     if all_skill_rows:
         needed_rows = len(all_skill_rows) + 1  # + cabecera
