@@ -41,6 +41,11 @@ log = logging.getLogger("sync_guilds")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 SERVICE_ACCOUNT_ENV = "SERVICE_ACCOUNT_FILE"  # JSON directo / base64 / ruta
 
+# Filtrado opcional por guild(s) concretos (coma-separados)
+FILTER_GUILD_IDS = {
+    s.strip() for s in os.getenv("FILTER_GUILD_IDS", "").split(",") if s.strip()
+}
+
 SHEET_GUILDS = os.getenv("GUILDS_SHEET", "Guilds")
 SHEET_PLAYERS = os.getenv("PLAYERS_SHEET", "Players")
 SHEET_PLAYER_UNITS = os.getenv("PLAYER_UNITS_SHEET", "Player_Units")
@@ -760,7 +765,9 @@ def run() -> str:
         gid = (row[idx_gid].strip() if idx_gid < len(row) else "")
         if not gid:
             continue
-
+    if FILTER_GUILD_IDS and gid not in FILTER_GUILD_IDS:
+        continue
+        
         # Reintentos alrededor de /guild
         attempts = 4
         delay = 1.2
