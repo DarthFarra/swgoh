@@ -1,3 +1,4 @@
+# src/swgoh/processing/sync_guilds.py
 from __future__ import annotations
 
 import os
@@ -194,6 +195,46 @@ def map_member_level(val) -> str:
         try: c = int(str(val).strip())
         except Exception: c = 0
     return ROLE_MAP.get(c, (str(c) if c else ""))
+
+def write_table_body(ws, headers: List[str], rows: List[List[str]]):
+    """Escribe el cuerpo (desde A2). Ajusta tamaño seguro para evitar 'Range exceeds grid limits'."""
+    cols = len(headers) if headers else 1
+    target_rows = max(len(rows) + 1, 1)
+    ws.resize(target_rows, cols)
+    if rows:
+        ws_update(ws, "A2", rows)
+    else:
+        # Mantener solo cabecera
+        ws.resize(1, cols)
+
+# ----------------- REBUILD ÍNDICES (fix IndexError) -----------------
+def rebuild_players_index_by_pid(rows: List[List[str]], idx_pid_col_1b: Optional[int]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    if not idx_pid_col_1b:
+        return out
+    col = idx_pid_col_1b - 1
+    for i, r in enumerate(rows):
+        pid = (r[col] if col < len(r) else "").strip()
+        if pid:
+            out[pid] = i
+    return out
+
+def rebuild_pu_indices(rows: List[List[str]], idx_pid_1b: Optional[int], idx_pname_1b: Optional[int]) -> Tuple[Dict[str,int], Dict[str,int]]:
+    by_pid: Dict[str,int] = {}
+    by_name: Dict[str,int] = {}
+    if idx_pid_1b:
+        c = idx_pid_1b - 1
+        for i, r in enumerate(rows):
+            pid = (r[c] if c < len(r) else "").strip()
+            if pid:
+                by_pid[pid] = i
+    if idx_pname_1b:
+        c = idx_pname_1b - 1
+        for i, r in enumerate(rows):
+            name = (r[c] if c < len(r) else "").strip().lower()
+            if name:
+                by_name[name] = i
+    return by_pid, by_name
 
 # ----------------- GUILDS / PLAYERS UPSERT -----------------
 def _ensure_headers(ws, required: List[str], synonyms: Dict[str, List[str]] | None = None) -> Dict[str, int]:
@@ -538,7 +579,6 @@ def run() -> str:
 
     # --- Catálogo de skills (zetas + omicrons) con headers exactos 'skillid'/'skill name'
     skill_id_to_name, skill_name_to_ids, skill_names = read_skill_catalog(ss)
-    # Si no hay catálogo, mantendremos columnas solo con Player Guild/Name; no se llenará nada.
 
     # --- Procesar Guilds ---
     g_headers, g_rows = _get_all(ws_guilds)
@@ -611,6 +651,10 @@ def run() -> str:
             final_pu_rows = [r for r in final_pu_rows
                              if not (idx_pu_pname - 1 < len(r) and (r[idx_pu_pname - 1] or "").strip().lower() in guild_pnames)]
 
+        # >>> RECONSTRUIR ÍNDICES TRAS LOS BORRADOS <<<
+        players_index_by_pid = rebuild_players_index_by_pid(final_players_rows, idx_pid_players)
+        current_by_pid, current_by_pname = rebuild_pu_indices(final_pu_rows, idx_pu_pid, idx_pu_pname)
+
         # ---- Reinsertar Players + Player_Units + matriz de skills
         for pid, pdata in players_data.items():
             pname = pdata.get("name","") or ""
@@ -622,8 +666,13 @@ def run() -> str:
             roster= pdata.get("roster",[]) or []
 
             # Players (upsert por Player Id si ya existía)
+            idx_row = None
             if idx_pid_players and pid and pid in players_index_by_pid:
-                idx_row = players_index_by_pid[pid]
+                tmp_idx = players_index_by_pid[pid]
+                if 0 <= tmp_idx < len(final_players_rows):
+                    idx_row = tmp_idx
+
+            if idx_row is not None:
                 prev = final_players_rows[idx_row]
                 merged = prev[:] + [""] * (len(p_headers) - len(prev))
                 def setp(col: str, val: Any):
@@ -664,7 +713,7 @@ def run() -> str:
                 idx_row_pu = current_by_pid[pid]
             elif idx_pu_pname and pname and pname.lower() in current_by_pname:
                 idx_row_pu = current_by_pname[pname.lower()]
-            if idx_row_pu is not None:
+            if idx_row_pu is not None and 0 <= idx_row_pu < len(final_pu_rows):
                 prev = final_pu_rows[idx_row_pu]
                 merged = prev[:] + [""] * (len(pu_headers) - len(prev))
             else:
@@ -679,7 +728,7 @@ def run() -> str:
                 col = unit_col_by_friendly.get(fname.strip().lower())
                 if not col: continue
                 merged[col-1] = val
-            if idx_row_pu is not None:
+            if idx_row_pu is not None and 0 <= idx_row_pu < len(final_pu_rows):
                 final_pu_rows[idx_row_pu] = merged
             else:
                 final_pu_rows.append(merged)
@@ -716,9 +765,9 @@ def run() -> str:
 
     # ---- Volcado final a Sheets: Players / Player_Units ----
     if final_players_rows != players_existing_rows:
-        ws_update(ws_players, f"2:{len(final_players_rows)+1}", final_players_rows)
+        write_table_body(ws_players, p_headers, final_players_rows)
     if final_pu_rows != pu_existing_rows:
-        ws_update(ws_pu, f"2:{len(final_pu_rows)+1}", final_pu_rows)
+        write_table_body(ws_pu, pu_headers, final_pu_rows)
 
     # ---- MERGE SELECTIVO de Player_Skills ----
     # Unión de columnas de skills: existentes + catálogo actual
