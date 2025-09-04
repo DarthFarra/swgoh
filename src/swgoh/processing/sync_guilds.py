@@ -11,6 +11,8 @@ import urllib.request
 import urllib.error
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -47,6 +49,18 @@ SHEET_SHIPS = os.getenv("SHIPS_SHEET", "Ships")
 
 # Unidades a excluir por substrings en baseId (coma-separado)
 EXCLUDE_BASEID_CONTAINS = [s.strip().upper() for s in os.getenv("EXCLUDE_BASEID_CONTAINS", "").split(",") if s.strip()]
+
+
+# ==========
+# Date/Time Settings
+# ==========
+TZ = ZoneInfo(os.getenv("ID_ZONA", "Europe/Madrid"))
+
+def now_ts() -> str:
+    # 2025-09-03T21:37:45+02:00
+    return datetime.now(TZ).isoformat(timespec="seconds")
+
+
 
 # ==========
 # Google Sheets helpers
@@ -169,6 +183,16 @@ def preflight_comlink() -> bool:
 # ==========
 DIV_MAP = {25: "1", 20: "2", 15: "3", 10: "4", 5: "5"}
 
+ROLE_MAP = {
+    2: "Miembro",
+    3: "Oficial",
+    4: "Lider",  # (sin tilde, como pediste)
+}
+
+def map_member_level(val) -> str:
+    c = _to_int(val, 0)
+    return ROLE_MAP.get(c, (str(c) if c else ""))
+
 RELIC_MAP = {
     11: "R9",
     10: "R8",
@@ -256,6 +280,7 @@ GUILDS_REQUIRED = [
     "Guild GP",
     "Last Raid Id",
     "Last Raid Score",
+    "Last Update",
     # (Preservamos si existen: "ROTE", "nombre abreviado")
 ]
 
@@ -296,7 +321,9 @@ def upsert_guild_row(ws, colmap: Dict[str, int], row_idx_1b: int, prev_row: List
         if key in newvals:
             setv(key, newvals[key])
 
-    ws_update(ws, f"{row_idx_1b}:{row_idx_1b}", [row])
+    setv("Last Update", now_ts())
+
+    ws.update(range_name=f"{row_idx_1b}:{row_idx_1b}", values=[row])
 
 def upsert_player_rows(ws, colmap: Dict[str, int], existing_rows: List[List[str]], rows_by_playerid: Dict[str, List[str]]):
     headers_now = _headers(ws)
@@ -511,41 +538,42 @@ def process_guild(
 
     # 3) Obtener detalle por jugador (/player UNA vez por miembro, siempre por playerId)
     players_data: Dict[str, Dict[str, Any]] = {}
-    for m in members_arr:
-        pid = str(m.get("playerId") or "").strip()
-        name_guess = str(m.get("playerName") or "").strip()
-        # en tu esquema es "memberLevel"
-        role = str(m.get("memberLevel") or "").strip()
+for m in members_arr:
+    pid = str(m.get("playerId") or "").strip()
+    name_guess = str(m.get("playerName") or "").strip()
 
-        if not pid:
-            log.warning("Miembro %r sin playerId; no se puede consultar /player", name_guess)
-            continue
+    # >>> NUEVO: role en texto y GP desde /guild.member
+    role_text = map_member_level(m.get("memberLevel"))
+    gp_member = _to_int(m.get("galacticPower"), 0)
 
-        p_resp: Dict[str, Any] = {}
-        try:
-            p_resp = fetch_player_by_id(pid)
-        except Exception as e:
-            log.warning("Error /player playerId=%s (%s): %s", pid, name_guess, e)
-            p_resp = {}
+    if not pid:
+        log.warning("Miembro %r sin playerId; no se puede consultar /player", name_guess)
+        continue
 
-        name = str(p_resp.get("name") or _safe_get(p_resp, ["player", "name"], "") or name_guess).strip()
-        ally = _parse_allycode(p_resp)  # lo sacamos de /player si viene
-        level = str(_safe_get(p_resp, ["level"], "") or _safe_get(p_resp, ["player", "level"], ""))
-        gp = _safe_get(p_resp, ["galacticPower"], "") or _safe_get(p_resp, ["player", "galacticPower"], "")
-        gac = _parse_player_rating(p_resp)
-        roster = p_resp.get("rosterUnit") or _safe_get(p_resp, ["player", "rosterUnit"], []) or []
+    p_resp: Dict[str, Any] = {}
+    try:
+        p_resp = fetch_player_by_id(pid)
+    except Exception as e:
+        log.warning("Error /player playerId=%s (%s): %s", pid, name_guess, e)
+        p_resp = {}
 
-        players_data[pid] = {
-            "playerId": pid,
-            "name": name,
-            "ally": ally,
-            "level": level,
-            "gp": gp,
-            "role": role,
-            "gac": gac,
-            "roster": roster,
-            "guild_name": guild_name,
-        }
+    name = str(p_resp.get("name") or _safe_get(p_resp, ["player", "name"], "") or name_guess).strip()
+    ally = _parse_allycode(p_resp)
+    level = str(_safe_get(p_resp, ["level"], "") or _safe_get(p_resp, ["player", "level"], ""))
+    gac = _parse_player_rating(p_resp)
+    roster = p_resp.get("rosterUnit") or _safe_get(p_resp, ["player", "rosterUnit"], []) or []
+
+    players_data[pid] = {
+        "playerId": pid,
+        "name": name,
+        "ally": ally,
+        "level": level,
+        "gp": gp_member,        # <<< GP de /guild.member
+        "role": role_text,      # <<< Role mapeado
+        "gac": gac,
+        "roster": roster,
+        "guild_name": guild_name,
+    }
 
     return guild_name, members_count, players_data
 
