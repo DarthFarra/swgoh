@@ -10,7 +10,8 @@ import logging
 import urllib.request
 import urllib.error
 from urllib.parse import urlparse
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Set
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -48,7 +49,9 @@ SHEET_OMIS  = os.getenv("CHAR_OMICRONS_SHEET", "CharactersOmicrons")
 EXCLUDE_BASEID_CONTAINS = [s.strip().upper() for s in os.getenv("EXCLUDE_BASEID_CONTAINS", "").split(",") if s.strip()]
 
 TZ = ZoneInfo(os.getenv("ID_ZONA", "Europe/Amsterdam"))
-FILTER_GUILD_IDS = {s.strip() for s in os.getenv("FILTER_GUILD_IDS", "").split(",") if s.strip()}
+
+def get_filter_ids_from_env() -> set[str]:
+    return {s.strip() for s in os.getenv("FILTER_GUILD_IDS", "").split(",") if s.strip()}
 
 DIV_MAP  = {25: "1", 20: "2", 15: "3", 10: "4", 5: "5"}
 RELIC_MAP = {11:"R9",10:"R8",9:"R7",8:"R6",7:"R5",6:"R4",5:"R3",4:"R2",3:"R1",2:"R0",1:"G12",0:"<G12"}
@@ -527,11 +530,16 @@ def process_guild(ss, ws_guilds, ws_players, guild_id: str, guild_row_idx_1b: in
     return guild_name, members_count, players_data
 
 # ----------------- MAIN -----------------
-def run() -> str:
+def run(filter_guild_ids: Optional[Set[str]] = None) -> str:
     if not preflight_comlink():
         log.error("Abortando: COMLINK_BASE no accesible desde este servicio.")
         return "error: comlink preflight"
 
+
+    # Filtro de gremios: prioridad al argumento; si no, leer del entorno en tiempo de ejecución
+    active_filter_ids = set(filter_guild_ids) if filter_guild_ids else get_filter_ids_from_env()
+
+    
     ss = _open_spreadsheet()
     ws_guilds = ss.worksheet(SHEET_GUILDS)
     ws_players = ss.worksheet(SHEET_PLAYERS)
@@ -592,8 +600,9 @@ def run() -> str:
     for i, row in enumerate(g_rows, start=2):
         gid = (row[idx_gid].strip() if idx_gid < len(row) else "")
         if not gid: continue
-        if FILTER_GUILD_IDS and gid not in FILTER_GUILD_IDS:
+        if active_filter_ids and gid not in active_filter_ids:
             continue
+
 
         # obtener datos del gremio + miembros + roster individual
         attempts = 4
