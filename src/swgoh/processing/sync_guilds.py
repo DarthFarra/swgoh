@@ -204,7 +204,6 @@ def write_table_body(ws, headers: List[str], rows: List[List[str]]):
     if rows:
         ws_update(ws, "A2", rows)
     else:
-        # Mantener solo cabecera
         ws.resize(1, cols)
 
 # ----------------- REBUILD ÍNDICES (fix IndexError) -----------------
@@ -435,8 +434,21 @@ def read_ps_matrix(ws):
     return headers, rows, skill_names, mat
 
 def write_ps_matrix(ws, matrix_dict, skill_names):
+    """
+    Escribe la matriz Player_Skills de forma segura:
+    1) Reduce primero a 1 fila y N columnas (encabezados) para no disparar celdas.
+    2) Escribe encabezados.
+    3) Ajusta filas y vuelca el cuerpo.
+    """
     headers = ["Player Guild", "Player Name"] + list(skill_names)
+
+    # 1) Reducir hoja a lo mínimo antes de crecer columnas
+    ws.resize(1, max(len(headers), 1))
+
+    # 2) Header
     ws_update(ws, "1:1", [headers])
+
+    # 3) Cuerpo
     keys_sorted = sorted(matrix_dict.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
     data_rows = []
     for (g, n) in keys_sorted:
@@ -447,13 +459,14 @@ def write_ps_matrix(ws, matrix_dict, skill_names):
             if v is not None:
                 row[2 + idx] = v
         data_rows.append(row)
-    cols_needed = len(headers)
+
     if data_rows:
-        ws.resize(max(len(data_rows) + 1, 2), cols_needed)
+        ws.resize(len(data_rows) + 1, len(headers))
         ws_update(ws, "A2", data_rows)
-        ws.resize(len(data_rows) + 1, cols_needed)
+        # asegurar tamaño exacto al final
+        ws.resize(len(data_rows) + 1, len(headers))
     else:
-        ws.resize(1, cols_needed)
+        ws.resize(1, len(headers))
 
 # ----------------- PROCESO DE GREMIO -----------------
 def process_guild(ss, ws_guilds, ws_players, guild_id: str, guild_row_idx_1b: int, guild_row_vals: List[str]) -> Tuple[str, int, Dict[str, Dict[str, Any]]]:
@@ -578,15 +591,15 @@ def run() -> str:
     processed_guild_names = set()
 
     # --- Catálogo de skills (zetas + omicrons) con headers exactos 'skillid'/'skill name'
-    skill_id_to_name, skill_name_to_ids, skill_names = read_skill_catalog(ss)
+    skill_id_to_name, skill_name_to_ids, skill_names_catalog = read_skill_catalog(ss)
 
     # --- Procesar Guilds ---
     g_headers, g_rows = _get_all(ws_guilds)
     if not g_rows:
         log.info("No hay filas en Guilds.")
         # Asegurar cabecera Player_Skills vacía
-        ws_update(ws_ps, "1:1", [["Player Guild","Player Name"] + skill_names])
-        ws_ps.resize(1, 2 + len(skill_names))
+        ws_update(ws_ps, "1:1", [["Player Guild","Player Name"]])
+        ws_ps.resize(1, 2)
         return "ok: 0 guilds"
 
     try:
@@ -770,23 +783,26 @@ def run() -> str:
         write_table_body(ws_pu, pu_headers, final_pu_rows)
 
     # ---- MERGE SELECTIVO de Player_Skills ----
-    # Unión de columnas de skills: existentes + catálogo actual
-    skill_name_set = {s for s in ps_skill_names_exist}
-    for s in skill_names:
-        skill_name_set.add(s)
-    skill_names_merged = sorted(skill_name_set, key=lambda x: x.lower())
-
-    # Eliminar solo los gremios procesados de la matriz existente
+    # 1) Eliminar solo las filas de los gremios procesados (matriz existente)
     for g in processed_guild_names:
         for key in list(ps_matrix_exist.keys()):
             if key[0] == g:
                 del ps_matrix_exist[key]
 
-    # Añadir las filas recalculadas
+    # 2) Añadir las filas recalculadas de esta ejecución
     for key, vals in skills_matrix.items():
         ps_matrix_exist[key] = vals
 
-    # Escribir matriz resultante
+    # 3) Construir encabezados SOLO con skills EN USO (existentes + nuevas con valor)
+    skills_in_use = set()
+    for vals in ps_matrix_exist.values():
+        for sname, v in vals.items():
+            if sname and (v is not None and str(v) != ""):
+                skills_in_use.add(sname)
+
+    skill_names_merged = sorted(skills_in_use, key=str.lower)
+
+    # 4) Escribir matriz resultante con headers mínimos necesarios
     write_ps_matrix(ws_ps, ps_matrix_exist, skill_names_merged)
 
     if processed == 0:
