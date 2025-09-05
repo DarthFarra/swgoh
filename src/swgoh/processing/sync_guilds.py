@@ -1,4 +1,3 @@
-# src/swgoh/processing/sync_guilds.py
 from __future__ import annotations
 
 import os
@@ -57,7 +56,9 @@ ROLE_MAP = {2:"Miembro",3:"Oficial",4:"Lider"}
 GUILDS_HEADER_SYNONYMS = {"GP": ["GP", "Guild GP"]}
 GUILDS_REQUIRED = ["Guild Id","Guild Name","Members","Guild GP","Last Raid Id","Last Raid Score","Last Update"]
 PLAYERS_REQUIRED = ["Player Id","Player Name","Ally code","Guild Name","Role","Level","GP","GAC League"]
-PLAYER_UNITS_MIN_PREFIX = ["Player Id","Player Name"]
+
+# Cambio aquí: Player_Units empieza por Guild Name + Player Name
+PLAYER_UNITS_MIN_PREFIX = ["Guild Name","Player Name"]
 
 # ----------------- HELPERS -----------------
 def now_ts() -> str:
@@ -197,7 +198,6 @@ def map_member_level(val) -> str:
     return ROLE_MAP.get(c, (str(c) if c else ""))
 
 def write_table_body(ws, headers: List[str], rows: List[List[str]]):
-    """Escribe el cuerpo (desde A2). Ajusta tamaño seguro para evitar 'Range exceeds grid limits'."""
     cols = len(headers) if headers else 1
     target_rows = max(len(rows) + 1, 1)
     ws.resize(target_rows, cols)
@@ -206,34 +206,22 @@ def write_table_body(ws, headers: List[str], rows: List[List[str]]):
     else:
         ws.resize(1, cols)
 
-# ----------------- REBUILD ÍNDICES (fix IndexError) -----------------
-def rebuild_players_index_by_pid(rows: List[List[str]], idx_pid_col_1b: Optional[int]) -> Dict[str, int]:
-    out: Dict[str, int] = {}
-    if not idx_pid_col_1b:
+# ----------------- REBUILD ÍNDICES -----------------
+def rebuild_pu_index_by_guild_name(rows: List[List[str]], idx_guild_1b: Optional[int], idx_pname_1b: Optional[int]) -> Dict[str,int]:
+    """
+    Índice por clave compuesta (guild_name | player_name_lower) -> row_index (0-based)
+    """
+    out: Dict[str,int] = {}
+    if not idx_guild_1b or not idx_pname_1b:
         return out
-    col = idx_pid_col_1b - 1
+    cg = idx_guild_1b - 1
+    cn = idx_pname_1b - 1
     for i, r in enumerate(rows):
-        pid = (r[col] if col < len(r) else "").strip()
-        if pid:
-            out[pid] = i
+        g = (r[cg] if cg < len(r) else "").strip()
+        n = (r[cn] if cn < len(r) else "").strip().lower()
+        if g and n:
+            out[f"{g}|{n}"] = i
     return out
-
-def rebuild_pu_indices(rows: List[List[str]], idx_pid_1b: Optional[int], idx_pname_1b: Optional[int]) -> Tuple[Dict[str,int], Dict[str,int]]:
-    by_pid: Dict[str,int] = {}
-    by_name: Dict[str,int] = {}
-    if idx_pid_1b:
-        c = idx_pid_1b - 1
-        for i, r in enumerate(rows):
-            pid = (r[c] if c < len(r) else "").strip()
-            if pid:
-                by_pid[pid] = i
-    if idx_pname_1b:
-        c = idx_pname_1b - 1
-        for i, r in enumerate(rows):
-            name = (r[c] if c < len(r) else "").strip().lower()
-            if name:
-                by_name[name] = i
-    return by_pid, by_name
 
 # ----------------- GUILDS / PLAYERS UPSERT -----------------
 def _ensure_headers(ws, required: List[str], synonyms: Dict[str, List[str]] | None = None) -> Dict[str, int]:
@@ -366,16 +354,6 @@ def roster_to_unit_values(roster_units: List[Dict[str,Any]], is_ship_by_base: Di
 
 # ----------------- SKILL CATALOG (Zetas + Omicrons) -----------------
 def read_skill_catalog(ss) -> Tuple[Dict[str,str], Dict[str,List[str]], List[str]]:
-    """
-    Lee CharactersZetas y CharactersOmicrons y devuelve:
-      - skill_id_to_name
-      - skill_name_to_ids
-      - skill_names (ordenados alfabéticamente, únicos por nombre)
-
-    Encabezados esperados (en minúsculas):
-      - 'skillid'
-      - 'skill name'
-    """
     skill_id_to_name: Dict[str,str] = {}
 
     def _ingest(sheet_name: str):
@@ -386,8 +364,8 @@ def read_skill_catalog(ss) -> Tuple[Dict[str,str], Dict[str,List[str]], List[str
         headers, rows = _get_all(ws)
         if not rows: return
         cm = {h.lower(): i for i, h in enumerate(headers)}
-        i_sid  = cm.get("skillid")    # exacto
-        i_name = cm.get("skill name") # exacto
+        i_sid  = cm.get("skillid")
+        i_name = cm.get("skill name")
         if i_sid is None or i_name is None:
             return
         for r in rows:
@@ -434,21 +412,9 @@ def read_ps_matrix(ws):
     return headers, rows, skill_names, mat
 
 def write_ps_matrix(ws, matrix_dict, skill_names):
-    """
-    Escribe la matriz Player_Skills de forma segura:
-    1) Reduce primero a 1 fila y N columnas (encabezados) para no disparar celdas.
-    2) Escribe encabezados.
-    3) Ajusta filas y vuelca el cuerpo.
-    """
     headers = ["Player Guild", "Player Name"] + list(skill_names)
-
-    # 1) Reducir hoja a lo mínimo antes de crecer columnas
     ws.resize(1, max(len(headers), 1))
-
-    # 2) Header
     ws_update(ws, "1:1", [headers])
-
-    # 3) Cuerpo
     keys_sorted = sorted(matrix_dict.keys(), key=lambda k: (k[0].lower(), k[1].lower()))
     data_rows = []
     for (g, n) in keys_sorted:
@@ -459,19 +425,27 @@ def write_ps_matrix(ws, matrix_dict, skill_names):
             if v is not None:
                 row[2 + idx] = v
         data_rows.append(row)
-
     if data_rows:
         ws.resize(len(data_rows) + 1, len(headers))
         ws_update(ws, "A2", data_rows)
-        # asegurar tamaño exacto al final
         ws.resize(len(data_rows) + 1, len(headers))
     else:
         ws.resize(1, len(headers))
 
 # ----------------- PROCESO DE GREMIO -----------------
+def _parse_last_raid(guild_data: Dict[str, Any]) -> Tuple[str, int]:
+    arr = _safe_get(guild_data, ["lastRaidPointsSummary"], None)
+    if arr is None:
+        arr = _safe_get(guild_data, ["guild","lastRaidPointsSummary"], [])
+    if isinstance(arr, list) and arr:
+        first = arr[0] or {}
+        ident = first.get("identifier", {})
+        pts = _to_int(first.get("totalPoints", 0), 0)
+        return _to_compact_json(ident), pts
+    return "", 0
+
 def process_guild(ss, ws_guilds, ws_players, guild_id: str, guild_row_idx_1b: int, guild_row_vals: List[str]) -> Tuple[str, int, Dict[str, Dict[str, Any]]]:
     try:
-        # incluye actividad reciente para last raid summary
         gdata = fetch_guild({"guildId": guild_id, "includeRecentGuildActivityInfo": True})
     except Exception as e:
         log.warning("Error en POST /guild: %s", e)
@@ -530,8 +504,8 @@ def process_guild(ss, ws_guilds, ws_players, guild_id: str, guild_row_idx_1b: in
             "name": name,
             "ally": ally,
             "level": level,
-            "gp": gp_member,           # desde /guild.member
-            "role": role_text,         # mapeado
+            "gp": gp_member,
+            "role": role_text,
             "gac": gac,
             "roster": roster,
             "guild_name": guild_name,
@@ -557,31 +531,17 @@ def run() -> str:
     # --- Catálogo de unidades (para Player_Units)
     unit_base_ids, base_to_name, is_ship = read_unit_catalog(ss)
     colmap_pu, unit_col_by_friendly, pu_headers = ensure_player_units_headers(ws_pu, unit_base_ids, base_to_name)
-    idx_pu_pid   = colmap_pu.get("player id")
+    idx_pu_guild = colmap_pu.get("guild name")
     idx_pu_pname = colmap_pu.get("player name")
     _, pu_existing_rows = _get_all(ws_pu)
 
-    current_by_pid: Dict[str,int] = {}
-    current_by_pname: Dict[str,int] = {}
-    if idx_pu_pid:
-        for i, r in enumerate(pu_existing_rows):
-            pid = (r[idx_pu_pid-1] if idx_pu_pid-1 < len(r) else "").strip()
-            if pid: current_by_pid[pid] = i
-    if idx_pu_pname:
-        for i, r in enumerate(pu_existing_rows):
-            pname = (r[idx_pu_pname-1] if idx_pu_pname-1 < len(r) else "").strip().lower()
-            if pname: current_by_pname[pname] = i
+    # índice por (guild_name|player_name_lower)
+    current_by_guild_player = rebuild_pu_index_by_guild_name(pu_existing_rows, idx_pu_guild, idx_pu_pname)
 
     # --- Índices Players
     p_headers = _headers(ws_players)
     pcol = {h.lower(): i for i, h in enumerate(p_headers, start=1)}
     _, players_existing_rows = _get_all(ws_players)
-    players_index_by_pid: Dict[str,int] = {}
-    idx_pid_players = pcol.get("player id")
-    if idx_pid_players:
-        for i, r in enumerate(players_existing_rows):
-            pid = (r[idx_pid_players-1] if idx_pid_players-1 < len(r) else "").strip()
-            if pid: players_index_by_pid[pid] = i
 
     final_pu_rows = pu_existing_rows[:]
     final_players_rows = players_existing_rows[:]
@@ -590,14 +550,13 @@ def run() -> str:
     ps_headers_exist, ps_rows_exist, ps_skill_names_exist, ps_matrix_exist = read_ps_matrix(ws_ps)
     processed_guild_names = set()
 
-    # --- Catálogo de skills (zetas + omicrons) con headers exactos 'skillid'/'skill name'
-    skill_id_to_name, skill_name_to_ids, skill_names_catalog = read_skill_catalog(ss)
+    # --- Catálogo de skills (zetas + omicrons)
+    skill_id_to_name, skill_name_to_ids, _ = read_skill_catalog(ss)
 
     # --- Procesar Guilds ---
     g_headers, g_rows = _get_all(ws_guilds)
     if not g_rows:
         log.info("No hay filas en Guilds.")
-        # Asegurar cabecera Player_Skills vacía
         ws_update(ws_ps, "1:1", [["Player Guild","Player Name"]])
         ws_ps.resize(1, 2)
         return "ok: 0 guilds"
@@ -612,7 +571,6 @@ def run() -> str:
             raise RuntimeError("La hoja Guilds no contiene la columna 'Guild Id'")
 
     processed = 0
-    players_upd = 0
 
     # Matriz recalculada de esta ejecución
     skills_matrix: Dict[Tuple[str,str], Dict[str,str]] = {}
@@ -640,116 +598,56 @@ def run() -> str:
         if last_exc:
             log.error("Error obteniendo guildId=%s: %s", gid, last_exc)
             continue
-
         if not players_data:
             continue
 
         guild_name = next(iter(players_data.values())).get("guild_name", "")
         processed_guild_names.add(guild_name)
 
-        # ---- BORRADO SELECTIVO previo: Players del gremio
-        idx_gn_players = pcol.get("guild name")
-        if guild_name and idx_gn_players:
-            final_players_rows = [r for r in final_players_rows
-                                  if not (idx_gn_players - 1 < len(r) and (r[idx_gn_players - 1] or "").strip() == guild_name)]
-
-        # ---- BORRADO SELECTIVO previo: Player_Units de los miembros del gremio
-        guild_pids = {pid for pid in players_data.keys() if pid}
-        guild_pnames = {(pdata.get("name","") or "").strip().lower() for pdata in players_data.values() if (pdata.get("name","") or "").strip()}
-
-        if idx_pu_pid:
+        # ---- BORRADO SELECTIVO Player_Units del gremio (por Guild Name)
+        if idx_pu_guild:
             final_pu_rows = [r for r in final_pu_rows
-                             if not (idx_pu_pid - 1 < len(r) and (r[idx_pu_pid - 1] or "").strip() in guild_pids)]
-        if idx_pu_pname:
-            final_pu_rows = [r for r in final_pu_rows
-                             if not (idx_pu_pname - 1 < len(r) and (r[idx_pu_pname - 1] or "").strip().lower() in guild_pnames)]
+                             if not (idx_pu_guild - 1 < len(r) and (r[idx_pu_guild - 1] or "").strip() == guild_name)]
 
         # >>> RECONSTRUIR ÍNDICES TRAS LOS BORRADOS <<<
-        players_index_by_pid = rebuild_players_index_by_pid(final_players_rows, idx_pid_players)
-        current_by_pid, current_by_pname = rebuild_pu_indices(final_pu_rows, idx_pu_pid, idx_pu_pname)
+        current_by_guild_player = rebuild_pu_index_by_guild_name(final_pu_rows, idx_pu_guild, idx_pu_pname)
 
-        # ---- Reinsertar Players + Player_Units + matriz de skills
+        # ---- Reinsertar Player_Units + matriz de skills
         for pid, pdata in players_data.items():
             pname = pdata.get("name","") or ""
-            ally  = pdata.get("ally","") or ""
-            level = pdata.get("level","") or ""
-            gp    = pdata.get("gp","") or ""
-            role  = pdata.get("role","") or ""
-            gac   = pdata.get("gac","") or ""
             roster= pdata.get("roster",[]) or []
 
-            # Players (upsert por Player Id si ya existía)
-            idx_row = None
-            if idx_pid_players and pid and pid in players_index_by_pid:
-                tmp_idx = players_index_by_pid[pid]
-                if 0 <= tmp_idx < len(final_players_rows):
-                    idx_row = tmp_idx
-
-            if idx_row is not None:
-                prev = final_players_rows[idx_row]
-                merged = prev[:] + [""] * (len(p_headers) - len(prev))
-                def setp(col: str, val: Any):
-                    j = pcol.get(col.lower())
-                    if j: merged[j-1] = "" if val is None else str(val)
-                setp("Player Id", pid)
-                setp("Player Name", pname)
-                setp("Ally code", ally)
-                setp("Guild Name", guild_name)
-                setp("Role", role)
-                setp("Level", level)
-                setp("GP", gp)
-                setp("GAC League", gac)
-                final_players_rows[idx_row] = merged
-                players_upd += 1
-            else:
-                rowp = [""] * len(p_headers)
-                def setp(col: str, val: Any):
-                    j = pcol.get(col.lower())
-                    if j: rowp[j-1] = "" if val is None else str(val)
-                setp("Player Id", pid)
-                setp("Player Name", pname)
-                setp("Ally code", ally)
-                setp("Guild Name", guild_name)
-                setp("Role", role)
-                setp("Level", level)
-                setp("GP", gp)
-                setp("GAC League", gac)
-                final_players_rows.append(rowp)
-                if idx_pid_players and pid:
-                    players_index_by_pid[pid] = len(final_players_rows) - 1
-                players_upd += 1
-
             # Player_Units
-            base_to_val = roster_to_unit_values(roster, is_ship)
-            idx_row_pu: Optional[int] = None
-            if idx_pu_pid and pid and pid in current_by_pid:
-                idx_row_pu = current_by_pid[pid]
-            elif idx_pu_pname and pname and pname.lower() in current_by_pname:
-                idx_row_pu = current_by_pname[pname.lower()]
+            key = f"{guild_name}|{pname.lower()}"
+            idx_row_pu: Optional[int] = current_by_guild_player.get(key)
             if idx_row_pu is not None and 0 <= idx_row_pu < len(final_pu_rows):
                 prev = final_pu_rows[idx_row_pu]
                 merged = prev[:] + [""] * (len(pu_headers) - len(prev))
             else:
                 merged = [""] * len(pu_headers)
-                if idx_pu_pid and pid: current_by_pid[pid] = len(final_pu_rows)
-                if idx_pu_pname and pname: current_by_pname[pname.lower()] = len(final_pu_rows)
-            if idx_pu_pid:   merged[idx_pu_pid-1] = pid
+                if idx_pu_guild: merged[idx_pu_guild-1] = guild_name
+                if idx_pu_pname: merged[idx_pu_pname-1] = pname
+                current_by_guild_player[key] = len(final_pu_rows)
+
+            if idx_pu_guild: merged[idx_pu_guild-1] = guild_name
             if idx_pu_pname: merged[idx_pu_pname-1] = pname
+
+            base_to_val = roster_to_unit_values(roster, is_ship)
             for base_id, val in base_to_val.items():
                 fname = base_to_name.get(base_id)
                 if not fname: continue
                 col = unit_col_by_friendly.get(fname.strip().lower())
                 if not col: continue
                 merged[col-1] = val
+
             if idx_row_pu is not None and 0 <= idx_row_pu < len(final_pu_rows):
                 final_pu_rows[idx_row_pu] = merged
             else:
                 final_pu_rows.append(merged)
 
-            # Player_Skills (matriz por (guild, name) -> skill_name: tier)
+            # Player_Skills matriz por (guild, name)
             if skill_id_to_name:
-                key = (guild_name, pname)
-                rowdict = skills_matrix.setdefault(key, {})
+                rowdict = skills_matrix.setdefault((guild_name, pname), {})
                 for ru in roster:
                     skills = (ru.get("skill") or ru.get("skills") or ru.get("skillList") or [])
                     if not isinstance(skills, list): continue
@@ -758,7 +656,7 @@ def run() -> str:
                         sid = s.get("id") or s.get("skillId") or s.get("idRef")
                         if not sid: continue
                         sid = str(sid).strip()
-                        if sid not in skill_id_to_name:  # limita a zetas/omnis de catálogo
+                        if sid not in skill_id_to_name:  # limita a zetas/omnis
                             continue
                         if _exclude_skillid(sid):
                             continue
@@ -776,24 +674,19 @@ def run() -> str:
 
         processed += 1
 
-    # ---- Volcado final a Sheets: Players / Player_Units ----
-    if final_players_rows != players_existing_rows:
-        write_table_body(ws_players, p_headers, final_players_rows)
+    # ---- Volcado final a Sheets ----
     if final_pu_rows != pu_existing_rows:
-        write_table_body(ws_pu, pu_headers, final_pu_rows)
+        write_table_body(ws_pu, _headers(ws_pu), final_pu_rows)
 
     # ---- MERGE SELECTIVO de Player_Skills ----
-    # 1) Eliminar solo las filas de los gremios procesados (matriz existente)
     for g in processed_guild_names:
         for key in list(ps_matrix_exist.keys()):
             if key[0] == g:
                 del ps_matrix_exist[key]
 
-    # 2) Añadir las filas recalculadas de esta ejecución
     for key, vals in skills_matrix.items():
         ps_matrix_exist[key] = vals
 
-    # 3) Construir encabezados SOLO con skills EN USO (existentes + nuevas con valor)
     skills_in_use = set()
     for vals in ps_matrix_exist.values():
         for sname, v in vals.items():
@@ -801,14 +694,12 @@ def run() -> str:
                 skills_in_use.add(sname)
 
     skill_names_merged = sorted(skills_in_use, key=str.lower)
-
-    # 4) Escribir matriz resultante con headers mínimos necesarios
     write_ps_matrix(ws_ps, ps_matrix_exist, skill_names_merged)
 
     if processed == 0:
         log.info("No hay filas nuevas para escribir.")
 
-    return f"ok: guilds={processed}, players_upserted~={len(final_players_rows)}, player_units_rows={len(final_pu_rows)}, skill_matrix_rows={len(ps_matrix_exist)}, skill_cols={len(skill_names_merged)}"
+    return f"ok: guilds={processed}, player_units_rows={len(final_pu_rows)}, skill_matrix_rows={len(ps_matrix_exist)}, skill_cols={len(skill_names_merged)}"
 
 if __name__ == "__main__":
     print(run())
