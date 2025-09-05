@@ -300,14 +300,16 @@ async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label, _ = _find_guild_by_id(ss, guild_id)
     await query.edit_message_text(f"⏳ Sincronizando {label}…")
 
+
+
+    
     # Ejecutar la sync solo para ese guild
     prev = os.getenv("FILTER_GUILD_IDS", "")
     try:
-        os.environ["FILTER_GUILD_IDS"] = guild_id
-        # Import tardío para evitar dependencias circulares en tiempo de import
         from ..processing import sync_guilds as mod_sync_guilds
-        _ = mod_sync_guilds.run()  # ignoramos métricas internas
+        _ = mod_sync_guilds.run(filter_guild_ids={guild_id})
         await query.edit_message_text(f"✅ Sincronización completada para {label}.")
+
     except Exception as e:
         await query.edit_message_text(f"❌ Error sincronizando {label}.\n{e}")
     finally:
@@ -315,6 +317,10 @@ async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.environ["FILTER_GUILD_IDS"] = prev
         else:
             os.environ.pop("FILTER_GUILD_IDS", None)
+
+
+
+
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
