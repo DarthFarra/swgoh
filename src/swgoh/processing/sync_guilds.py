@@ -646,20 +646,35 @@ def run() -> str:
                 final_pu_rows.append(merged)
 
             # Player_Skills matriz por (guild, name)
+# --- dentro de run(), en el bucle de miembros por cada guild ---
+# Reemplaza el bloque "Player_Skills (matriz por (guild, name) -> skill_name: tier)"
+# por este, que construye headers "CharacterName|skill name":
+
+            # Player_Skills matriz por (guild, name)
             if skill_id_to_name:
                 rowdict = skills_matrix.setdefault((guild_name, pname), {})
                 for ru in roster:
+                    # baseId del unit para obtener el nombre del personaje
+                    defid = str(ru.get("definitionId") or "").strip()
+                    base = defid.split(":")[0] if defid else ""
+                    char_name = base_to_name.get(base, "")  # friendly name desde Characters/Ships
+
                     skills = (ru.get("skill") or ru.get("skills") or ru.get("skillList") or [])
-                    if not isinstance(skills, list): continue
+                    if not isinstance(skills, list):
+                        continue
+
                     for s in skills:
-                        if not isinstance(s, dict): continue
+                        if not isinstance(s, dict):
+                            continue
                         sid = s.get("id") or s.get("skillId") or s.get("idRef")
-                        if not sid: continue
+                        if not sid:
+                            continue
                         sid = str(sid).strip()
-                        if sid not in skill_id_to_name:  # limita a zetas/omnis
+                        # limitar a zetas/omicrons del catálogo y respetar EXCLUDE_BASEID_CONTAINS (sobre skillid)
+                        if sid not in skill_id_to_name or _exclude_skillid(sid):
                             continue
-                        if _exclude_skillid(sid):
-                            continue
+
+                        # tier robusto
                         tier = s.get("tier")
                         if tier is None:
                             tier = s.get("currentTier", s.get("selectedTier", s.get("tierIndex", 0)))
@@ -667,11 +682,15 @@ def run() -> str:
                             tier_int = int(tier)
                         except Exception:
                             tier_int = 0
-                        sname = skill_id_to_name[sid]
-                        prevv = rowdict.get(sname)
-                        if prevv is None or tier_int > _to_int(prevv, 0):
-                            rowdict[sname] = str(tier_int)
 
+                        # Construir encabezado "CharacterName|skill name"
+                        sname = skill_id_to_name[sid]  # nombre de la skill desde catálogo
+                        header = f"{char_name}|{sname}" if char_name else sname  # fallback si no hay char_name
+
+                        prevv = rowdict.get(header)
+                        if prevv is None or tier_int > _to_int(prevv, 0):
+                            rowdict[header] = str(tier_int)
+                            
         processed += 1
 
     # ---- Volcado final a Sheets ----
