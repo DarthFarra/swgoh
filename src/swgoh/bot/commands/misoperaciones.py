@@ -4,7 +4,7 @@ from ..services.sheets import (
     open_ss, usuarios_guilds_for_user, resolve_label_name_rote_by_id,
     user_alias_for_guild, render_assignments_for_alias
 )
-from ..keyboards.guil d_select import make_keyboard_guilds
+from ..keyboards.guild_select import make_keyboard_guilds
 
 async def cmd_misoperaciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss = open_ss()
