@@ -64,7 +64,7 @@ async def cb_register_method(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data[STATE_KEY] = st
 
     if method == "alias":
-        prompt = "Escribe tu *alias de jugador* exactamente como aparece en la hoja (Players → Player Name)."
+        prompt = "Escribe tu *alias de jugador* exactamente como aparece en el juego."
     else:
         prompt = "Escribe tu *código de aliado* (puede ser con o sin guiones)."
 
@@ -89,7 +89,7 @@ async def msg_register_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         kind = "alias" if method == "alias" else "código de aliado"
         await update.message.reply_text(
             f"❌ El {kind} proporcionado no se pudo encontrar en *{st['label']}*.\n"
-            f"Revisa que coincida con la hoja *Players*.",
+            f"Revisa que coincida exactamente con el del juego.",
             parse_mode="Markdown"
         )
         context.user_data.pop(STATE_KEY, None)
