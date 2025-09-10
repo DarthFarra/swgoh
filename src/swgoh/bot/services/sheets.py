@@ -308,7 +308,7 @@ def render_assignments_for_alias(ss, rote_sheet: str, alias: str) -> str:
 def list_phases_in_rote(ss, rote_sheet: str):
     """
     Devuelve la lista de fases distintas presentes en la hoja ROTE,
-    ordenadas (numérico si aplica, luego alfabético).
+    ordenadas (numérico si aplica, luego alfabético), EXCLUYENDO 'x'.
     """
     ws = ss.worksheet(rote_sheet)
     headers, rows = _get_all(ws)
@@ -318,11 +318,16 @@ def list_phases_in_rote(ss, rote_sheet: str):
     if "fase" not in hl:
         return []
     i_fase = hl.index("fase")
+
     phases = set()
     for r in rows:
         fv = (r[i_fase] if i_fase < len(r) else "").strip()
-        if fv:
-            phases.add(fv)
+        if not fv:
+            continue
+        # excluir fase fantasma 'x' (case-insensitive)
+        if fv.strip().lower() == "x":
+            continue
+        phases.add(fv.strip())
 
     def _key(x):
         try:
@@ -331,6 +336,7 @@ def list_phases_in_rote(ss, rote_sheet: str):
             return (1, x.lower())
 
     return sorted(phases, key=_key)
+
 
 def render_ops_for_alias_phase_grouped(ss, rote_sheet: str, alias: str, phase: str) -> str:
     """
