@@ -65,9 +65,8 @@ async def cb_myops(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for p in phases
     ])
     await q.edit_message_text(
-        f"Elige la fase para *{alias}* en *{label}*:",
+        f"Elige la fase para {alias} en {label}:",
         reply_markup=kb,
-        parse_mode="Markdown"
     )
 
 
@@ -91,12 +90,46 @@ async def cb_myops_phase(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"❌ No encuentro tu alias en '{gname}'. ¿Te has registrado?")
         return
 
-    body = render_ops_for_alias_phase_grouped(ss, rote_sheet, alias, phase)
     title = f"Asignaciones de {alias} — {label} (Fase {phase})"
-    if body.startswith("No tienes asignaciones"):
-        await q.edit_message_text(f"{title}\n\n{body}")
-    else:
-        await q.edit_message_text(f"{title}\n\n{body}")
+    body = render_ops_for_alias_phase_grouped(ss, rote_sheet, alias, phase)
+
+    # Teclado con "Cambiar fase"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="Cambiar fase", callback_data=f"myopschoosephase:{gid}")]
+    ])
+
+    await q.edit_message_text(f"{title}\n\n{body}", reply_markup=kb)
+
+
+async def cb_myops_choosephase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback para volver a mostrar el selector de fases del mismo gremio."""
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("myopschoosephase:"):
+        return
+    gid = data.split(":", 1)[1]
+
+    ss = open_ss()
+    label, gname, rote_sheet = resolve_label_name_rote_by_id(ss, gid)
+    alias = user_alias_for_guild(ss, q.from_user.id, gname)
+    if not alias:
+        await q.edit_message_text(f"❌ No encuentro tu alias en '{gname}'. ¿Te has registrado?")
+        return
+
+    phases = list_phases_in_rote(ss, rote_sheet)
+    if not phases:
+        await q.edit_message_text(f"❌ No hay fases en la hoja ROTE de {label}.")
+        return
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(text=f"Fase {p}", callback_data=f"myopsphase:{gid}:{p}")]
+        for p in phases
+    ])
+    await q.edit_message_text(
+        f"Elige la fase para {alias} en {label}:",
+        reply_markup=kb,
+    )
 
 
 async def _ask_phase_for_guild(update: Update, context: ContextTypes.DEFAULT_TYPE, ss, gid: str, gname: str, label: str, via_callback: bool):
@@ -124,11 +157,11 @@ async def _ask_phase_for_guild(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton(text=f"Fase {p}", callback_data=f"myopsphase:{gid}:{p}")]
         for p in phases
     ])
-    text = f"Elige la fase para *{alias}* en *{label}*:"
+    text = f"Elige la fase para {alias} en {label}:"
     if via_callback:
-        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
     else:
-        await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+        await update.message.reply_text(text, reply_markup=kb)
 
 
 def get_handlers():
@@ -136,4 +169,5 @@ def get_handlers():
         CommandHandler("misoperaciones", cmd_misoperaciones),
         CallbackQueryHandler(cb_myops, pattern=r"^myops:"),
         CallbackQueryHandler(cb_myops_phase, pattern=r"^myopsphase:"),
+        CallbackQueryHandler(cb_myops_choosephase, pattern=r"^myopschoosephase:"),
     ]
