@@ -304,3 +304,84 @@ def render_assignments_for_alias(ss, rote_sheet: str, alias: str) -> str:
             parts.append(f"• {planeta} / {oper} — *{personaje}* (`{req}`)")
         parts.append("")  # línea en blanco
     return "\n".join(parts).strip()
+
+def list_phases_in_rote(ss, rote_sheet: str):
+    """
+    Devuelve la lista de fases distintas presentes en la hoja ROTE,
+    ordenadas (numérico si aplica, luego alfabético).
+    """
+    ws = ss.worksheet(rote_sheet)
+    headers, rows = _get_all(ws)
+    if not rows:
+        return []
+    hl = [h.lower() for h in headers]
+    if "fase" not in hl:
+        return []
+    i_fase = hl.index("fase")
+    phases = set()
+    for r in rows:
+        fv = (r[i_fase] if i_fase < len(r) else "").strip()
+        if fv:
+            phases.add(fv)
+
+    def _key(x):
+        try:
+            return (0, int(x))
+        except Exception:
+            return (1, x.lower())
+
+    return sorted(phases, key=_key)
+
+def render_ops_for_alias_phase_grouped(ss, rote_sheet: str, alias: str, phase: str) -> str:
+    """
+    Render de asignaciones para un alias y una fase concreta, agrupadas por PLANETA.
+    Formato:
+      {Planeta}
+      - {Personaje} ({Operacion})
+      ...
+    """
+    ws = ss.worksheet(rote_sheet)
+    headers, rows = _get_all(ws)
+    if not rows:
+        return "No tienes asignaciones en esta fase."
+
+    hl = [h.lower() for h in headers]
+    need = ["fase", "planeta", "operacion", "personaje", "jugador"]
+    for n in need:
+        if n not in hl:
+            return "No tienes asignaciones en esta fase."
+
+    i_fase = hl.index("fase")
+    i_plan = hl.index("planeta")
+    i_op   = hl.index("operacion")
+    i_char = hl.index("personaje")
+    i_jug  = hl.index("jugador")
+
+    alias_norm = (alias or "").strip().lower()
+    phase_str = str(phase).strip()
+
+    groups = {}  # planeta -> list[(personaje, operacion)]
+    for r in rows:
+        jugador = (r[i_jug] if i_jug < len(r) else "").strip().lower()
+        if jugador != alias_norm:
+            continue
+        fase_val = (r[i_fase] if i_fase < len(r) else "").strip()
+        if fase_val != phase_str:
+            continue
+        planeta = (r[i_plan] if i_plan < len(r) else "").strip() or "—"
+        personaje = (r[i_char] if i_char < len(r) else "").strip()
+        oper = (r[i_op] if i_op < len(r) else "").strip()
+        groups.setdefault(planeta, []).append((personaje, oper))
+
+    if not groups:
+        return "No tienes asignaciones en esta fase."
+
+    parts = []
+    for planeta in sorted(groups.keys(), key=lambda s: s.lower()):
+        parts.append(f"{planeta}")
+        # Ordena por operación y personaje para estabilidad
+        for personaje, oper in sorted(groups[planeta], key=lambda t: (t[1].lower(), t[0].lower())):
+            parts.append(f"- {personaje} ({oper})")
+        parts.append("")  # línea en blanco entre planetas
+
+    return "\n".join(parts).strip()
