@@ -90,6 +90,23 @@ async def cb_myops_phase(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"❌ No encuentro tu alias en '{gname}'. ¿Te has registrado?")
         return
 
+    # ⛑️ protección por si llega una 'x' desde un callback antiguo
+    if phase.strip().lower() == "x":
+        # volvemos a mostrar el selector de fases válido
+        phases = list_phases_in_rote(ss, rote_sheet)
+        if not phases:
+            await q.edit_message_text(f"❌ No hay fases en la hoja ROTE de {label}.")
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(text=f"Fase {p}", callback_data=f"myopsphase:{gid}:{p}")]
+            for p in phases
+        ])
+        await q.edit_message_text(
+            f"Elige la fase para {alias} en {label}:",
+            reply_markup=kb,
+        )
+        return
+
     title = f"Asignaciones de {alias} — {label} (Fase {phase})"
     body = render_ops_for_alias_phase_grouped(ss, rote_sheet, alias, phase)
 
