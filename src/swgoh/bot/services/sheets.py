@@ -248,20 +248,29 @@ def user_alias_for_guild(ss, user_id: int, guild_name: str) -> Optional[str]:
 
 # ---------- Asignaciones ----------
 def render_assignments_for_alias(ss, rote_sheet: str, alias: str) -> str:
+    """
+    Render bonito en Markdown:
+    - Título por fase en negrita y conteo de asignaciones
+    - Cada línea: • Planeta / Operación — Personaje (`req`)
+    - Ordena por planeta y operación
+    """
     ws = ss.worksheet(rote_sheet)
     headers, rows = _get_all(ws)
     if not rows:
         return "No hay asignaciones."
+
     hl = [h.lower() for h in headers]
     col = {h: i for i, h in enumerate(hl)}
     need = ["fase","planeta","operacion","personaje","reliquia","jugador"]
     for n in need:
         if n not in col:
             return f"No se encontró la columna '{n}' en la hoja '{rote_sheet}'."
-    i_fase, i_plan, i_op, i_char, i_rel, i_jug = (col[n] for n in need)
 
+    i_fase, i_plan, i_op, i_char, i_rel, i_jug = (col[n] for n in need)
     alias_norm = (alias or "").strip().lower()
-    per_fase: Dict[str, List[str]] = {}
+
+    # Recolectar asignaciones del alias
+    per_fase = {}  # fase -> list[(planeta, oper, personaje, req)]
     for r in rows:
         jugador = (r[i_jug] if i_jug < len(r) else "").strip()
         if (jugador or "").strip().lower() != alias_norm:
@@ -270,19 +279,28 @@ def render_assignments_for_alias(ss, rote_sheet: str, alias: str) -> str:
         planeta = (r[i_plan] if i_plan < len(r) else "").strip()
         oper = (r[i_op] if i_op < len(r) else "").strip()
         personaje = (r[i_char] if i_char < len(r) else "").strip()
-        reliq = (r[i_rel] if i_rel < len(r) else "").strip()
-        per_fase.setdefault(fase or "—", []).append(f"• {planeta} / {oper} — {personaje} (req: {reliq})")
+        req = (r[i_rel] if i_rel < len(r) else "").strip() or "R0"
+        per_fase.setdefault(fase or "—", []).append((planeta, oper, personaje, req))
 
     if not per_fase:
         return "No tienes asignaciones."
 
+    # Orden auxiliar para la fase (numérica cuando se pueda)
     def fase_key(fv: str):
-        try: return (0, int(fv))
-        except Exception: return (1, fv.lower())
+        try:
+            return (0, int(fv))
+        except Exception:
+            return (1, fv.lower())
 
+    # Componer en Markdown
     parts = []
     for fase in sorted(per_fase.keys(), key=fase_key):
-        parts.append(f"*Fase {fase}*")
-        parts.extend(per_fase[fase])
-        parts.append("")
+        items = per_fase[fase]
+        # ordenar por planeta, luego operación, luego personaje
+        items.sort(key=lambda x: (x[0].lower(), x[1].lower(), x[2].lower()))
+        parts.append(f"**Fase {fase}** ({len(items)})")
+        for planeta, oper, personaje, req in items:
+            # `req` en monoespaciado para que destaque y no rompa Markdown
+            parts.append(f"• {planeta} / {oper} — *{personaje}* (`{req}`)")
+        parts.append("")  # línea en blanco
     return "\n".join(parts).strip()
