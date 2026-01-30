@@ -10,7 +10,8 @@ def main():
         raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Registrar handlers de cada comando
+
+# Registrar handlers de cada comando
     for h in (
         syncguild.get_handlers() +
         misoperaciones.get_handlers() +
