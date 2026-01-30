@@ -16,10 +16,8 @@ def main():
         misoperaciones.get_handlers() +
         register.get_handlers() +
         syncdata.get_handlers() +
-        operacionesjugador.get_handlers():
+        operacionesjugador.get_handlers()
     ):
-
-        
         app.add_handler(h)
 
     logging.info("Bot iniciado (polling).")
