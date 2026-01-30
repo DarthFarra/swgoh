@@ -391,3 +391,51 @@ def render_ops_for_alias_phase_grouped(ss, rote_sheet: str, alias: str, phase: s
         parts.append("")  # línea en blanco entre planetas
 
     return "\n".join(parts).strip()
+def user_has_leadership_role(ss, user_id: int, guild_name: str) -> bool:
+"""
+Verifica si el usuario tiene rol de 'Oficial' o 'Lider' en el gremio especificado.
+"""
+ws = ss.worksheet(USERS_SHEET)
+headers, rows = _get_all(ws)
+hl = [h.lower() for h in headers]
+try:
+    i_uid = hl.index("user_id")
+    i_gn = hl.index("guild_name")
+    i_rol = hl.index("rol")
+except ValueError:
+    return False
+
+for r in rows:
+    if str(r[i_uid] if i_uid < len(r) else "").strip() == str(user_id):
+        gn = (r[i_gn] if i_gn < len(r) else "").strip()
+        if gn == guild_name:
+            rol = (r[i_rol] if i_rol < len(r) else "").strip().lower()
+            return rol in ["oficial", "lider", "líder"]
+return False
+
+def list_players_for_guild(ss, guild_name: str) -> List[Tuple[str, str]]:
+"""
+Devuelve lista de jugadores (player_name, player_name) para un gremio.
+Usamos player_name como identificador ya que es único dentro del gremio.
+
+Returns:
+    Lista de tuplas (nombre_visible, identificador) ordenadas alfabéticamente.
+"""
+ws = ss.worksheet(PLAYERS_SHEET)
+headers, rows = _get_all(ws)
+hl = [h.lower() for h in headers]
+try:
+    i_gn = hl.index("guild name")
+    i_name = hl.index("player name")
+except ValueError:
+    return []
+
+players = []
+for r in rows:
+    gn = (r[i_gn] if i_gn < len(r) else "").strip()
+    if gn == guild_name:
+        name = (r[i_name] if i_name < len(r) else "").strip()
+        if name:
+            players.append((name, name))
+
+return sorted(players, key=lambda x: x[0].lower())
