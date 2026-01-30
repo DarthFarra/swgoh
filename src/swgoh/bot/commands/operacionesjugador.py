@@ -23,8 +23,8 @@ async def cmd_operacionesjugador(update: Update, context: ContextTypes.DEFAULT_T
     5) Tras elegir jugador, pide elegir FASE.
     6) Renderiza asignaciones del jugador en esa fase, agrupadas por PLANETA.
     """
-ss = open_ss()
-guilds = usuarios_guilds_for_user(ss, update.effective_user.id)
+    ss = open_ss()
+    guilds = usuarios_guilds_for_user(ss, update.effective_user.id)
 
 if not guilds:
     await update.message.reply_text("No estás registrado en ningún gremio.")
