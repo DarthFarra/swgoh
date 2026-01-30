@@ -1,28 +1,29 @@
+# src/swgoh/bot/commands/operacionesjugador.py
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 
 from ..services.sheets import (
-open_ss,
-usuarios_guilds_for_user,
-resolve_label_name_rote_by_id,
-list_phases_in_rote,
-render_ops_for_alias_phase_grouped,
-user_has_leadership_role,
-list_players_for_guild,
+    open_ss,
+    usuarios_guilds_for_user,
+    resolve_label_name_rote_by_id,
+    list_phases_in_rote,
+    render_ops_for_alias_phase_grouped,
+    user_has_leadership_role,
+    list_players_for_guild,
 )
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..keyboards.player_select import make_keyboard_players
 
 async def cmd_operacionesjugador(update: Update, context: ContextTypes.DEFAULT_TYPE):
-"""
-Flujo:
-  1) Verifica que el usuario tenga rol de Oficial o Lider.
-  2) Detecta gremios del usuario donde tenga ese rol.
-  3) Si varios, pide elegir gremio.
-  4) Tras elegir gremio, muestra lista de jugadores.
-  5) Tras elegir jugador, pide elegir FASE.
-  6) Renderiza asignaciones del jugador en esa fase, agrupadas por PLANETA.
-"""
+  """
+    Flujo:
+    1) Verifica que el usuario tenga rol de Oficial o Lider.
+    2) Detecta gremios del usuario donde tenga ese rol.
+    3) Si varios, pide elegir gremio.
+    4) Tras elegir gremio, muestra lista de jugadores.
+    5) Tras elegir jugador, pide elegir FASE.
+    6) Renderiza asignaciones del jugador en esa fase, agrupadas por PLANETA.
+    """
 ss = open_ss()
 guilds = usuarios_guilds_for_user(ss, update.effective_user.id)
 
@@ -51,7 +52,7 @@ label, gid, gname = leadership_guilds[0]
 await _ask_player_for_guild(update, context, ss, gid, gname, label, via_callback=False)
 
 async def cb_playerops_guild(update: Update, context: ContextTypes.DEFAULT_TYPE):
-"""Callback de selección de gremio para /operacionesjugador."""
+    """Callback de selección de gremio para /operacionesjugador."""
 q = update.callback_query
 await q.answer()
 data = q.data or ""
@@ -70,7 +71,7 @@ if not user_has_leadership_role(ss, q.from_user.id, gname):
 await _ask_player_for_guild(update, context, ss, gid, gname, label, via_callback=True)
 
 async def cb_playerops_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-"""Callback de selección de jugador."""
+    """Callback de selección de jugador."""
 q = update.callback_query
 await q.answer()
 data = q.data or ""
@@ -112,7 +113,7 @@ await q.edit_message_text(
 )
 
 async def cb_playerops_phase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-"""Callback de selección de fase."""
+    """Callback de selección de fase."""
 q = update.callback_query
 await q.answer()
 data = q.data or ""
@@ -169,7 +170,7 @@ kb = InlineKeyboardMarkup([
 await q.edit_message_text(f"{title}\n\n{body}", reply_markup=kb)
 
 async def cb_playerops_choosephase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-"""Callback para volver a mostrar el selector de fases."""
+    """Callback para volver a mostrar el selector de fases."""
 q = update.callback_query
 await q.answer()
 data = q.data or ""
@@ -201,7 +202,7 @@ await q.edit_message_text(
 )
 
 async def cb_playerops_chooseplayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-"""Callback para volver a mostrar el selector de jugadores."""
+    """Callback para volver a mostrar el selector de jugadores."""
 q = update.callback_query
 await q.answer()
 data = q.data or ""
@@ -221,7 +222,7 @@ kb = make_keyboard_players(players, f"playeropsplayer:{gid}")
 await q.edit_message_text(f"Selecciona un jugador de {label}:", reply_markup=kb)
 
 async def _ask_player_for_guild(update: Update, context: ContextTypes.DEFAULT_TYPE, ss, gid: str, gname: str, label: str, via_callback: bool):
-"""Utilidad para mostrar la lista de jugadores de un gremio."""
+    """Utilidad para mostrar la lista de jugadores de un gremio."""
 players = list_players_for_guild(ss, gname)
 
 if not players:
@@ -248,7 +249,7 @@ else:
     await update.message.reply_text(text, reply_markup=kb)
 
 def get_handlers():
-"""Retorna todos los handlers del comando /operacionesjugador."""
+    """Retorna todos los handlers del comando /operacionesjugador."""
 return [
     CommandHandler("operacionesjugador", cmd_operacionesjugador),
     CallbackQueryHandler(cb_playerops_guild, pattern=r"^playerops:"),
