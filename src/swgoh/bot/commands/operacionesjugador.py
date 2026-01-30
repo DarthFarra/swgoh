@@ -1,21 +1,20 @@
-# src/swgoh/bot/commands/operacionesjugador.py
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 
 from ..services.sheets import (
-    open_ss,
-    usuarios_guilds_for_user,
-    resolve_label_name_rote_by_id,
-    list_phases_in_rote,
-    render_ops_for_alias_phase_grouped,
-    user_has_leadership_role,
-    list_players_for_guild,
+open_ss,
+usuarios_guilds_for_user,
+resolve_label_name_rote_by_id,
+list_phases_in_rote,
+render_ops_for_alias_phase_grouped,
+user_has_leadership_role,
+list_players_for_guild,
 )
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..keyboards.player_select import make_keyboard_players
 
 async def cmd_operacionesjugador(update: Update, context: ContextTypes.DEFAULT_TYPE):
-  """
+    """
     Flujo:
     1) Verifica que el usuario tenga rol de Oficial o Lider.
     2) Detecta gremios del usuario donde tenga ese rol.
@@ -31,7 +30,6 @@ if not guilds:
     await update.message.reply_text("No estás registrado en ningún gremio.")
     return
 
-# Filtrar solo gremios donde tenga rol de Oficial o Lider
 leadership_guilds = []
 for label, gid, gname in guilds:
     if user_has_leadership_role(ss, update.effective_user.id, gname):
@@ -47,7 +45,6 @@ if len(leadership_guilds) > 1:
     await update.message.reply_text("Elige el gremio para ver operaciones de jugadores:", reply_markup=kb)
     return
 
-# Solo 1 gremio: saltamos directo a la selección de jugador
 label, gid, gname = leadership_guilds[0]
 await _ask_player_for_guild(update, context, ss, gid, gname, label, via_callback=False)
 
@@ -63,7 +60,6 @@ gid = data.split(":", 1)[1]
 ss = open_ss()
 label, gname, _rote_sheet = resolve_label_name_rote_by_id(ss, gid)
 
-# Verificar permisos
 if not user_has_leadership_role(ss, q.from_user.id, gname):
     await q.edit_message_text("❌ No tienes permisos de Oficial o Líder en este gremio.")
     return
@@ -78,7 +74,6 @@ data = q.data or ""
 if not data.startswith("playeropsplayer:"):
     return
 
-# Formato: playeropsplayer:<gid>:<player_name>
 try:
     parts = data.split(":", 2)
     gid = parts[1]
@@ -90,14 +85,12 @@ except (ValueError, IndexError):
 ss = open_ss()
 label, gname, rote_sheet = resolve_label_name_rote_by_id(ss, gid)
 
-# Guardar player_name en context para usarlo después
 context.user_data["selected_player"] = player_name
 context.user_data["selected_guild_id"] = gid
 context.user_data["selected_guild_name"] = gname
 context.user_data["selected_guild_label"] = label
 context.user_data["selected_rote_sheet"] = rote_sheet
 
-# Pedir fase
 phases = list_phases_in_rote(ss, rote_sheet)
 if not phases:
     await q.edit_message_text(f"❌ No hay fases en la hoja ROTE de {label}.")
@@ -120,7 +113,6 @@ data = q.data or ""
 if not data.startswith("playeropsphase:"):
     return
 
-# Formato: playeropsphase:<gid>:<fase>
 try:
     _, gid, phase = data.split(":", 2)
 except ValueError:
@@ -129,7 +121,6 @@ except ValueError:
 
 ss = open_ss()
 
-# Recuperar datos del jugador del context
 player_name = context.user_data.get("selected_player")
 label = context.user_data.get("selected_guild_label")
 rote_sheet = context.user_data.get("selected_rote_sheet")
@@ -138,7 +129,6 @@ if not player_name:
     await q.edit_message_text("❌ Error: No se encontró el jugador seleccionado.")
     return
 
-# Protección por si llega una 'x' desde un callback antiguo
 if phase.strip().lower() == "x":
     phases = list_phases_in_rote(ss, rote_sheet)
     if not phases:
@@ -157,11 +147,9 @@ if phase.strip().lower() == "x":
 title = f"Asignaciones de {player_name} — {label} (Fase {phase})"
 body = render_ops_for_alias_phase_grouped(ss, rote_sheet, player_name, phase)
 
-# Verificar si hay asignaciones
 if not body or "No tienes asignaciones" in body:
     body = f"El jugador seleccionado no tiene asignaciones para la Fase {phase}"
 
-# Teclado con opciones para cambiar fase o cambiar jugador
 kb = InlineKeyboardMarkup([
     [InlineKeyboardButton(text="Cambiar fase", callback_data=f"playeropschoosephase:{gid}")],
     [InlineKeyboardButton(text="Cambiar jugador", callback_data=f"playeropschooseplayer:{gid}")]
@@ -170,7 +158,7 @@ kb = InlineKeyboardMarkup([
 await q.edit_message_text(f"{title}\n\n{body}", reply_markup=kb)
 
 async def cb_playerops_choosephase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para volver a mostrar el selector de fases."""
+        """Callback para volver a mostrar el selector de fases."""
 q = update.callback_query
 await q.answer()
 data = q.data or ""
@@ -233,7 +221,6 @@ if not players:
         await update.message.reply_text(msg)
     return
 
-# Guardar info del gremio en context
 _, _, rote_sheet = resolve_label_name_rote_by_id(ss, gid)
 context.user_data["selected_guild_id"] = gid
 context.user_data["selected_guild_name"] = gname
