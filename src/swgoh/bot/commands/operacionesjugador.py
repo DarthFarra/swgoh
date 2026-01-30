@@ -2,13 +2,13 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 
 from ..services.sheets import (
-open_ss,
-usuarios_guilds_for_user,
-resolve_label_name_rote_by_id,
-list_phases_in_rote,
-render_ops_for_alias_phase_grouped,
-user_has_leadership_role,
-list_players_for_guild,
+    open_ss,
+    usuarios_guilds_for_user,
+    resolve_label_name_rote_by_id,
+    list_phases_in_rote,
+    render_ops_for_alias_phase_grouped,
+    user_has_leadership_role,
+    list_players_for_guild,
 )
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..keyboards.player_select import make_keyboard_players
