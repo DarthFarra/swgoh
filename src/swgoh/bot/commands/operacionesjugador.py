@@ -158,7 +158,7 @@ async def cb_playerops_phase(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.edit_message_text(f"{title}\n\n{body}", reply_markup=kb)
 
 async def cb_playerops_choosephase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Callback para volver a mostrar el selector de fases."""
+    """Callback para volver a mostrar el selector de fases."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
