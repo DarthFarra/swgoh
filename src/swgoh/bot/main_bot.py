@@ -1,7 +1,7 @@
 import logging
 from telegram.ext import ApplicationBuilder
 from .config import BOT_TOKEN
-from .commands import syncguild, misoperaciones, register, syncdata
+from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [main_bot] %(message)s")
 
@@ -15,8 +15,11 @@ def main():
         syncguild.get_handlers() +
         misoperaciones.get_handlers() +
         register.get_handlers() +
-        syncdata.get_handlers()
+        syncdata.get_handlers() +
+        operacionesjugador.get_handlers():
     ):
+
+        
         app.add_handler(h)
 
     logging.info("Bot iniciado (polling).")
