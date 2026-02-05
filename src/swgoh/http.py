@@ -103,4 +103,7 @@ def post_json_retry(
                 time.sleep(sleep)
         sleep *= 1.6
     assert last_exc is not None
+    # --- MODIFICATION START ---
+    print(f"Error after all retries for {path}: {last_exc}")
+    # --- MODIFICATION END ---
     raise last_exc
