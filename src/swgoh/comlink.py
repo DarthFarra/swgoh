@@ -47,6 +47,7 @@ def fetch_data_items(version: str, items: str) -> Dict[str, Any]:
         "enums": False,
     }
     log.debug("POST /data payload=%s", body)
+    print(f"[DEBUG] Request Body for /data endpoint:\n{json.dumps(body, indent=2)}")
     return post_json_retry("/data", body, attempts=8, base_sleep=1.5)
 
 # ----- /guild ----------------------------------------------------------------
