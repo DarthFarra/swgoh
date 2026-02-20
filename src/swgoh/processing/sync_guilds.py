@@ -54,7 +54,7 @@ def get_filter_ids_from_env() -> set[str]:
     return {s.strip() for s in os.getenv("FILTER_GUILD_IDS", "").split(",") if s.strip()}
 
 DIV_MAP  = {25: "1", 20: "2", 15: "3", 10: "4", 5: "5"}
-RELIC_MAP = {14: "R13",13: "R12",13: "R11",12: "R10",11:"R9",10:"R8",9:"R7",8:"R6",7:"R5",6:"R4",5:"R3",4:"R2",3:"R1",2:"R0",1:"G12",0:"<G12"}
+RELIC_MAP = {14: "R13",13: "R12",13: "R11",12: "R10",11:"R9",10:"R8",9:"R7",8:"R6",7:"R5",6:"R4",5:"R3",4:"R2",3:"R1",2:"R0",1:"<G13",0:"<G12"}
 ROLE_MAP = {2:"Miembro",3:"Oficial",4:"Lider"}
 
 GUILDS_HEADER_SYNONYMS = {"GP": ["GP", "Guild GP"]}
