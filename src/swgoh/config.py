@@ -105,6 +105,10 @@ SHEET_CHARACTERS:      str = _optional("SHEET_CHARACTERS",      "Characters")
 SHEET_SHIPS:           str = _optional("SHEET_SHIPS",           "Ships")
 SHEET_USERS:           str = _optional("SHEET_USERS",           "Usuarios")
 SHEET_ASSIGNMENTS:     str = _optional("SHEET_ASSIGNMENTS",     "Asignaciones ROTE")
+
+# Fallback ROTE sheet name used when a guild has no ROTE column configured.
+# Overridable via env if your default sheet has a different name.
+DEFAULT_ROTE_SHEET:    str = _optional("DEFAULT_ROTE_SHEET",    "Asignaciones ROTE")
 SHEET_TICKET_SNAPSHOTS: str = _optional("SHEET_TICKET_SNAPSHOTS", "Ticket_Snapshots")
 
 # ---------------------------------------------------------------------------
