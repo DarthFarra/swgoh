@@ -13,7 +13,6 @@ from ..services.sheets import open_ss, already_synced_today, resolve_label_name_
 from ..services.auth import user_authorized_guilds, user_has_role_in_guild
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..security import (
-    rate_limit,
     validate_guild_id,
     CallbackValidationError,
 )
@@ -24,7 +23,6 @@ APPS_SCRIPT_URL     = os.getenv("APPS_SCRIPT_WEBHOOK_URL")
 APPS_SCRIPT_TIMEOUT = int(os.getenv("APPS_SCRIPT_TIMEOUT", "350"))
 
 
-@rate_limit(cooldown_seconds=30)
 async def cmd_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss   = open_ss()
     opts = user_authorized_guilds(ss, update.effective_user.id)  # [(label, gid)]
