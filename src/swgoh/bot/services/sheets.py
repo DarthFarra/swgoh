@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 
+
 # Reutiliza tu cliente y spreadsheet del core
 from .. import config as bot_cfg
 from ... import sheets as core_sheets  # <- tu src/swgoh/sheets.py
@@ -432,18 +433,6 @@ def list_players_for_guild(ss, guild_name: str) -> List[Tuple[str, str]]:
                 players.append((name, name))
 
     return sorted(players, key=lambda x: x[0].lower())
-
-# Additions for src/swgoh/bot/services/sheets.py
-# Paste these functions at the end of the existing sheets.py file.
-# Also add TICKET_SNAPSHOTS_SHEET to the imports at the top:
-#   from .. import config as bot_cfg
-#   TICKET_SNAPSHOTS_SHEET = bot_cfg.TICKET_SNAPSHOTS_SHEET
-
-from __future__ import annotations
-
-from datetime import date
-from typing import Dict, Optional
-
 
 # ---------------------------------------------------------------------------
 # Guilds — reset time
