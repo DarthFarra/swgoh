@@ -1,31 +1,42 @@
 # src/swgoh/bot/config.py
-import os
-from zoneinfo import ZoneInfo
+"""
+Bot-level config shim.
 
-# Reutiliza tu core config
-from .. import config as core_cfg
+All values come from src/swgoh/config.py (the single source of truth).
+This file exists only so bot modules can use a short import path:
+    from .config import BOT_TOKEN
+instead of reaching up into the core package.
 
-# Token del bot (alias a tu variable actual)
-BOT_TOKEN = getattr(core_cfg, "TELEGRAM_BOT_TOKEN", None) or os.getenv("TELEGRAM_BOT_TOKEN")
+Do NOT add os.getenv() calls here. Add new variables to src/swgoh/config.py
+and alias them below.
+"""
+from __future__ import annotations
 
-# Spreadsheet (usas ID en tu core)
-SPREADSHEET_ID = getattr(core_cfg, "SPREADSHEET_ID", None) or os.getenv("SPREADSHEET_ID")
+from .. import config as _core
 
-# Nombres de pestañas (reutilizamos los tuyos)
-USERS_SHEET   = getattr(core_cfg, "SHEET_PLAYERS", None)  # placeholder en caso de que no exista abajo
-USERS_SHEET   = getattr(core_cfg, "SHEET_USERS", "Usuarios")  # si tienes SHEET_USERS en tu core, úsalo
-GUILDS_SHEET  = getattr(core_cfg, "SHEET_GUILDS", "Guilds")
-PLAYERS_SHEET = getattr(core_cfg, "SHEET_PLAYERS", "Players")
-TICKET_SNAPSHOTS_SHEET = getattr(core_cfg, "TICKET_SNAPSHOTS_SHEET", "Ticket_Snapshots")
+# Telegram
+BOT_TOKEN: str = _core.TELEGRAM_BOT_TOKEN
 
-# Pestaña por defecto para ROTE (si en Guilds no hay valor en "ROTE")
-DEFAULT_ROTE_SHEET = os.getenv("DEFAULT_ROTE_SHEET", "Asignaciones ROTE")
-TICKET_SNAPSHOTS_SHEET = os.getenv("TICKET_SNAPSHOTS_SHEET", "Ticket_Snapshots")
+# Spreadsheet identity
+SPREADSHEET_ID: str   = _core.SPREADSHEET_ID
+SPREADSHEET_NAME: str = _core.SPREADSHEET_NAME
 
+# Tab names
+GUILDS_SHEET:           str = _core.SHEET_GUILDS
+PLAYERS_SHEET:          str = _core.SHEET_PLAYERS
+USERS_SHEET:            str = _core.SHEET_USERS
+ASSIGNMENTS_SHEET:      str = _core.SHEET_ASSIGNMENTS
+TICKET_SNAPSHOTS_SHEET: str = _core.SHEET_TICKET_SNAPSHOTS
 
-# Chats permitidos para /syncdata (puedes mantenerlo también en env)
-_raw = os.getenv("SYNC_DATA_ALLOWED_CHATS", "7367477801,30373681")
-SYNC_DATA_ALLOWED_CHATS = {s.strip() for s in _raw.split(",") if s.strip()}
+# Auth
+SYNC_DATA_ALLOWED_CHATS:  set[str] = _core.SYNC_DATA_ALLOWED_CHATS
+SYNC_GUILD_ALLOWED_CHATS: set[str] = _core.SYNC_GUILD_ALLOWED_CHATS
 
-# Zona horaria (reutiliza tu TIMEZONE del core)
-TZ = ZoneInfo(getattr(core_cfg, "TIMEZONE", os.getenv("ID_ZONA", "Europe/Amsterdam")))
+# Timezone
+TZ = _core.TZ
+TIMEZONE: str = _core.TIMEZONE
+
+# Scheduled job configuration
+SEND_ASSIGNMENTS_TIME: str = _core.SEND_ASSIGNMENTS_TIME
+SYNC_GUILDS_CRON: str      = _core.SYNC_GUILDS_CRON
+SYNC_DATA_CRON: str        = _core.SYNC_DATA_CRON
