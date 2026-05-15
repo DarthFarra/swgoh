@@ -1,0 +1,77 @@
+# systemd/swgoh-bot.service
+#
+# Raspberry Pi systemd service for the SWGOH bot.
+#
+# INSTALLATION:
+#   1. Edit the paths below to match your Pi setup.
+#   2. Copy to systemd:
+#        sudo cp systemd/swgoh-bot.service /etc/systemd/system/
+#   3. Enable and start:
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable swgoh-bot
+#        sudo systemctl start swgoh-bot
+#
+# USEFUL COMMANDS:
+#   sudo systemctl status swgoh-bot      — check running status
+#   sudo journalctl -u swgoh-bot -f      — tail live logs
+#   sudo systemctl restart swgoh-bot     — restart after a code update
+#   sudo systemctl stop swgoh-bot        — stop the bot
+#
+# After a code update (git pull):
+#   sudo systemctl restart swgoh-bot
+# That's it — no Railway redeploy needed.
+
+[Unit]
+Description=SWGOH Telegram Bot
+# Wait for the network to be fully up before starting.
+# 'network-online.target' is stricter than 'network.target' and ensures
+# the interface has an IP address — important for the comlink HTTP call
+# that happens at bot startup.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# --- Identity ---
+# Run as your Pi user (not root). Replace 'pi' with your username if different.
+User=pi
+Group=pi
+
+# --- Working directory ---
+# The root of the cloned repository.
+WorkingDirectory=/home/pi/swgoh
+
+# --- Environment ---
+# EnvironmentFile loads your .env file so no secrets are baked into this unit.
+# The '-' prefix means systemd won't fail if the file doesn't exist yet
+# (useful during first boot before you've created .env).
+EnvironmentFile=-/home/pi/swgoh/.env
+
+# --- Python path ---
+# Ensure the src/ layout is importable. Adjust the Python path to your venv.
+Environment=PYTHONPATH=/home/pi/swgoh/src
+
+# --- Command ---
+# Uses the venv Python. If you're not using a venv, replace with:
+#   ExecStart=/usr/bin/python3 -m swgoh.bot.main_bot
+ExecStart=/home/pi/swgoh/.venv/bin/python -m swgoh.bot.main_bot
+
+# --- Restart policy ---
+# Always restart on failure, with a 10 second delay.
+# This covers crashes, OOM kills, and Pi reboots.
+Restart=always
+RestartSec=10
+
+# --- Logging ---
+# Output goes to the systemd journal (view with journalctl -u swgoh-bot).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=swgoh-bot
+
+# --- Resource limits (optional, conservative defaults for Pi) ---
+# Prevents the bot from consuming all memory if something goes wrong.
+# Adjust or remove if your Pi has more RAM.
+MemoryMax=256M
+
+[Install]
+# Start automatically on boot (multi-user = normal system mode).
+WantedBy=multi-user.target
