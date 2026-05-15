@@ -20,7 +20,6 @@ from ..services.sheets import (
     upsert_usuario,
 )
 from ..security import (
-    rate_limit,
     session_set,
     session_get,
     session_clear,
@@ -36,7 +35,6 @@ _S_METHOD     = "reg_method"
 _S_WAITING    = "reg_waiting"
 
 
-@rate_limit(cooldown_seconds=10)
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss   = open_ss()
     gmap = map_guild_name_to_label_id_rote(ss)
