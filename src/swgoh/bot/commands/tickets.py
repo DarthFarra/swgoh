@@ -4,19 +4,20 @@
 
 Flow:
   1. /tickets -> guild selector (if multiple guilds)
-  2. Guild chosen -> two buttons: "Today (live)" | "Yesterday (missed)"
-  3a. Today -> fetches live data, shows delinquents + "Refresh" + "Send Reminder" buttons
-      -> "Send Reminder" -> confirmation step (count) -> confirm/cancel
-      -> confirmed -> sends messages, reports sent/failed
+  2. Guild chosen -> two buttons: "Hoy (en vivo)" | "Ayer (faltas)"
+  3a. Today -> fetches live data, shows delinquents +
+               "Actualizar" | "Ayer" | "Enviar Recordatorio" | "Publicar en Avisos"
+      -> "Enviar Recordatorio" -> confirm -> sends DMs, reports sent/failed
+      -> "Publicar en Avisos"  -> confirm -> posts to channel, reports result
   3b. Yesterday -> reads snapshot + live lifetimeValue, shows who missed
 """
 from __future__ import annotations
 
 import logging
-from datetime import date
 from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
@@ -27,12 +28,16 @@ from ..services.sheets import (
     user_has_leadership_role,
     read_ticket_snapshot,
     get_chat_ids_for_members,
+    get_channel_id_for_guild,
+    get_usernames_for_members,
 )
 from ..services.tickets import (
     fetch_guild_tickets,
     render_tickets_today,
     render_tickets_yesterday,
+    render_tickets_today_channel,
     send_ticket_reminders,
+    publish_tickets_to_channel,
     DAILY_TICKET_GOAL,
 )
 from ..keyboards.guild_select import make_keyboard_guilds
@@ -41,12 +46,12 @@ log = logging.getLogger(__name__)
 
 MADRID_TZ = ZoneInfo("Europe/Madrid")
 
+
 # ---------------------------------------------------------------------------
 # Command entry point
 # ---------------------------------------------------------------------------
 
 async def cmd_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point: /tickets"""
     ss = open_ss()
     user_id = update.effective_user.id
     guilds = usuarios_guilds_for_user(ss, user_id)
@@ -102,7 +107,7 @@ async def cb_tickets_guild(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ---------------------------------------------------------------------------
-# Mode selector (Today / Yesterday)
+# Mode selector
 # ---------------------------------------------------------------------------
 
 async def _show_mode_selector(
@@ -140,13 +145,11 @@ async def cb_tickets_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     data = q.data or ""
     if not data.startswith("ticketstoday:"):
         return
-
     gid = data.split(":", 1)[1]
     await _fetch_and_show_today(q, gid, context)
 
 
 async def _fetch_and_show_today(q, gid: str, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shared logic for initial load and refresh of Today view."""
     ss = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
 
@@ -168,9 +171,9 @@ async def _fetch_and_show_today(q, gid: str, context: ContextTypes.DEFAULT_TYPE)
 
     delinquents = [m for m in members if not m.completed_today]
 
-    # Cache members so the reminder flow reuses them without a second API call
+    # Cache for reminder and publish flows (avoids second API call)
     context.user_data[f"tickets_members_{gid}"] = members
-    context.user_data[f"tickets_gname_{gid}"] = gname
+    context.user_data[f"tickets_gname_{gid}"]   = gname
 
     text = render_tickets_today(members, label)
 
@@ -185,20 +188,26 @@ async def _fetch_and_show_today(q, gid: str, context: ContextTypes.DEFAULT_TYPE)
             InlineKeyboardButton(
                 f"Enviar Recordatorio ({len(delinquents)})",
                 callback_data=f"ticketsremind:{gid}",
-            )
+            ),
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                f"Publicar en Avisos ({len(delinquents)})",
+                callback_data=f"ticketspublish:{gid}",
+            ),
         ])
     rows.append([InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}")])
 
-    kb = InlineKeyboardMarkup(rows)
-    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
+    await q.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2
+    )
 
 
 # ---------------------------------------------------------------------------
-# Reminder -- confirmation step
+# Reminder — confirmation
 # ---------------------------------------------------------------------------
 
 async def cb_tickets_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Shows confirmation before sending reminders."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
@@ -206,26 +215,13 @@ async def cb_tickets_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     gid = data.split(":", 1)[1]
-    ss = open_ss()
+    ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
-
-    # Retrieve cached members; re-fetch if missing (e.g. bot restarted)
-    members = context.user_data.get(f"tickets_members_{gid}")
+    members = await _get_cached_or_fetch(q, context, gid, gname)
     if members is None:
-        try:
-            members = fetch_guild_tickets(gid)
-            context.user_data[f"tickets_members_{gid}"] = members
-            context.user_data[f"tickets_gname_{gid}"] = gname
-        except Exception as exc:
-            log.error("Error re-fetching tickets for reminder confirmation: %s", exc)
-            await q.edit_message_text(
-                "No se pudieron obtener los datos\\. Ejecuta /tickets de nuevo\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            return
+        return
 
     delinquents = [m for m in members if not m.completed_today]
-
     if not delinquents:
         await q.edit_message_text(
             "Todos han completado sus tickets\\. No hay recordatorios que enviar\\!",
@@ -233,7 +229,7 @@ async def cb_tickets_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    count = len(delinquents)
+    count     = len(delinquents)
     esc_label = _escape_md(label)
     esc_count = _escape_md(str(count))
     esc_goal  = _escape_md(str(DAILY_TICKET_GOAL))
@@ -250,21 +246,19 @@ async def cb_tickets_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await q.edit_message_text(
         f"*{esc_label}* \u2014 Enviar recordatorio de tickets\n\n"
         f"Se enviara un mensaje a *{esc_count}* miembro\\(s\\) que aun no han "
-        f"alcanzado los {esc_goal} tickets de hoy\\.\n\n"
-        f"Confirmas?",
+        f"alcanzado los {esc_goal} tickets de hoy\\.\n\nConfirmas?",
         reply_markup=kb,
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
 
 # ---------------------------------------------------------------------------
-# Reminder -- confirmed, send messages
+# Reminder — confirmed, send DMs
 # ---------------------------------------------------------------------------
 
 async def cb_tickets_remind_confirm(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Sends reminders to all delinquent members and reports results."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
@@ -272,9 +266,8 @@ async def cb_tickets_remind_confirm(
         return
 
     gid = data.split(":", 1)[1]
-    ss = open_ss()
+    ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
-
     members = context.user_data.get(f"tickets_members_{gid}")
     if members is None:
         await q.edit_message_text(
@@ -296,50 +289,196 @@ async def cb_tickets_remind_confirm(
         parse_mode=ParseMode.MARKDOWN_V2,
     )
 
-    delinquent_names = [m.player_name for m in delinquents]
     try:
-        chat_ids = get_chat_ids_for_members(ss, gname, delinquent_names)
+        chat_ids = get_chat_ids_for_members(ss, gname, [m.player_name for m in delinquents])
     except Exception as exc:
         log.error("Error reading chat_ids for guild %s: %s", gname, exc)
         await q.edit_message_text(
-            f"Error leyendo los chat IDs del spreadsheet\\.\n\n"
-            f"`{_escape_md(str(exc))}`",
+            f"Error leyendo los chat IDs\\.\n\n`{_escape_md(str(exc))}`",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
     sent, failed = await send_ticket_reminders(
-        bot=context.bot,
-        members=delinquents,
-        chat_ids=chat_ids,
+        bot=context.bot, members=delinquents, chat_ids=chat_ids
     )
-
-    # Clear cache -- data is stale after reminders are sent
-    context.user_data.pop(f"tickets_members_{gid}", None)
-    context.user_data.pop(f"tickets_gname_{gid}", None)
-
-    esc_label  = _escape_md(label)
-    esc_sent   = _escape_md(str(sent))
-    esc_failed = _escape_md(str(failed))
-    total      = _escape_md(str(sent + failed))
+    _clear_cache(context, gid)
 
     lines = [
-        f"*{esc_label}* \u2014 Resultado del recordatorio\n",
-        f"Enviados: *{esc_sent}* / {total}",
+        f"*{_escape_md(label)}* \u2014 Resultado del recordatorio\n",
+        f"Enviados: *{_escape_md(str(sent))}* / {_escape_md(str(sent + failed))}",
     ]
     if failed:
         lines.append(
-            f"Fallidos: *{esc_failed}* \\(sin chat\\_id registrado o bot bloqueado\\)"
+            f"Fallidos: *{_escape_md(str(failed))}* "
+            f"\\(sin chat\\_id registrado o bot bloqueado\\)"
         )
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Actualizar tickets", callback_data=f"ticketstoday:{gid}"),
+        InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
+    ]])
+    await q.edit_message_text(
+        "\n".join(lines), reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
+# ---------------------------------------------------------------------------
+# Publish to channel — confirmation
+# ---------------------------------------------------------------------------
+
+async def cb_tickets_publish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("ticketspublish:"):
+        return
+
+    gid = data.split(":", 1)[1]
+    ss  = open_ss()
+    label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+
+    # Validate channel is configured before showing confirm
+    channel_id = get_channel_id_for_guild(ss, gname)
+    if not channel_id:
+        await q.edit_message_text(
+            f"*{_escape_md(label)}* \u2014 No hay canal de avisos configurado\\.\n\n"
+            f"Agrega la columna `announcements\\_channel` en la hoja Guilds con el "
+            f"ID del canal \\(ej\\: `\\-1002461429674`\\)\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    members = await _get_cached_or_fetch(q, context, gid, gname)
+    if members is None:
+        return
+
+    delinquents = [m for m in members if not m.completed_today]
+    if not delinquents:
+        await q.edit_message_text(
+            "Todos han completado sus tickets\\. No hay nada que publicar\\!",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    count     = len(delinquents)
+    esc_label = _escape_md(label)
+    esc_count = _escape_md(str(count))
+    esc_chan   = _escape_md(channel_id)
 
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("Actualizar tickets", callback_data=f"ticketstoday:{gid}"),
-            InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
+            InlineKeyboardButton(
+                f"Si, publicar ({count} miembros)",
+                callback_data=f"ticketspublishconfirm:{gid}",
+            ),
+            InlineKeyboardButton("Cancelar", callback_data=f"ticketstoday:{gid}"),
         ]
     ])
     await q.edit_message_text(
-        "\n".join(lines),
+        f"*{esc_label}* \u2014 Publicar en avisos\n\n"
+        f"Se publicara el informe de *{esc_count}* miembro\\(s\\) con tickets "
+        f"pendientes en el canal `{esc_chan}`\\.\n\nConfirmas?",
+        reply_markup=kb,
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Publish to channel — confirmed
+# ---------------------------------------------------------------------------
+
+async def cb_tickets_publish_confirm(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("ticketspublishconfirm:"):
+        return
+
+    gid = data.split(":", 1)[1]
+    ss  = open_ss()
+    label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+
+    channel_id = get_channel_id_for_guild(ss, gname)
+    if not channel_id:
+        await q.edit_message_text(
+            "No hay canal configurado\\. Agrega `announcements\\_channel` en Guilds\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    members = context.user_data.get(f"tickets_members_{gid}")
+    if members is None:
+        await q.edit_message_text(
+            "Sesion expirada\\. Ejecuta /tickets de nuevo\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    delinquents = [m for m in members if not m.completed_today]
+    if not delinquents:
+        await q.edit_message_text(
+            "Todos han completado sus tickets\\. Nada que publicar\\!",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    await q.edit_message_text(
+        f"Publicando en el canal para *{_escape_md(label)}*\u2026",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    # Fetch usernames only for delinquent members
+    try:
+        usernames = get_usernames_for_members(
+            ss, gname, [m.player_name for m in delinquents]
+        )
+    except Exception as exc:
+        log.error("Error reading usernames for guild %s: %s", gname, exc)
+        usernames = {}  # degrade gracefully: fall back to plain names for all
+
+    try:
+        await publish_tickets_to_channel(
+            bot=context.bot,
+            channel_id=channel_id,
+            members=delinquents,
+            usernames=usernames,
+            guild_label=label,
+        )
+    except Forbidden:
+        log.error("Bot is not admin of channel %s", channel_id)
+        await q.edit_message_text(
+            f"El bot no tiene permisos de admin en el canal `{_escape_md(channel_id)}`\\.\n\n"
+            f"Asegurate de que el bot es administrador del canal e intentalo de nuevo\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+    except BadRequest as exc:
+        log.error("Bad channel ID %s: %s", channel_id, exc)
+        await q.edit_message_text(
+            f"ID de canal invalido: `{_escape_md(channel_id)}`\\.\n\n"
+            f"`{_escape_md(str(exc))}`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+    except Exception as exc:
+        log.error("Unexpected error publishing to channel %s: %s", channel_id, exc)
+        await q.edit_message_text(
+            f"Error inesperado al publicar\\.\n\n`{_escape_md(str(exc))}`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    _clear_cache(context, gid)
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Actualizar tickets", callback_data=f"ticketstoday:{gid}"),
+        InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
+    ]])
+    await q.edit_message_text(
+        f"*{_escape_md(label)}* \u2014 Publicado correctamente en el canal\\!",
         reply_markup=kb,
         parse_mode=ParseMode.MARKDOWN_V2,
     )
@@ -357,10 +496,9 @@ async def cb_tickets_yesterday(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     gid = data.split(":", 1)[1]
-    ss = open_ss()
+    ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
-
-    snapshot_result = read_ticket_snapshot(ss, gname)
+    snapshot_result  = read_ticket_snapshot(ss, gname)
 
     if snapshot_result is None:
         await q.edit_message_text(
@@ -389,15 +527,13 @@ async def cb_tickets_yesterday(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    text = render_tickets_yesterday(members_live, snapshot_data, label)
+    text  = render_tickets_yesterday(members_live, snapshot_data, label)
     text += f"\n\n_Snapshot: {_escape_md(snapshot_date)}_"
 
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Hoy", callback_data=f"ticketstoday:{gid}"),
-            InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
-        ]
-    ])
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Hoy", callback_data=f"ticketstoday:{gid}"),
+        InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
+    ]])
     await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
 
 
@@ -413,14 +549,41 @@ async def cb_tickets_back(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     gid = data.split(":", 1)[1]
-    ss = open_ss()
+    ss  = open_ss()
     label, _, _ = resolve_label_name_rote_by_id(ss, gid)
     await _show_mode_selector(update, context, gid, label, via_callback=True)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
+
+async def _get_cached_or_fetch(q, context, gid: str, gname: str):
+    """
+    Returns cached members list or re-fetches from API.
+    Edits the message with an error and returns None on failure.
+    """
+    members = context.user_data.get(f"tickets_members_{gid}")
+    if members is not None:
+        return members
+    try:
+        members = fetch_guild_tickets(gid)
+        context.user_data[f"tickets_members_{gid}"] = members
+        context.user_data[f"tickets_gname_{gid}"]   = gname
+        return members
+    except Exception as exc:
+        log.error("Error re-fetching tickets for guild %s: %s", gid, exc)
+        await q.edit_message_text(
+            "No se pudieron obtener los datos\\. Ejecuta /tickets de nuevo\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return None
+
+
+def _clear_cache(context, gid: str) -> None:
+    context.user_data.pop(f"tickets_members_{gid}", None)
+    context.user_data.pop(f"tickets_gname_{gid}", None)
+
 
 def _guild_name_for_id(ss, guild_id: str) -> str:
     _, gname, _ = resolve_label_name_rote_by_id(ss, guild_id)
@@ -440,10 +603,12 @@ def _escape_md(text: str) -> str:
 def get_handlers():
     return [
         CommandHandler("tickets", cmd_tickets),
-        CallbackQueryHandler(cb_tickets_guild,          pattern=r"^tickets:"),
-        CallbackQueryHandler(cb_tickets_today,          pattern=r"^ticketstoday:"),
-        CallbackQueryHandler(cb_tickets_yesterday,      pattern=r"^ticketsyest:"),
-        CallbackQueryHandler(cb_tickets_remind,         pattern=r"^ticketsremind:"),
-        CallbackQueryHandler(cb_tickets_remind_confirm, pattern=r"^ticketsremindconfirm:"),
-        CallbackQueryHandler(cb_tickets_back,           pattern=r"^ticketsback:"),
+        CallbackQueryHandler(cb_tickets_guild,           pattern=r"^tickets:"),
+        CallbackQueryHandler(cb_tickets_today,           pattern=r"^ticketstoday:"),
+        CallbackQueryHandler(cb_tickets_yesterday,       pattern=r"^ticketsyest:"),
+        CallbackQueryHandler(cb_tickets_remind,          pattern=r"^ticketsremind:"),
+        CallbackQueryHandler(cb_tickets_remind_confirm,  pattern=r"^ticketsremindconfirm:"),
+        CallbackQueryHandler(cb_tickets_publish,         pattern=r"^ticketspublish:"),
+        CallbackQueryHandler(cb_tickets_publish_confirm, pattern=r"^ticketspublishconfirm:"),
+        CallbackQueryHandler(cb_tickets_back,            pattern=r"^ticketsback:"),
     ]
