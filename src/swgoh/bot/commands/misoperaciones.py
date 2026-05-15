@@ -14,7 +14,6 @@ from ..services.sheets import (
 )
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..security import (
-    rate_limit,
     session_set,
     session_get,
     validate_guild_id,
@@ -30,7 +29,6 @@ _S_ROTE   = "myops_rote_sheet"
 _S_PHASES = "myops_phases"
 
 
-@rate_limit(cooldown_seconds=10)
 async def cmd_misoperaciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss     = open_ss()
     guilds = usuarios_guilds_for_user(ss, update.effective_user.id)
