@@ -1,3 +1,6 @@
+# src/swgoh/bot/commands/operacionesjugador.py
+from __future__ import annotations
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -12,62 +15,90 @@ from ..services.sheets import (
 )
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..keyboards.player_select import make_keyboard_players
+from ..security import (
+    rate_limit,
+    session_set,
+    session_get,
+    validate_guild_id,
+    validate_player_name,
+    validate_phase,
+    CallbackValidationError,
+)
 
+# Session keys
+_S_GID     = "playerops_guild_id"
+_S_GNAME   = "playerops_guild_name"
+_S_LABEL   = "playerops_label"
+_S_ROTE    = "playerops_rote_sheet"
+_S_PLAYER  = "playerops_player"
+_S_PHASES  = "playerops_phases"
+_S_PLAYERS = "playerops_players"  # whitelist of valid player names
+
+
+@rate_limit(cooldown_seconds=10)
 async def cmd_operacionesjugador(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Flujo:
-    1) Verifica que el usuario tenga rol de Oficial o Lider.
-    2) Detecta gremios del usuario donde tenga ese rol.
-    3) Si varios, pide elegir gremio.
-    4) Tras elegir gremio, muestra lista de jugadores.
-    5) Tras elegir jugador, pide elegir FASE.
-    6) Renderiza asignaciones del jugador en esa fase, agrupadas por PLANETA.
-    """
-    ss = open_ss()
-    guilds = usuarios_guilds_for_user(ss, update.effective_user.id)
+    ss      = open_ss()
+    user_id = update.effective_user.id
+    guilds  = usuarios_guilds_for_user(ss, user_id)
 
     if not guilds:
         await update.message.reply_text("No estás registrado en ningún gremio.")
         return
 
-    leadership_guilds = []
-    for label, gid, gname in guilds:
-        if user_has_leadership_role(ss, update.effective_user.id, gname):
-            leadership_guilds.append((label, gid, gname))
+    leadership_guilds = [
+        (label, gid, gname)
+        for label, gid, gname in guilds
+        if user_has_leadership_role(ss, user_id, gname)
+    ]
 
     if not leadership_guilds:
-        await update.message.reply_text("No tienes permisos de Oficial o Líder en ningún gremio.")
+        await update.message.reply_text(
+            "No tienes permisos de Oficial o Líder en ningún gremio."
+        )
         return
 
     if len(leadership_guilds) > 1:
-        opts = [(label, gid) for (label, gid, _gn) in leadership_guilds]
-        kb = make_keyboard_guilds(opts, "playerops")
-        await update.message.reply_text("Elige el gremio para ver operaciones de jugadores:", reply_markup=kb)
+        opts = [(label, gid) for label, gid, _ in leadership_guilds]
+        await update.message.reply_text(
+            "Elige el gremio para ver operaciones de jugadores:",
+            reply_markup=make_keyboard_guilds(opts, "playerops"),
+        )
         return
 
     label, gid, gname = leadership_guilds[0]
     await _ask_player_for_guild(update, context, ss, gid, gname, label, via_callback=False)
 
+
 async def cb_playerops_guild(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback de selección de gremio para /operacionesjugador."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
     if not data.startswith("playerops:"):
         return
-    gid = data.split(":", 1)[1]
 
-    ss = open_ss()
-    label, gname, _rote_sheet = resolve_label_name_rote_by_id(ss, gid)
+    raw_gid = data.split(":", 1)[1]
+    user_id = q.from_user.id
+    ss      = open_ss()
 
-    if not user_has_leadership_role(ss, q.from_user.id, gname):
+    # Validate against guilds where the user has leadership
+    guilds    = usuarios_guilds_for_user(ss, user_id)
+    known_ids = {gid for _, gid, _ in guilds}
+    try:
+        gid = validate_guild_id(raw_gid, known_ids)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Gremio no válido.")
+        return
+
+    label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+
+    if not user_has_leadership_role(ss, user_id, gname):
         await q.edit_message_text("❌ No tienes permisos de Oficial o Líder en este gremio.")
         return
 
     await _ask_player_for_guild(update, context, ss, gid, gname, label, via_callback=True)
 
+
 async def cb_playerops_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback de selección de jugador."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
@@ -75,26 +106,49 @@ async def cb_playerops_player(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        parts = data.split(":", 2)
-        gid = parts[1]
-        player_name = parts[2]
+        _, raw_gid, raw_player = data.split(":", 2)
     except (ValueError, IndexError):
         await q.edit_message_text("❌ Error al procesar la selección del jugador.")
         return
 
-    ss = open_ss()
+    user_id = q.from_user.id
+    ss      = open_ss()
+
+    # Validate guild
+    guilds    = usuarios_guilds_for_user(ss, user_id)
+    known_ids = {gid for _, gid, _ in guilds}
+    try:
+        gid = validate_guild_id(raw_gid, known_ids)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Gremio no válido.")
+        return
+
     label, gname, rote_sheet = resolve_label_name_rote_by_id(ss, gid)
 
-    context.user_data["selected_player"] = player_name
-    context.user_data["selected_guild_id"] = gid
-    context.user_data["selected_guild_name"] = gname
-    context.user_data["selected_guild_label"] = label
-    context.user_data["selected_rote_sheet"] = rote_sheet
+    if not user_has_leadership_role(ss, user_id, gname):
+        await q.edit_message_text("❌ No tienes permisos de Oficial o Líder en este gremio.")
+        return
+
+    # Validate player name against the known list (from session or re-fetched)
+    known_players_tuples = session_get(context, user_id, _S_PLAYERS) or list_players_for_guild(ss, gname)
+    known_player_names   = {name for name, _ in known_players_tuples}
+    try:
+        player_name = validate_player_name(raw_player, known_player_names)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Jugador no válido.")
+        return
 
     phases = list_phases_in_rote(ss, rote_sheet)
     if not phases:
         await q.edit_message_text(f"❌ No hay fases en la hoja ROTE de {label}.")
         return
+
+    session_set(context, user_id, _S_GID,    gid)
+    session_set(context, user_id, _S_GNAME,  gname)
+    session_set(context, user_id, _S_LABEL,  label)
+    session_set(context, user_id, _S_ROTE,   rote_sheet)
+    session_set(context, user_id, _S_PLAYER, player_name)
+    session_set(context, user_id, _S_PHASES, phases)
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text=f"Fase {p}", callback_data=f"playeropsphase:{gid}:{p}")]
@@ -105,8 +159,8 @@ async def cb_playerops_player(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=kb,
     )
 
+
 async def cb_playerops_phase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback de selección de fase."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
@@ -114,71 +168,91 @@ async def cb_playerops_phase(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     try:
-        _, gid, phase = data.split(":", 2)
+        _, raw_gid, raw_phase = data.split(":", 2)
     except ValueError:
         await q.edit_message_text("❌ Error al procesar la fase.")
         return
 
-    ss = open_ss()
+    user_id = q.from_user.id
+    ss      = open_ss()
 
-    player_name = context.user_data.get("selected_player")
-    label = context.user_data.get("selected_guild_label")
-    rote_sheet = context.user_data.get("selected_rote_sheet")
-
-    if not player_name:
-        await q.edit_message_text("❌ Error: No se encontró el jugador seleccionado.")
+    # Validate guild
+    guilds    = usuarios_guilds_for_user(ss, user_id)
+    known_ids = {gid for _, gid, _ in guilds}
+    try:
+        gid = validate_guild_id(raw_gid, known_ids)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Gremio no válido.")
         return
 
-    if phase.strip().lower() == "x":
-        phases = list_phases_in_rote(ss, rote_sheet)
-        if not phases:
-            await q.edit_message_text(f"❌ No hay fases en la hoja ROTE de {label}.")
-            return
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(text=f"Fase {p}", callback_data=f"playeropsphase:{gid}:{p}")]
-            for p in phases
-        ])
-        await q.edit_message_text(
-            f"Elige la fase para {player_name} en {label}:",
-            reply_markup=kb,
-        )
+    label, gname, rote_sheet = resolve_label_name_rote_by_id(ss, gid)
+
+    if not user_has_leadership_role(ss, user_id, gname):
+        await q.edit_message_text("❌ No tienes permisos de Oficial o Líder en este gremio.")
+        return
+
+    # Validate phase
+    known_phases = session_get(context, user_id, _S_PHASES) or list_phases_in_rote(ss, rote_sheet)
+    try:
+        phase = validate_phase(raw_phase, known_phases)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Fase no válida.")
+        return
+
+    player_name = session_get(context, user_id, _S_PLAYER)
+    if not player_name:
+        await q.edit_message_text("❌ No se encontró el jugador seleccionado. Vuelve a empezar.")
         return
 
     title = f"Asignaciones de {player_name} — {label} (Fase {phase})"
-    body = render_ops_for_alias_phase_grouped(ss, rote_sheet, player_name, phase)
+    body  = render_ops_for_alias_phase_grouped(ss, rote_sheet, player_name, phase)
 
     if not body or "No tienes asignaciones" in body:
-        body = f"El jugador seleccionado no tiene asignaciones para la Fase {phase}"
+        body = f"El jugador no tiene asignaciones para la Fase {phase}."
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="Cambiar fase", callback_data=f"playeropschoosephase:{gid}")],
-        [InlineKeyboardButton(text="Cambiar jugador", callback_data=f"playeropschooseplayer:{gid}")]
+        [InlineKeyboardButton(text="Cambiar fase",    callback_data=f"playeropschoosephase:{gid}")],
+        [InlineKeyboardButton(text="Cambiar jugador", callback_data=f"playeropschooseplayer:{gid}")],
     ])
-
     await q.edit_message_text(f"{title}\n\n{body}", reply_markup=kb)
 
+
 async def cb_playerops_choosephase(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para volver a mostrar el selector de fases."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
     if not data.startswith("playeropschoosephase:"):
         return
-    gid = data.split(":", 1)[1]
 
-    ss = open_ss()
-    label = context.user_data.get("selected_guild_label")
-    rote_sheet = context.user_data.get("selected_rote_sheet")
-    player_name = context.user_data.get("selected_player")
+    raw_gid = data.split(":", 1)[1]
+    user_id = q.from_user.id
+    ss      = open_ss()
 
+    guilds    = usuarios_guilds_for_user(ss, user_id)
+    known_ids = {gid for _, gid, _ in guilds}
+    try:
+        gid = validate_guild_id(raw_gid, known_ids)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Gremio no válido.")
+        return
+
+    label, gname, rote_sheet = resolve_label_name_rote_by_id(ss, gid)
+
+    if not user_has_leadership_role(ss, user_id, gname):
+        await q.edit_message_text("❌ No tienes permisos de Oficial o Líder en este gremio.")
+        return
+
+    player_name = session_get(context, user_id, _S_PLAYER)
     if not player_name:
-        await q.edit_message_text("❌ Error: No se encontró el jugador seleccionado.")
+        await q.edit_message_text("❌ No se encontró el jugador seleccionado. Vuelve a empezar.")
         return
 
     phases = list_phases_in_rote(ss, rote_sheet)
     if not phases:
         await q.edit_message_text(f"❌ No hay fases en la hoja ROTE de {label}.")
         return
+
+    session_set(context, user_id, _S_PHASES, phases)
 
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text=f"Fase {p}", callback_data=f"playeropsphase:{gid}:{p}")]
@@ -189,32 +263,47 @@ async def cb_playerops_choosephase(update: Update, context: ContextTypes.DEFAULT
         reply_markup=kb,
     )
 
+
 async def cb_playerops_chooseplayer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback para volver a mostrar el selector de jugadores."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
     if not data.startswith("playeropschooseplayer:"):
         return
-    gid = data.split(":", 1)[1]
 
-    ss = open_ss()
-    label, gname, _rote_sheet = resolve_label_name_rote_by_id(ss, gid)
+    raw_gid = data.split(":", 1)[1]
+    user_id = q.from_user.id
+    ss      = open_ss()
 
-    players = list_players_for_guild(ss, gname)
-    if not players:
-        await q.edit_message_text("❌ Jugadores no disponibles para el gremio seleccionado.")
+    guilds    = usuarios_guilds_for_user(ss, user_id)
+    known_ids = {gid for _, gid, _ in guilds}
+    try:
+        gid = validate_guild_id(raw_gid, known_ids)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Gremio no válido.")
         return
 
-    kb = make_keyboard_players(players, f"playeropsplayer:{gid}")
-    await q.edit_message_text(f"Selecciona un jugador de {label}:", reply_markup=kb)
+    label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
 
-async def _ask_player_for_guild(update: Update, context: ContextTypes.DEFAULT_TYPE, ss, gid: str, gname: str, label: str, via_callback: bool):
-    """Utilidad para mostrar la lista de jugadores de un gremio."""
+    if not user_has_leadership_role(ss, user_id, gname):
+        await q.edit_message_text("❌ No tienes permisos de Oficial o Líder en este gremio.")
+        return
+
+    await _ask_player_for_guild(update, context, ss, gid, gname, label, via_callback=True)
+
+
+async def _ask_player_for_guild(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    ss,
+    gid: str,
+    gname: str,
+    label: str,
+    via_callback: bool,
+):
     players = list_players_for_guild(ss, gname)
-
     if not players:
-        msg = "❌ Jugadores no disponibles para el gremio seleccionado."
+        msg = "❌ No hay jugadores disponibles para el gremio seleccionado."
         if via_callback:
             await update.callback_query.edit_message_text(msg)
         else:
@@ -222,12 +311,16 @@ async def _ask_player_for_guild(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     _, _, rote_sheet = resolve_label_name_rote_by_id(ss, gid)
-    context.user_data["selected_guild_id"] = gid
-    context.user_data["selected_guild_name"] = gname
-    context.user_data["selected_guild_label"] = label
-    context.user_data["selected_rote_sheet"] = rote_sheet
+    user_id = update.effective_user.id
 
-    kb = make_keyboard_players(players, f"playeropsplayer:{gid}")
+    # Store the player whitelist in session so callbacks can validate against it
+    session_set(context, user_id, _S_GID,     gid)
+    session_set(context, user_id, _S_GNAME,   gname)
+    session_set(context, user_id, _S_LABEL,   label)
+    session_set(context, user_id, _S_ROTE,    rote_sheet)
+    session_set(context, user_id, _S_PLAYERS, players)
+
+    kb   = make_keyboard_players(players, f"playeropsplayer:{gid}")
     text = f"Selecciona un jugador de {label}:"
 
     if via_callback:
@@ -235,13 +328,13 @@ async def _ask_player_for_guild(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         await update.message.reply_text(text, reply_markup=kb)
 
+
 def get_handlers():
-    """Retorna todos los handlers del comando /operacionesjugador."""
     return [
         CommandHandler("operacionesjugador", cmd_operacionesjugador),
-        CallbackQueryHandler(cb_playerops_guild, pattern=r"^playerops:"),
-        CallbackQueryHandler(cb_playerops_player, pattern=r"^playeropsplayer:"),
-        CallbackQueryHandler(cb_playerops_phase, pattern=r"^playeropsphase:"),
-        CallbackQueryHandler(cb_playerops_choosephase, pattern=r"^playeropschoosephase:"),
+        CallbackQueryHandler(cb_playerops_guild,        pattern=r"^playerops:"),
+        CallbackQueryHandler(cb_playerops_player,       pattern=r"^playeropsplayer:"),
+        CallbackQueryHandler(cb_playerops_phase,        pattern=r"^playeropsphase:"),
+        CallbackQueryHandler(cb_playerops_choosephase,  pattern=r"^playeropschoosephase:"),
         CallbackQueryHandler(cb_playerops_chooseplayer, pattern=r"^playeropschooseplayer:"),
     ]
