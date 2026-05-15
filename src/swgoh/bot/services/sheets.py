@@ -491,27 +491,55 @@ def list_guilds_with_reset_time(ss) -> list[tuple[str, str, str]]:
  
 def get_channel_id_for_guild(ss, guild_name: str) -> Optional[str]:
     """
-    Returns the announcements channel ID (e.g. '-1002461429674') for the
-    given guild_name, read from the 'announcements_channel' column in
-    GUILDS_SHEET. Returns None if the column is missing or value is empty.
+    Returns the announcements channel ID for the given guild_name.
+    Prefer get_channel_config_for_guild() when you also need the thread_id.
+    """
+    channel_id, _ = get_channel_config_for_guild(ss, guild_name)
+    return channel_id
+ 
+ 
+def get_channel_config_for_guild(
+    ss, guild_name: str
+) -> tuple[Optional[str], Optional[int]]:
+    """
+    Returns (channel_id, thread_id) for the given guild_name in a single
+    sheet read.
+ 
+    - channel_id: value of 'announcements_channel' column, or None if absent/empty.
+    - thread_id:  integer value of 'announcements_thread_id' column, or None if
+                  the column is missing, empty, or not a valid integer.
+                  Pass as message_thread_id to post in a specific forum topic.
     """
     ws = ss.worksheet(GUILDS_SHEET)
     headers, rows = _get_all(ws)
     hl = [h.strip().lower() for h in headers]
  
     if "guild name" not in hl or "announcements_channel" not in hl:
-        return None
+        return None, None
  
-    i_name = hl.index("guild name")
-    i_ch   = hl.index("announcements_channel")
+    i_name   = hl.index("guild name")
+    i_ch     = hl.index("announcements_channel")
+    i_thread = hl.index("announcements_thread_id") if "announcements_thread_id" in hl else None
  
     for r in rows:
-        gn  = (r[i_name] if i_name < len(r) else "").strip()
+        gn = (r[i_name] if i_name < len(r) else "").strip()
         if gn != guild_name:
             continue
-        raw = (r[i_ch] if i_ch < len(r) else "").strip()
-        return raw if raw else None
-    return None
+ 
+        channel_id = (r[i_ch] if i_ch < len(r) else "").strip() or None
+ 
+        thread_id: Optional[int] = None
+        if i_thread is not None:
+            raw_thread = (r[i_thread] if i_thread < len(r) else "").strip()
+            if raw_thread:
+                try:
+                    thread_id = int(raw_thread)
+                except ValueError:
+                    pass  # malformed value — treat as no thread
+ 
+        return channel_id, thread_id
+ 
+    return None, None
  
  
 def get_usernames_for_members(
@@ -738,3 +766,7 @@ def read_ticket_snapshot(ss, guild_name: str) -> Optional[tuple[str, Dict[str, i
         return None
  
     return snapshot_date, result
+ 
+
+
+1Password menu is available. Press down arrow to select.
