@@ -196,6 +196,66 @@ def render_tickets_yesterday(
 
 
 # ---------------------------------------------------------------------------
+# Reminder sending
+# ---------------------------------------------------------------------------
+
+REMINDER_TEMPLATE = (
+    "⚠️ Recordatorio Tickets\\! "
+    "Aun te quedan tickets por hacer, actualmente llevas \\({current}/{goal}\\)"
+)
+
+
+async def send_ticket_reminders(
+    bot,
+    members: List[MemberTickets],
+    chat_ids: Dict[str, int],  # player_name_lower -> chat_id
+) -> tuple[int, int]:
+    """
+    Sends a personalised reminder to each delinquent member who has a chat_id.
+
+    Returns:
+        (sent_count, failed_count)
+
+    'failed' covers both members with no chat_id registered AND Telegram
+    delivery errors (blocked bot, invalid chat, etc.).
+    """
+    import asyncio
+
+    delinquents = [m for m in members if not m.completed_today]
+    sent = 0
+    failed = 0
+
+    for m in delinquents:
+        chat_id = chat_ids.get(m.player_name.lower())
+        if not chat_id:
+            failed += 1
+            log.warning("No chat_id for member '%s'; skipping reminder.", m.player_name)
+            continue
+
+        text = REMINDER_TEMPLATE.format(
+            current=m.current_value,
+            goal=DAILY_TICKET_GOAL,
+        )
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="MarkdownV2",
+            )
+            sent += 1
+            # Small sleep to respect Telegram's per-second rate limit (30 msg/s global)
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            log.warning(
+                "Failed to send reminder to '%s' (chat_id=%s): %s",
+                m.player_name, chat_id, exc,
+            )
+            failed += 1
+
+    return sent, failed
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
