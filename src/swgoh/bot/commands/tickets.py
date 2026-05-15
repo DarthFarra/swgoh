@@ -29,6 +29,7 @@ from ..services.sheets import (
     read_ticket_snapshot,
     get_chat_ids_for_members,
     get_channel_id_for_guild,
+    get_channel_config_for_guild,
     get_usernames_for_members,
 )
 from ..services.tickets import (
@@ -339,7 +340,7 @@ async def cb_tickets_publish(update: Update, context: ContextTypes.DEFAULT_TYPE)
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
 
     # Validate channel is configured before showing confirm
-    channel_id = get_channel_id_for_guild(ss, gname)
+    channel_id, thread_id = get_channel_config_for_guild(ss, gname)
     if not channel_id:
         await q.edit_message_text(
             f"*{_escape_md(label)}* \u2014 No hay canal de avisos configurado\\.\n\n"
@@ -401,7 +402,7 @@ async def cb_tickets_publish_confirm(
     ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
 
-    channel_id = get_channel_id_for_guild(ss, gname)
+    channel_id, thread_id = get_channel_config_for_guild(ss, gname)
     if not channel_id:
         await q.edit_message_text(
             "No hay canal configurado\\. Agrega `announcements\\_channel` en Guilds\\.",
@@ -446,6 +447,7 @@ async def cb_tickets_publish_confirm(
             members=delinquents,
             usernames=usernames,
             guild_label=label,
+            thread_id=thread_id,
         )
     except Forbidden:
         log.error("Bot is not admin of channel %s", channel_id)
