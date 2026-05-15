@@ -146,53 +146,54 @@ def render_tickets_today(
 
 
 def render_tickets_yesterday(
-    members_live: List[MemberTickets],
-    snapshot: Dict[str, int],  # player_name (lower) -> lifetime_value at snapshot
+    snapshot_d: Dict[str, int],   # player_name_lower -> lifetimeValue at today's reset
+    snapshot_d1: Dict[str, int],  # player_name_lower -> lifetimeValue at yesterday's reset
     guild_label: str,
 ) -> str:
     """
-    Renders the 'Yesterday (missed)' message.
+    Renders the 'Yesterday (missed)' message using the two stored snapshots.
 
     Logic:
-      delta = current_lifetime - snapshot_lifetime
-      if delta < DAILY_TICKET_GOAL → missed
+      delta = lifetime_d[member] - lifetime_d1[member]
+      if delta < DAILY_TICKET_GOAL → missed yesterday
 
-    Members not in the snapshot are flagged separately (joined after snapshot).
-    All user-supplied and numeric content is escaped for MarkdownV2.
+    Members present in lifetime_d but absent from lifetime_d1 joined after
+    yesterday's snapshot and are flagged separately (can't be judged).
     """
-    missed: List[Tuple[str, int]] = []   # (player_name, delta)
-    new_members: List[str] = []          # names not in snapshot
+    missed: List[Tuple[str, int]] = []   # (player_name, contributed)
+    new_members: List[str] = []
 
-    for m in members_live:
-        key = m.player_name.lower()
-        if key not in snapshot:
-            new_members.append(m.player_name)
+    # Iterate snapshot_d (today's roster at reset time)
+    for name_lower, ld in snapshot_d.items():
+        if name_lower not in snapshot_d1:
+            new_members.append(name_lower)
             continue
-        delta = m.lifetime_value - snapshot[key]
+        delta = ld - snapshot_d1[name_lower]
         if delta < DAILY_TICKET_GOAL:
-            missed.append((m.player_name, max(0, delta)))
+            missed.append((name_lower, max(0, delta)))
 
     label = _escape_md(guild_label)
 
     if not missed and not new_members:
-        return f"✅ *{label}* — Everyone contributed their tickets yesterday\\!"
+        return f"✅ *{label}* — Todos contribuyeron sus tickets ayer\!"
 
-    lines = [f"📅 *{label}* — Missed tickets yesterday:\n"]
+    lines = [f"📅 *{label}* — Tickets pendientes ayer:\n"]
 
     if missed:
-        missed.sort(key=lambda x: x[1])  # ascending by tickets contributed
+        missed.sort(key=lambda x: x[1])
         goal = _escape_md(str(DAILY_TICKET_GOAL))
-        for name, contributed in missed:
-            esc_name        = _escape_md(name)
+        for name_lower, contributed in missed:
+            esc_name        = _escape_md(name_lower)
             esc_contributed = _escape_md(str(contributed))
             lines.append(f"• {esc_name} \\({esc_contributed}/{goal}\\)")
 
     if new_members:
-        lines.append("\n⚠️ *New members \\(no snapshot data\\):*")
+        lines.append("\n⚠️ *Nuevos miembros \\(sin datos de ayer\\):*")
         for name in sorted(new_members):
             lines.append(f"• {_escape_md(name)}")
 
     return "\n".join(lines)
+
 
 
 async def publish_tickets_to_channel(
