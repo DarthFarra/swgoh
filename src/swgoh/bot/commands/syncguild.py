@@ -1,148 +1,147 @@
-# swgoh/bot/commands/syncguild.py
+# src/swgoh/bot/commands/syncguild.py
+from __future__ import annotations
+
 import os
 import asyncio
+import logging
+
+import requests
 from telegram import Update
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
+
 from ..services.sheets import open_ss, already_synced_today, resolve_label_name_rote_by_id
 from ..services.auth import user_authorized_guilds, user_has_role_in_guild
 from ..keyboards.guild_select import make_keyboard_guilds
-import requests
-import logging
+from ..security import (
+    rate_limit,
+    validate_guild_id,
+    CallbackValidationError,
+)
 
 log = logging.getLogger(__name__)
 
-# URL del Apps Script Web App (configurar en .env)
-APPS_SCRIPT_URL = os.getenv('APPS_SCRIPT_WEBHOOK_URL')
-APPS_SCRIPT_TIMEOUT = int(os.getenv('APPS_SCRIPT_TIMEOUT', '350'))  # 350 segundos (5m 50s)
+APPS_SCRIPT_URL     = os.getenv("APPS_SCRIPT_WEBHOOK_URL")
+APPS_SCRIPT_TIMEOUT = int(os.getenv("APPS_SCRIPT_TIMEOUT", "350"))
 
+
+@rate_limit(cooldown_seconds=30)
 async def cmd_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
- """Comando /syncguild - Muestra selector de gremios"""
- ss = open_ss()
- opts = user_authorized_guilds(ss, update.effective_user.id)  # [(label,gid)]
- 
- if not opts:
-     await update.message.reply_text("No tienes permisos para sincronizar (se requiere rol Lider u Oficial).")
-     return
- 
- kb = make_keyboard_guilds(opts, "syncguild")
- await update.message.reply_text("Elige el gremio a sincronizar:", reply_markup=kb)
+    ss   = open_ss()
+    opts = user_authorized_guilds(ss, update.effective_user.id)  # [(label, gid)]
+
+    if not opts:
+        await update.message.reply_text(
+            "No tienes permisos para sincronizar (se requiere rol Lider u Oficial)."
+        )
+        return
+
+    await update.message.reply_text(
+        "Elige el gremio a sincronizar:",
+        reply_markup=make_keyboard_guilds(opts, "syncguild"),
+    )
+
 
 async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
- """Callback cuando se selecciona un gremio del keyboard"""
- q = update.callback_query
- await q.answer()
- 
- data = q.data or ""
- if not data.startswith("syncguild:"):
-     return
- 
- gid = data.split(":", 1)[1]
- ss = open_ss()
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("syncguild:"):
+        return
 
- # Verificar permisos
- if not user_has_role_in_guild(ss, q.from_user.id, gid):
-     await q.edit_message_text("❌ No tienes permisos para sincronizar este gremio.")
-     return
+    raw_gid = data.split(":", 1)[1]
+    user_id = q.from_user.id
+    ss      = open_ss()
 
- # Verificar si ya se sincronizó hoy
- if already_synced_today(ss, gid):
-     label, _, _ = resolve_label_name_rote_by_id(ss, gid)
-     await q.edit_message_text(f"ℹ️ {label} ya se sincronizó hoy.")
-     return
+    # Validate guild_id against guilds the user is actually authorized for
+    authorized = user_authorized_guilds(ss, user_id)
+    known_ids  = {gid for _, gid in authorized}
+    try:
+        gid = validate_guild_id(raw_gid, known_ids)
+    except CallbackValidationError:
+        await q.edit_message_text("❌ Gremio no válido.")
+        return
 
- label, _, _ = resolve_label_name_rote_by_id(ss, gid)
- 
- # Verificar que Apps Script esté configurado
- if not APPS_SCRIPT_URL:
-     await q.edit_message_text("❌ Error: APPS_SCRIPT_WEBHOOK_URL no configurado.")
-     log.error("APPS_SCRIPT_WEBHOOK_URL no está definido en variables de entorno")
-     return
- 
- # Iniciar sincronización
- await q.edit_message_text(f"⏳ Sincronizando {label}…\n\n_Esto puede tardar varios minutos._")
- 
- try:
-     # Llamar a Apps Script de forma asíncrona
-     result = await call_apps_script_sync(gid)
-     
-     # Parsear resultado
-     if result.get('status') == 'success':
-         summary = result.get('result', 'Completado')
-         await q.edit_message_text(f"✅ Sincronización completada para {label}.\n\n`{summary}`", parse_mode='Markdown')
-     else:
-         error_msg = result.get('message', 'Error desconocido')
-         await q.edit_message_text(f"❌ Error sincronizando {label}.\n\n{error_msg}")
-         
- except asyncio.TimeoutError:
-     # Timeout - pero el proceso puede seguir en Apps Script
-     await q.edit_message_text(
-         f"⏱️ {label}: La sincronización está tomando más tiempo del esperado.\n\n"
-         f"El proceso continúa en segundo plano. Verifica los datos en unos minutos."
-     )
-     log.warning(f"Timeout esperando respuesta de Apps Script para guild {gid}")
-     
- except requests.RequestException as e:
-     await q.edit_message_text(f"❌ Error de conexión sincronizando {label}.\n\n{str(e)}")
-     log.error(f"Error llamando a Apps Script: {e}")
-     
- except Exception as e:
-     await q.edit_message_text(f"❌ Error sincronizando {label}.\n\n{str(e)}")
-     log.exception(f"Error inesperado en syncguild para {gid}")
+    # Belt-and-suspenders: role check on the resolved guild
+    if not user_has_role_in_guild(ss, user_id, gid):
+        await q.edit_message_text("❌ No tienes permisos para sincronizar este gremio.")
+        return
 
-async def call_apps_script_sync(guild_id: str) -> dict:
- """
- Llama al Apps Script para sincronizar un gremio específico.
- 
- Args:
-     guild_id: ID del gremio a sincronizar
-     
- Returns:
-     dict con la respuesta del Apps Script
-     
- Raises:
-     requests.RequestException: Si hay error de conexión
-     asyncio.TimeoutError: Si excede el timeout
- """
- payload = {
-     "action": "sync_guilds",
-     "filterGuildIds": [guild_id]
- }
- 
- log.info(f"Llamando a Apps Script para guild {guild_id}")
- 
- # Ejecutar en thread pool para no bloquear el event loop
- loop = asyncio.get_event_loop()
- 
- def _sync_request():
-     response = requests.post(
-         APPS_SCRIPT_URL,
-         json=payload,
-         timeout=APPS_SCRIPT_TIMEOUT
-     )
-     response.raise_for_status()
-     return response.json()
- 
- try:
-     result = await asyncio.wait_for(
-         loop.run_in_executor(None, _sync_request),
-         timeout=APPS_SCRIPT_TIMEOUT
-     )
-     log.info(f"Apps Script completado para guild {guild_id}: {result.get('status')}")
-     return result
-     
- except asyncio.TimeoutError:
-     log.warning(f"Timeout esperando Apps Script para guild {guild_id}")
-     raise
- except requests.Timeout:
-     log.warning(f"Request timeout para guild {guild_id}")
-     raise asyncio.TimeoutError()
- except Exception as e:
-     log.error(f"Error en call_apps_script_sync: {e}")
-     raise
+    if already_synced_today(ss, gid):
+        label, _, _ = resolve_label_name_rote_by_id(ss, gid)
+        await q.edit_message_text(f"ℹ️ {label} ya se sincronizó hoy.")
+        return
+
+    label, _, _ = resolve_label_name_rote_by_id(ss, gid)
+
+    if not APPS_SCRIPT_URL:
+        await q.edit_message_text("❌ Error: APPS_SCRIPT_WEBHOOK_URL no configurado.")
+        log.error("APPS_SCRIPT_WEBHOOK_URL is not set.")
+        return
+
+    await q.edit_message_text(
+        f"⏳ Sincronizando {label}…\n\n_Esto puede tardar varios minutos._",
+        parse_mode="Markdown",
+    )
+
+    try:
+        result = await _call_apps_script(gid)
+        if result.get("status") == "success":
+            summary = result.get("result", "Completado")
+            await q.edit_message_text(
+                f"✅ Sincronización completada para {label}.\n\n`{summary}`",
+                parse_mode="Markdown",
+            )
+        else:
+            error_msg = result.get("message", "Error desconocido")
+            await q.edit_message_text(f"❌ Error sincronizando {label}.\n\n{error_msg}")
+
+    except asyncio.TimeoutError:
+        await q.edit_message_text(
+            f"⏱️ {label}: La sincronización está tomando más tiempo del esperado.\n\n"
+            "El proceso continúa en segundo plano. Verifica los datos en unos minutos."
+        )
+        log.warning("Timeout waiting for Apps Script response for guild %s", gid)
+
+    except requests.RequestException as e:
+        await q.edit_message_text(f"❌ Error de conexión sincronizando {label}.")
+        log.error("Request error calling Apps Script for guild %s: %s", gid, e)
+
+    except Exception as e:
+        await q.edit_message_text(f"❌ Error inesperado sincronizando {label}.")
+        log.exception("Unexpected error in cb_syncguild for guild %s", gid)
+
+
+async def _call_apps_script(guild_id: str) -> dict:
+    """
+    POST to the Apps Script webhook with the guild_id to sync.
+    Runs in a thread pool to avoid blocking the asyncio event loop.
+    """
+    payload = {"action": "sync_guilds", "filterGuildIds": [guild_id]}
+    loop    = asyncio.get_event_loop()
+
+    def _sync_request() -> dict:
+        response = requests.post(
+            APPS_SCRIPT_URL,
+            json=payload,
+            timeout=APPS_SCRIPT_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_request),
+            timeout=APPS_SCRIPT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.warning("Apps Script timeout for guild %s", guild_id)
+        raise
+    except requests.Timeout:
+        raise asyncio.TimeoutError()
+
 
 def get_handlers():
- """Retorna los handlers para registrar en el bot"""
- return [
-     CommandHandler("syncguild", cmd_syncguild),
-     CallbackQueryHandler(cb_syncguild, pattern=r"^syncguild:")
- ]
+    return [
+        CommandHandler("syncguild", cmd_syncguild),
+        CallbackQueryHandler(cb_syncguild, pattern=r"^syncguild:"),
+    ]
