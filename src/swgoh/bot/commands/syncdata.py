@@ -1,8 +1,13 @@
+# src/swgoh/bot/commands/syncdata.py
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes
+
 from ..config import SYNC_DATA_ALLOWED_CHATS
 from ..services.sync_runner import run_sync_data
+from ..security import rate_limit
 
+
+@rate_limit(cooldown_seconds=60)
 async def cmd_syncdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if chat_id not in SYNC_DATA_ALLOWED_CHATS:
@@ -11,10 +16,11 @@ async def cmd_syncdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Ejecutando sync de datos globales…")
     try:
-        _ = await run_sync_data()
+        await run_sync_data()
         await update.message.reply_text("✅ Sincronización de datos completada.")
     except Exception as e:
         await update.message.reply_text(f"❌ Error en sync_data.\n{e}")
+
 
 def get_handlers():
     return [CommandHandler("syncdata", cmd_syncdata)]
