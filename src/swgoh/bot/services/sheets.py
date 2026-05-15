@@ -489,6 +489,72 @@ def list_guilds_with_reset_time(ss) -> list[tuple[str, str, str]]:
     return out
  
  
+def get_channel_id_for_guild(ss, guild_name: str) -> Optional[str]:
+    """
+    Returns the announcements channel ID (e.g. '-1002461429674') for the
+    given guild_name, read from the 'announcements_channel' column in
+    GUILDS_SHEET. Returns None if the column is missing or value is empty.
+    """
+    ws = ss.worksheet(GUILDS_SHEET)
+    headers, rows = _get_all(ws)
+    hl = [h.strip().lower() for h in headers]
+ 
+    if "guild name" not in hl or "announcements_channel" not in hl:
+        return None
+ 
+    i_name = hl.index("guild name")
+    i_ch   = hl.index("announcements_channel")
+ 
+    for r in rows:
+        gn  = (r[i_name] if i_name < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        raw = (r[i_ch] if i_ch < len(r) else "").strip()
+        return raw if raw else None
+    return None
+ 
+ 
+def get_usernames_for_members(
+    ss, guild_name: str, player_names: list[str]
+) -> Dict[str, Optional[str]]:
+    """
+    Returns {player_name_lower: username_or_None} for members of guild_name.
+ 
+    'username' is the Telegram @handle without the '@' prefix, or None if
+    the member has no username registered. Caller decides the fallback.
+    """
+    ws = ss.worksheet(USERS_SHEET)
+    headers, rows = _get_all(ws)
+    hl = [h.strip().lower() for h in headers]
+ 
+    required = ["alias", "guild_name"]
+    if any(col not in hl for col in required):
+        return {}
+ 
+    i_alias = hl.index("alias")
+    i_gn    = hl.index("guild_name")
+    i_user  = hl.index("username") if "username" in hl else None
+ 
+    targets = {n.strip().lower() for n in player_names if n.strip()}
+    result: Dict[str, Optional[str]] = {}
+ 
+    for r in rows:
+        gn = (r[i_gn] if i_gn < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        alias = (r[i_alias] if i_alias < len(r) else "").strip()
+        if alias.lower() not in targets:
+            continue
+        username = None
+        if i_user is not None:
+            raw = (r[i_user] if i_user < len(r) else "").strip()
+            # Strip leading '@' if present; store bare handle or None
+            username = raw.lstrip("@") if raw else None
+        result[alias.lower()] = username
+ 
+    return result
+ 
+ 
 # ---------------------------------------------------------------------------
 # Ticket Snapshots — read / write
 # ---------------------------------------------------------------------------
