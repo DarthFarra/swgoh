@@ -1,23 +1,117 @@
 # src/swgoh/bot/main_bot.py
+"""
+Bot entry point.
+
+Runs:
+  - Telegram polling (PTB)
+  - APScheduler for the ticket snapshot jobs (guild-specific, time-driven)
+  - PTB JobQueue for the three consolidated batch jobs:
+      * send_assignments  — daily at SEND_ASSIGNMENTS_TIME (TIMEZONE)
+      * sync_guilds       — on SYNC_GUILDS_CRON schedule
+      * sync_data         — on SYNC_DATA_CRON schedule
+
+Previously these were three separate Railway services. They now run in the
+same process as the bot, eliminating deployment overhead and cost.
+
+Pi / local deployment:
+  Set SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON in .env.
+  The systemd unit file (systemd/swgoh-bot.service) keeps this process alive.
+"""
+from __future__ import annotations
+
+import asyncio
 import logging
+from datetime import time as dt_time
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from telegram.ext import ApplicationBuilder
-from .config import BOT_TOKEN
+
+from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE
 from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets
 from .jobs.snapshot_tickets import schedule_snapshot_jobs
+from .jobs.send_assignments_daily import job_send_assignments
+from .services.sync_runner import run_sync_guilds_once, run_sync_data
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [main_bot] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 log = logging.getLogger(__name__)
 
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Falta TELEGRAM_BOT_TOKEN")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
+def _parse_send_time(raw: str, tz: ZoneInfo) -> dt_time:
+    """
+    Parse SEND_ASSIGNMENTS_TIME (HH:MM) into a timezone-aware datetime.time
+    for PTB's run_daily().
+
+    Raises SystemExit on invalid format so the process fails fast at startup.
+    """
+    try:
+        parts = raw.strip().split(":")
+        if len(parts) != 2:
+            raise ValueError
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+        return dt_time(hour, minute, tzinfo=tz)
+    except (ValueError, AttributeError):
+        raise SystemExit(
+            f"SEND_ASSIGNMENTS_TIME must be in HH:MM format (24h), got: {raw!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# APScheduler job wrappers
+# (APScheduler calls plain functions; we bridge to async via asyncio.run_coroutine_threadsafe
+#  or, simpler, by scheduling coroutines directly since we use AsyncIOScheduler)
+# ---------------------------------------------------------------------------
+
+async def _job_sync_guilds() -> None:
+    """Scheduled weekly guild sync — syncs ALL guilds (no filter)."""
+    log.info("[scheduled] sync_guilds triggered.")
+    try:
+        # Pass empty set → sync_guilds.run() will process all guilds.
+        await asyncio.to_thread(
+            __import__(
+                "swgoh.processing.sync_guilds", fromlist=["run"]
+            ).run
+        )
+        log.info("[scheduled] sync_guilds completed.")
+    except Exception:
+        log.exception("[scheduled] sync_guilds failed.")
+
+
+async def _job_sync_data() -> None:
+    """Scheduled monthly data sync."""
+    log.info("[scheduled] sync_data triggered.")
+    try:
+        await run_sync_data()
+        log.info("[scheduled] sync_data completed.")
+    except Exception:
+        log.exception("[scheduled] sync_data failed.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is not set.")
+
+    tz = ZoneInfo(TIMEZONE)
+
+    # --- PTB Application ---
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Register command handlers
-    for h in (
+    # Register all command handlers
+    for handler in (
         syncguild.get_handlers()
         + misoperaciones.get_handlers()
         + register.get_handlers()
@@ -25,27 +119,67 @@ def main():
         + operacionesjugador.get_handlers()
         + tickets.get_handlers()
     ):
-        app.add_handler(h)
+        app.add_handler(handler)
 
-    # Set up APScheduler (runs in the same asyncio event loop as the bot)
-    scheduler = AsyncIOScheduler()
+    # --- Parse send-assignments time ---
+    send_time = _parse_send_time(SEND_ASSIGNMENTS_TIME, tz)
+    log.info("send_assignments scheduled at %s %s", send_time.strftime("%H:%M"), TIMEZONE)
 
-    async def _on_startup(application):
+    # --- APScheduler (for jobs that need cron expressions) ---
+    scheduler = AsyncIOScheduler(timezone=tz)
+
+    async def _on_startup(application) -> None:
+        # 1. Start APScheduler
         scheduler.start()
-        log.info("APScheduler started.")
-        # Load guild reset times from spreadsheet and register snapshot jobs
+        log.info("APScheduler started (timezone=%s).", TIMEZONE)
+
+        # 2. Ticket snapshot jobs (guild-specific times, from spreadsheet)
         schedule_snapshot_jobs(scheduler)
 
-    async def _on_shutdown(application):
+        # 3. Weekly sync_guilds
+        scheduler.add_job(
+            _job_sync_guilds,
+            trigger=CronTrigger.from_crontab(SYNC_GUILDS_CRON, timezone=tz),
+            id="scheduled_sync_guilds",
+            name="Weekly guild sync",
+            replace_existing=True,
+            misfire_grace_time=300,  # 5 min tolerance for a slow cold start
+        )
+        log.info("sync_guilds scheduled: cron='%s' tz=%s", SYNC_GUILDS_CRON, TIMEZONE)
+
+        # 4. Monthly sync_data
+        scheduler.add_job(
+            _job_sync_data,
+            trigger=CronTrigger.from_crontab(SYNC_DATA_CRON, timezone=tz),
+            id="scheduled_sync_data",
+            name="Monthly data sync",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        log.info("sync_data scheduled: cron='%s' tz=%s", SYNC_DATA_CRON, TIMEZONE)
+
+        # 5. Daily send_assignments via PTB JobQueue
+        # (PTB's run_daily handles timezone-aware time natively)
+        application.job_queue.run_daily(
+            job_send_assignments,
+            time=send_time,
+            name="daily_send_assignments",
+        )
+        log.info(
+            "send_assignments scheduled daily at %s %s",
+            send_time.strftime("%H:%M"), TIMEZONE,
+        )
+
+    async def _on_shutdown(application) -> None:
         if scheduler.running:
             scheduler.shutdown(wait=False)
             log.info("APScheduler stopped.")
 
-    app.post_init = _on_startup
+    app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
 
-    log.info("Bot iniciado (polling).")
-    app.run_polling()
+    log.info("Bot starting (polling).")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
