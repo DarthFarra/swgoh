@@ -16,7 +16,6 @@ from ..services.sheets import (
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..keyboards.player_select import make_keyboard_players
 from ..security import (
-    rate_limit,
     session_set,
     session_get,
     validate_guild_id,
@@ -35,7 +34,6 @@ _S_PHASES  = "playerops_phases"
 _S_PLAYERS = "playerops_players"  # whitelist of valid player names
 
 
-@rate_limit(cooldown_seconds=10)
 async def cmd_operacionesjugador(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss      = open_ss()
     user_id = update.effective_user.id
