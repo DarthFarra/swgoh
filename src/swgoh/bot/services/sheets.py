@@ -586,137 +586,124 @@ def get_usernames_for_members(
 # ---------------------------------------------------------------------------
 # Ticket Snapshots — read / write
 # ---------------------------------------------------------------------------
+#
+# Schema (one row per member per guild):
+#   guild_name | player_name | last_snapshot_date | lifetime_d | lifetime_d1
+#
+# lifetime_d  = lifetimeValue taken at today's reset (18:30)
+# lifetime_d1 = lifetimeValue taken at yesterday's reset (promoted from lifetime_d)
+#
+# "Yesterday missed" query: lifetime_d - lifetime_d1 < 600
  
-def ensure_ticket_snapshots_headers(ws) -> Dict[str, int]:
-    """
-    Ensures the Ticket_Snapshots sheet has the required columns.
-    Returns a header→index (0-based) map.
  
-    Schema:
-        guild_name | player_name | snapshot_date | lifetime_value
+SNAPSHOT_COLS = ["guild_name", "player_name", "last_snapshot_date", "lifetime_d", "lifetime_d1"]
+ 
+ 
+def _ensure_snapshot_headers(ws) -> Dict[str, int]:
     """
-    needed = ["guild_name", "player_name", "snapshot_date", "lifetime_value"]
+    Ensures Ticket_Snapshots has the required columns.
+    Returns a header→0-based-index map.
+    Adds missing columns non-destructively (never removes existing ones).
+    """
     headers = ws.row_values(1) or []
     low = [h.strip().lower() for h in headers]
  
     changed = False
-    for col in needed:
+    for col in SNAPSHOT_COLS:
         if col not in low:
             headers.append(col)
             low.append(col)
             changed = True
     if changed:
-        ws.update("1:1", [headers])
+        ws.update("A1", [headers])
  
-    return {h: i for i, h in enumerate([h.strip().lower() for h in headers])}
+    return {h.strip().lower(): i for i, h in enumerate(headers)}
  
  
 def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> None:
     """
-    Writes (or overwrites) one row per member for the given guild_name.
-    Rows from other guilds are preserved.
+    Called at reset time (18:30). For every member of guild_name:
+      1. Promotes current lifetime_d -> lifetime_d1
+      2. Writes fresh lifetimeValue -> lifetime_d
+      3. Updates last_snapshot_date to today
  
-    Args:
-        ss:           gspread Spreadsheet object
-        guild_name:   name of the guild being snapshotted
-        snapshots:    {player_name: lifetime_value} for every member
+    Members not yet in the sheet are inserted.
+    Members in the sheet but absent from snapshots (left the guild) are removed.
+    Rows from other guilds are preserved untouched.
     """
-    from .. import config as bot_cfg  # local import to avoid circular at module level
+    from .. import config as bot_cfg
     ws = ss.worksheet(bot_cfg.TICKET_SNAPSHOTS_SHEET)
-    hdr_map = ensure_ticket_snapshots_headers(ws)
+    hdr = _ensure_snapshot_headers(ws)
  
-    i_gn   = hdr_map["guild_name"]
-    i_pn   = hdr_map["player_name"]
-    i_date = hdr_map["snapshot_date"]
-    i_lv   = hdr_map["lifetime_value"]
+    i_gn   = hdr["guild_name"]
+    i_pn   = hdr["player_name"]
+    i_date = hdr["last_snapshot_date"]
+    i_ld   = hdr["lifetime_d"]
+    i_ld1  = hdr["lifetime_d1"]
+    n_cols = len(hdr)
  
-    today_str = date.today().isoformat()  # YYYY-MM-DD
+    today_str = date.today().isoformat()
  
     all_vals = ws.get_all_values() or []
-    existing_rows: list[list[str]] = all_vals[1:] if len(all_vals) > 1 else []
+    existing: list[list[str]] = all_vals[1:] if len(all_vals) > 1 else []
  
-    # Keep rows belonging to OTHER guilds untouched
+    # Keep other guilds exactly as-is
     other_rows = [
-        r for r in existing_rows
+        r for r in existing
         if (r[i_gn] if i_gn < len(r) else "").strip() != guild_name
     ]
  
-    # Build new rows for this guild
-    n_cols = len(ws.row_values(1) or [])
+    # Build existing lookup for THIS guild: player_name_lower -> row
+    this_guild: Dict[str, list[str]] = {}
+    for r in existing:
+        if (r[i_gn] if i_gn < len(r) else "").strip() != guild_name:
+            continue
+        pn = (r[i_pn] if i_pn < len(r) else "").strip()
+        if pn:
+            this_guild[pn.lower()] = r
+ 
     new_rows: list[list[str]] = []
-    for player_name, lifetime_val in snapshots.items():
-        row: list[str] = [""] * n_cols
+    for player_name, fresh_lifetime in snapshots.items():
+        row = [""] * n_cols
         row[i_gn]   = guild_name
         row[i_pn]   = player_name
         row[i_date] = today_str
-        row[i_lv]   = str(lifetime_val)
+ 
+        existing_row = this_guild.get(player_name.lower())
+        if existing_row is not None:
+            # Promote today -> yesterday before overwriting
+            old_d = (existing_row[i_ld] if i_ld < len(existing_row) else "").strip()
+            row[i_ld1] = old_d if old_d else str(fresh_lifetime)
+        else:
+            # New member: both columns start at the same value
+            # (they can't have "missed yesterday" on their first snapshot)
+            row[i_ld1] = str(fresh_lifetime)
+ 
+        row[i_ld] = str(fresh_lifetime)
         new_rows.append(row)
  
-    # Sort for stable ordering
     new_rows.sort(key=lambda r: r[i_pn].lower())
  
     final_rows = other_rows + new_rows
-    n_data = len(final_rows)
+    hdr_row = [""] * n_cols
+    for col, idx in hdr.items():
+        hdr_row[idx] = col
  
-    ws.resize(rows=max(n_data + 1, 1), cols=n_cols)
     ws.clear()
-    ws.update("A1", [list(ws.row_values(1) or [])])  # re-write header
-    # Re-fetch header after clear+update to be safe
-    hdr_row = [h if i < n_cols else "" for i, h in enumerate(["guild_name", "player_name", "snapshot_date", "lifetime_value"])]
     ws.update("A1", [hdr_row])
- 
     if final_rows:
         ws.update("A2", final_rows)
  
  
-def get_chat_ids_for_members(
-    ss, guild_name: str, player_names: list[str]
-) -> Dict[str, int]:
-    """
-    Returns {player_name_lower: chat_id} for members of guild_name
-    whose player_name (case-insensitive) is in the given list.
- 
-    Only returns rows where chat_id is a valid integer.
-    If a player appears more than once for the same guild (shouldn't happen,
-    but defensive), the last row wins.
-    """
-    ws = ss.worksheet(USERS_SHEET)
-    headers, rows = _get_all(ws)
-    hl = [h.strip().lower() for h in headers]
- 
-    required = ["alias", "guild_name", "chat_id"]
-    if any(col not in hl for col in required):
-        return {}
- 
-    i_alias = hl.index("alias")
-    i_gn    = hl.index("guild_name")
-    i_chat  = hl.index("chat_id")
- 
-    targets = {n.strip().lower() for n in player_names if n.strip()}
-    result: Dict[str, int] = {}
- 
-    for r in rows:
-        gn = (r[i_gn] if i_gn < len(r) else "").strip()
-        if gn != guild_name:
-            continue
-        alias = (r[i_alias] if i_alias < len(r) else "").strip()
-        if alias.lower() not in targets:
-            continue
-        raw_chat = (r[i_chat] if i_chat < len(r) else "").strip()
-        try:
-            result[alias.lower()] = int(raw_chat)
-        except (ValueError, TypeError):
-            pass  # skip rows with missing/invalid chat_id
- 
-    return result
- 
- 
-def read_ticket_snapshot(ss, guild_name: str) -> Optional[tuple[str, Dict[str, int]]]:
+def read_ticket_snapshot(
+    ss, guild_name: str
+) -> Optional[tuple[str, Dict[str, int], Dict[str, int]]]:
     """
     Reads the latest snapshot for guild_name.
  
     Returns:
-        (snapshot_date_str, {player_name_lower: lifetime_value})
+        (last_snapshot_date, lifetime_d, lifetime_d1)
+        where lifetime_d and lifetime_d1 are {player_name_lower: int}
         or None if no snapshot exists for this guild.
     """
     from .. import config as bot_cfg
@@ -730,39 +717,81 @@ def read_ticket_snapshot(ss, guild_name: str) -> Optional[tuple[str, Dict[str, i
         return None
  
     hl = [h.strip().lower() for h in headers]
-    required = ["guild_name", "player_name", "snapshot_date", "lifetime_value"]
-    if any(col not in hl for col in required):
+    if any(col not in hl for col in SNAPSHOT_COLS):
         return None
  
     i_gn   = hl.index("guild_name")
     i_pn   = hl.index("player_name")
-    i_date = hl.index("snapshot_date")
-    i_lv   = hl.index("lifetime_value")
+    i_date = hl.index("last_snapshot_date")
+    i_ld   = hl.index("lifetime_d")
+    i_ld1  = hl.index("lifetime_d1")
  
     snapshot_date: Optional[str] = None
-    result: Dict[str, int] = {}
+    d:  Dict[str, int] = {}
+    d1: Dict[str, int] = {}
  
     for r in rows:
         gn = (r[i_gn] if i_gn < len(r) else "").strip()
         if gn != guild_name:
             continue
-        pn   = (r[i_pn]   if i_pn   < len(r) else "").strip()
-        dt   = (r[i_date] if i_date  < len(r) else "").strip()
-        lv   = (r[i_lv]   if i_lv   < len(r) else "").strip()
+        pn  = (r[i_pn]   if i_pn   < len(r) else "").strip()
+        dt  = (r[i_date] if i_date  < len(r) else "").strip()
+        ld  = (r[i_ld]   if i_ld   < len(r) else "").strip()
+        ld1 = (r[i_ld1]  if i_ld1  < len(r) else "").strip()
  
         if not pn:
             continue
  
-        try:
-            lifetime = int(lv)
-        except (ValueError, TypeError):
-            lifetime = 0
- 
-        result[pn.lower()] = lifetime
+        d[pn.lower()]  = _safe_int(ld)
+        d1[pn.lower()] = _safe_int(ld1)
         if snapshot_date is None:
             snapshot_date = dt
  
-    if not result:
+    if not d:
         return None
  
-    return snapshot_date, result
+    return snapshot_date, d, d1
+ 
+ 
+def snapshot_taken_today(ss, guild_name: str) -> bool:
+    """
+    Returns True if last_snapshot_date for guild_name equals today (Madrid TZ).
+    Used by the catch-up logic on bot startup.
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    from .. import config as bot_cfg
+ 
+    today_str = datetime.now(ZoneInfo("Europe/Madrid")).date().isoformat()
+ 
+    try:
+        ws = ss.worksheet(bot_cfg.TICKET_SNAPSHOTS_SHEET)
+    except Exception:
+        return False
+ 
+    headers, rows = _get_all(ws)
+    if not rows:
+        return False
+ 
+    hl = [h.strip().lower() for h in headers]
+    if "guild_name" not in hl or "last_snapshot_date" not in hl:
+        return False
+ 
+    i_gn   = hl.index("guild_name")
+    i_date = hl.index("last_snapshot_date")
+ 
+    for r in rows:
+        gn = (r[i_gn] if i_gn < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        dt = (r[i_date] if i_date < len(r) else "").strip()
+        return dt == today_str
+ 
+    return False
+ 
+ 
+def _safe_int(val: str, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
