@@ -1,6 +1,8 @@
 # src/swgoh/bot/commands/register.py
 from __future__ import annotations
 
+import logging
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     CommandHandler,
@@ -9,6 +11,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+log = logging.getLogger(__name__)
 
 from ..services.sheets import (
     open_ss,
@@ -36,6 +40,7 @@ _S_WAITING    = "reg_waiting"
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("cmd_register called by user %s", update.effective_user.id if update.effective_user else "unknown")
     ss   = open_ss()
     gmap = map_guild_name_to_label_id_rote(ss)
     if not gmap:
