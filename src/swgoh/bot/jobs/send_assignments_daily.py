@@ -1,53 +1,70 @@
 # src/swgoh/bot/jobs/send_assignments_daily.py
+"""
+Daily assignment sender.
+
+Can be invoked in three ways:
+  1. As a PTB JobQueue job (registered in main_bot.py):
+         application.job_queue.run_daily(job_send_assignments, time=...)
+  2. As a standalone script (legacy / debugging):
+         python -m swgoh.bot.jobs.send_assignments_daily
+  3. Manually from a bot command (future).
+
+The send time is configured via SEND_ASSIGNMENTS_TIME (HH:MM, 24h,
+in the TIMEZONE timezone). main_bot.py reads that value and passes the
+correct datetime.time to PTB's run_daily().
+
+Phase logic (unchanged):
+  - Sunday       → no send
+  - Even ISO week → phase = weekday + 1  (Mon=1 … Sat=6)
+  - Odd ISO week  → no send
+"""
 from __future__ import annotations
 
-import os
 import json
+import logging
 import time
 import random
 import datetime
 import unicodedata
 import urllib.request
-import logging
-from typing import Any, Dict, List, Optional, Tuple, DefaultDict
 from collections import defaultdict
+from typing import DefaultDict, Dict, List, Optional, Tuple
 
 import pytz
 from gspread.exceptions import APIError
+from telegram.ext import ContextTypes
 
 # ── shared infrastructure ────────────────────────────────────────────────────
-# Use the single canonical credential + spreadsheet loader from the core.
-# No credential duplication here.
-from ...sheets import spreadsheet as open_spreadsheet   # ← shared client
+from ...sheets import spreadsheet as open_spreadsheet
+from ... import config as cfg
 # ─────────────────────────────────────────────────────────────────────────────
 
 log = logging.getLogger(__name__)
 
-# ==========
-# Config env
-# ==========
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ID_ZONA = os.getenv("ID_ZONA", "Europe/Madrid")
-DEBUG_MODE = os.getenv("DEBUG_ASSIGNMENTS", "").strip().lower() in ("1", "true", "yes", "on")
+# ---------------------------------------------------------------------------
+# Config — all sourced from core config, no os.getenv() here
+# ---------------------------------------------------------------------------
 
-SHEET_USUARIOS = os.getenv("USUARIOS_SHEET", "Usuarios")
-SHEET_GUILDS   = os.getenv("GUILDS_SHEET", "Guilds")
+TELEGRAM_BOT_TOKEN: str       = cfg.TELEGRAM_BOT_TOKEN
+TIMEZONE: str                  = cfg.TIMEZONE
+SHEET_USERS: str               = cfg.SHEET_USERS
+SHEET_GUILDS: str              = cfg.SHEET_GUILDS
 
 
-# ==========
-# gspread helpers with backoff
-# ==========
+# ---------------------------------------------------------------------------
+# gspread helpers with exponential-backoff retry
+# ---------------------------------------------------------------------------
 
 def _with_backoff(fn, *args, **kwargs):
     """Execute a gspread call with retry on 429/5xx responses."""
-    max_attempts = kwargs.pop("_attempts", 6)
+    max_attempts = kwargs.pop("_attempts",   6)
     base_sleep   = kwargs.pop("_base_sleep", 0.6)
     for attempt in range(1, max_attempts + 1):
         try:
             return fn(*args, **kwargs)
         except APIError as e:
-            status  = getattr(getattr(e, "response", None), "status_code", None)
-            msg     = str(e)
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            msg    = str(e)
             transient = (
                 status in (429, 500, 502, 503, 504)
                 or "429" in msg
@@ -55,13 +72,18 @@ def _with_backoff(fn, *args, **kwargs):
             )
             if transient and attempt < max_attempts:
                 sleep = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
-                log.debug("gspread retry %d/%d after status=%s; sleeping %.2fs", attempt, max_attempts, status or "??", sleep)
+                log.debug(
+                    "gspread retry %d/%d after status=%s; sleeping %.2fs",
+                    attempt, max_attempts, status or "??", sleep,
+                )
                 time.sleep(sleep)
                 continue
             raise
 
 
-def _read_all_values(ss, sheet_name: str) -> Tuple[List[str], List[List[str]]]:
+def _read_all_values(
+    ss, sheet_name: str
+) -> Tuple[List[str], List[List[str]]]:
     ws      = _with_backoff(ss.worksheet, sheet_name)
     vals    = _with_backoff(ws.get_all_values)
     headers = [h.strip() for h in (vals[0] if vals else [])]
@@ -69,9 +91,9 @@ def _read_all_values(ss, sheet_name: str) -> Tuple[List[str], List[List[str]]]:
     return headers, rows
 
 
-# ==========
-# Normalisation (accent-insensitive)
-# ==========
+# ---------------------------------------------------------------------------
+# Normalisation (accent-insensitive column matching)
+# ---------------------------------------------------------------------------
 
 def _strip_accents(s: str) -> str:
     return "".join(
@@ -122,40 +144,51 @@ HEADERS_USUARIOS = {
 }
 
 
-# =========================
+# ---------------------------------------------------------------------------
 # Phase calculation
-# =========================
+# ---------------------------------------------------------------------------
 
 def obtener_fase_actual() -> Optional[str]:
     """
     Returns the current ROTE phase string, or None if today is not a send day.
-    - Sunday  → None
-    - Even ISO week → phase = weekday + 1 (Mon=1 … Sat=6)
-    - Odd ISO week  → None
+
+    Logic:
+      - Sunday        → None (no send)
+      - Even ISO week → phase = weekday + 1  (Mon→1, Tue→2, … Sat→6)
+      - Odd ISO week  → None (no send)
     """
-    tz  = pytz.timezone(ID_ZONA)
+    tz  = pytz.timezone(TIMEZONE)
     hoy = datetime.datetime.now(tz)
+
     if hoy.weekday() >= 6:
         log.debug("Sunday: no assignments sent.")
         return None
+
     even_week = (hoy.isocalendar()[1] % 2) == 0
-    phase = str(hoy.weekday() + 1) if even_week else None
-    log.debug("Date=%s even_week=%s -> phase=%s", hoy.isoformat(), even_week, phase)
+    phase     = str(hoy.weekday() + 1) if even_week else None
+    log.debug(
+        "Date=%s even_week=%s -> phase=%s", hoy.isoformat(), even_week, phase
+    )
     return phase
 
 
-# =========================
-# Assignment index (one read per guild sheet)
-# =========================
+# ---------------------------------------------------------------------------
+# Assignment index (one sheet read per guild, then O(1) lookups)
+# ---------------------------------------------------------------------------
 
 class AssignIndex:
+    """
+    Builds an in-memory index of assignments for a given phase from a
+    single guild's ROTE sheet read. Lookups are O(1) by user_id or alias.
+    """
+
     def __init__(
         self,
         sheet_name: str,
         idxs: Dict[str, int],
         rows: List[List[str]],
         fase: str,
-    ):
+    ) -> None:
         self.sheet_name  = sheet_name
         self.fase        = str(fase)
         self.idx_fase    = idxs["fase"]
@@ -187,7 +220,8 @@ class AssignIndex:
 
         log.debug(
             "Index '%s' phase=%s: rows_in_phase=%d uids=%d aliases=%d",
-            sheet_name, fase, total_fase, len(self.by_uid), len(self.by_alias_norm),
+            sheet_name, fase, total_fase,
+            len(self.by_uid), len(self.by_alias_norm),
         )
 
     def build_message_for(
@@ -214,9 +248,9 @@ class AssignIndex:
         return "\n".join(lines)
 
 
-# =========================
-# Telegram
-# =========================
+# ---------------------------------------------------------------------------
+# Telegram helper
+# ---------------------------------------------------------------------------
 
 def _tg_send_message(
     token: str,
@@ -226,9 +260,9 @@ def _tg_send_message(
 ) -> None:
     url  = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps({
-        "chat_id": int(chat_id),
-        "text": text,
-        "parse_mode": parse_mode,
+        "chat_id":                int(chat_id),
+        "text":                   text,
+        "parse_mode":             parse_mode,
         "disable_web_page_preview": True,
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -240,27 +274,34 @@ def _tg_send_message(
         resp.read()
 
 
-# =========================
-# Main
-# =========================
+# ---------------------------------------------------------------------------
+# Core logic — extracted so it can be called from PTB JobQueue or standalone
+# ---------------------------------------------------------------------------
 
-def main() -> int:
+def run() -> int:
+    """
+    Execute the send-assignments logic.
+
+    Returns:
+        0 on success or no-send-day.
+    Raises:
+        RuntimeError if TELEGRAM_BOT_TOKEN is not configured.
+    """
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
-    # Use the shared spreadsheet client — credentials loaded once, centrally.
-    ss = open_spreadsheet()
-
+    ss   = open_spreadsheet()
     fase = obtener_fase_actual()
+
     if not fase:
-        log.info("[send_assignments_daily] Today is not a send day.")
+        log.info("[send_assignments] Today is not a send day.")
         return 0
-    log.info("[send_assignments_daily] Phase: %s", fase)
+    log.info("[send_assignments] Phase: %s", fase)
 
     # --- Read USUARIOS once ---
-    u_headers, u_rows = _read_all_values(ss, SHEET_USUARIOS)
+    u_headers, u_rows = _read_all_values(ss, SHEET_USERS)
     if not u_rows:
-        log.info("[send_assignments_daily] No registered users found.")
+        log.info("[send_assignments] No registered users found.")
         return 0
 
     uhm       = _hmap(u_headers)
@@ -302,17 +343,22 @@ def main() -> int:
     skipped = 0
 
     for guild_name, lst in per_guild.items():
-        sheet_name = guild_to_rote.get(guild_name) or "Asignaciones ROTE"
+        sheet_name = guild_to_rote.get(guild_name) or cfg.SHEET_ASSIGNMENTS
 
         try:
             a_headers, a_rows = _read_all_values(ss, sheet_name)
         except Exception as e:
-            log.warning("Cannot open sheet '%s' for guild '%s': %s", sheet_name, guild_name, e)
+            log.warning(
+                "Cannot open sheet '%s' for guild '%s': %s",
+                sheet_name, guild_name, e,
+            )
             skipped += len(lst)
             continue
 
         if not a_rows:
-            log.debug("Sheet '%s' is empty for guild '%s'.", sheet_name, guild_name)
+            log.debug(
+                "Sheet '%s' is empty for guild '%s'.", sheet_name, guild_name
+            )
             skipped += len(lst)
             continue
 
@@ -327,7 +373,10 @@ def main() -> int:
         }
 
         if min(idxs.values()) == -1:
-            log.warning("Missing required columns in '%s' for guild '%s'.", sheet_name, guild_name)
+            log.warning(
+                "Missing required columns in '%s' for guild '%s'.",
+                sheet_name, guild_name,
+            )
             skipped += len(lst)
             continue
 
@@ -338,17 +387,50 @@ def main() -> int:
                 msg = assign_index.build_message_for(guild_name, user_id, alias)
                 if not msg:
                     skipped += 1
-                    log.debug("No assignments: guild=%s user_id=%s alias='%s'", guild_name, user_id, alias)
+                    log.debug(
+                        "No assignments: guild=%s user_id=%s alias='%s'",
+                        guild_name, user_id, alias,
+                    )
                     continue
                 _tg_send_message(TELEGRAM_BOT_TOKEN, chat_id, msg, parse_mode="Markdown")
                 sent += 1
                 time.sleep(0.05)
-            except Exception as e:
-                log.warning("Failed to send to chat %s: %s", chat_id, e)
+            except Exception:
+                log.warning("Failed to send to chat %s", chat_id, exc_info=True)
                 skipped += 1
 
-    log.info("[send_assignments_daily] Phase %s: sent=%d skipped=%d", fase, sent, skipped)
+    log.info("[send_assignments] Phase %s: sent=%d skipped=%d", fase, sent, skipped)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# PTB JobQueue entry point
+# ---------------------------------------------------------------------------
+
+async def job_send_assignments(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Entry point for PTB's JobQueue.
+
+    Registered in main_bot.py via:
+        application.job_queue.run_daily(job_send_assignments, time=send_time)
+
+    Runs the synchronous logic in a thread so it doesn't block the
+    asyncio event loop.
+    """
+    import asyncio
+    log.info("[send_assignments] PTB job triggered.")
+    try:
+        await asyncio.to_thread(run)
+    except Exception:
+        log.exception("[send_assignments] Unhandled error in job.")
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry point (legacy / debugging)
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    return run()
 
 
 if __name__ == "__main__":
