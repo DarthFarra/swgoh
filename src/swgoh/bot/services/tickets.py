@@ -201,21 +201,29 @@ async def publish_tickets_to_channel(
     members: List[MemberTickets],
     usernames: Dict[str, Optional[str]],  # player_name_lower -> @handle or None
     guild_label: str,
+    thread_id: Optional[int] = None,
 ) -> None:
     """
     Publishes the missing-tickets report to a Telegram channel.
 
+    Args:
+        thread_id: if provided, posts into that forum topic (message_thread_id).
+                   If None, posts to the channel's general topic.
+
     Raises:
         telegram.error.Forbidden: bot is not an admin of the channel.
-        telegram.error.BadRequest: channel_id is invalid.
+        telegram.error.BadRequest: channel_id or thread_id is invalid.
         Any other telegram.error.*: other delivery failure.
     """
     text = render_tickets_today_channel(members, usernames, guild_label)
-    await bot.send_message(
-        chat_id=channel_id,
-        text=text,
-        parse_mode="MarkdownV2",
-    )
+    kwargs = {
+        "chat_id": channel_id,
+        "text": text,
+        "parse_mode": "MarkdownV2",
+    }
+    if thread_id is not None:
+        kwargs["message_thread_id"] = thread_id
+    await bot.send_message(**kwargs)
 
 
 def render_tickets_today_channel(
