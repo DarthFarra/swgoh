@@ -132,15 +132,15 @@ def render_tickets_today(
     if not delinquents:
         total = _escape_md(str(len(members)))
         goal  = _escape_md(str(DAILY_TICKET_GOAL))
-        return f"✅ *{label}* — All {total} members have reached their {goal} ticket goal today\!"
+        return f"✅ *{label}* — All {total} members have reached their {goal} ticket goal today\\!"
 
     count_str = _escape_md(f"{len(delinquents)}/{len(members)}")
-    lines = [f"🎫 *{label}* — Missing tickets today \({count_str}\):\n"]
+    lines = [f"🎫 *{label}* — Missing tickets today \\({count_str}\\):\n"]
     for m in sorted(delinquents, key=lambda x: x.current_value):
         name    = _escape_md(m.player_name)
         current = _escape_md(str(m.current_value))
         goal    = _escape_md(str(DAILY_TICKET_GOAL))
-        lines.append(f"• {name} \({current}/{goal}\)")
+        lines.append(f"• {name} \\({current}/{goal}\\)")
 
     return "\n".join(lines)
 
@@ -175,7 +175,7 @@ def render_tickets_yesterday(
     label = _escape_md(guild_label)
 
     if not missed and not new_members:
-        return f"✅ *{label}* — Everyone contributed their tickets yesterday\!"
+        return f"✅ *{label}* — Everyone contributed their tickets yesterday\\!"
 
     lines = [f"📅 *{label}* — Missed tickets yesterday:\n"]
 
@@ -185,10 +185,10 @@ def render_tickets_yesterday(
         for name, contributed in missed:
             esc_name        = _escape_md(name)
             esc_contributed = _escape_md(str(contributed))
-            lines.append(f"• {esc_name} \({esc_contributed}/{goal}\)")
+            lines.append(f"• {esc_name} \\({esc_contributed}/{goal}\\)")
 
     if new_members:
-        lines.append("\n⚠️ *New members \(no snapshot data\):*")
+        lines.append("\n⚠️ *New members \\(no snapshot data\\):*")
         for name in sorted(new_members):
             lines.append(f"• {_escape_md(name)}")
 
