@@ -1,8 +1,12 @@
+# src/swgoh/bot/main_bot.py
 import logging
+import traceback
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+from telegram.ext import ApplicationBuilder, ContextTypes
 
 from .config import BOT_TOKEN
+from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11,9 +15,15 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.info("PING received from user %s", update.effective_user.id)
-    await update.message.reply_text("pong")
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log all exceptions raised inside handlers so nothing is ever silent."""
+    log.error(
+        "Exception while handling update %s:\n%s",
+        update,
+        "".join(traceback.format_exception(
+            type(context.error), context.error, context.error.__traceback__
+        )),
+    )
 
 
 def main():
@@ -21,22 +31,20 @@ def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("ping", cmd_ping))
 
-    try:
-        from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador
-        for handler in (
-            syncguild.get_handlers()
-            + misoperaciones.get_handlers()
-            + register.get_handlers()
-            + syncdata.get_handlers()
-            + operacionesjugador.get_handlers()
-        ):
-            app.add_handler(handler)
-        log.info("All handlers registered successfully.")
-    except Exception as e:
-        log.exception("FAILED to register handlers: %s", e)
+    # Global error handler — logs every unhandled exception with full traceback
+    app.add_error_handler(error_handler)
 
+    for handler in (
+        syncguild.get_handlers()
+        + misoperaciones.get_handlers()
+        + register.get_handlers()
+        + syncdata.get_handlers()
+        + operacionesjugador.get_handlers()
+    ):
+        app.add_handler(handler)
+
+    log.info("All handlers registered successfully.")
     log.info("Bot started (polling).")
     app.run_polling()
 
