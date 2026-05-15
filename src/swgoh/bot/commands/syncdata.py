@@ -4,10 +4,8 @@ from telegram.ext import CommandHandler, ContextTypes
 
 from ..config import SYNC_DATA_ALLOWED_CHATS
 from ..services.sync_runner import run_sync_data
-from ..security import rate_limit
 
 
-@rate_limit(cooldown_seconds=60)
 async def cmd_syncdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if chat_id not in SYNC_DATA_ALLOWED_CHATS:
