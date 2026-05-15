@@ -195,6 +195,67 @@ def render_tickets_yesterday(
     return "\n".join(lines)
 
 
+async def publish_tickets_to_channel(
+    bot,
+    channel_id: str,
+    members: List[MemberTickets],
+    usernames: Dict[str, Optional[str]],  # player_name_lower -> @handle or None
+    guild_label: str,
+) -> None:
+    """
+    Publishes the missing-tickets report to a Telegram channel.
+
+    Raises:
+        telegram.error.Forbidden: bot is not an admin of the channel.
+        telegram.error.BadRequest: channel_id is invalid.
+        Any other telegram.error.*: other delivery failure.
+    """
+    text = render_tickets_today_channel(members, usernames, guild_label)
+    await bot.send_message(
+        chat_id=channel_id,
+        text=text,
+        parse_mode="MarkdownV2",
+    )
+
+
+def render_tickets_today_channel(
+    members: List[MemberTickets],
+    usernames: Dict[str, Optional[str]],  # player_name_lower -> handle or None
+    guild_label: str,
+) -> str:
+    """
+    Renders the channel version of the today report.
+    Members with a username get '@handle', others get plain player name.
+    Only delinquents are listed.
+    """
+    delinquents = [m for m in members if not m.completed_today]
+    label = _escape_md(guild_label)
+
+    if not delinquents:
+        total = _escape_md(str(len(members)))
+        goal  = _escape_md(str(DAILY_TICKET_GOAL))
+        return (
+            f"✅ *{label}* — Todos los {total} miembros han completado "
+            f"sus {goal} tickets hoy\\!"
+        )
+
+    count_str = _escape_md(f"{len(delinquents)}/{len(members)}")
+    lines = [f"🎫 *{label}* — Tickets pendientes hoy \\({count_str}\\):\n"]
+
+    for m in sorted(delinquents, key=lambda x: x.current_value):
+        handle = usernames.get(m.player_name.lower())
+        if handle:
+            # @username mentions work in channels without needing inline links
+            name_part = f"@{_escape_md(handle)}"
+        else:
+            name_part = _escape_md(m.player_name)
+        current = _escape_md(str(m.current_value))
+        goal    = _escape_md(str(DAILY_TICKET_GOAL))
+        lines.append(f"• {name_part} \\({current}/{goal}\\)")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Reminder sending
 # ---------------------------------------------------------------------------
