@@ -1,222 +1,283 @@
-# src/swgoh/bot/services/tickets.py
+# src/swgoh/bot/commands/tickets.py
+"""
+/tickets command — lets officers check daily ticket contributions.
+
+Flow:
+  1. /tickets → guild selector (if multiple guilds)
+  2. Guild chosen → two buttons: "Today (live)" | "Yesterday (missed)"
+  3a. Today → fetches live data, shows delinquents + "Refresh" button
+  3b. Yesterday → reads snapshot + live lifetimeValue, shows who missed
+"""
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import date
+from zoneinfo import ZoneInfo
 
-from ...comlink import fetch_guild
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.constants import ParseMode
+
+from ..services.sheets import (
+    open_ss,
+    usuarios_guilds_for_user,
+    resolve_label_name_rote_by_id,
+    user_has_leadership_role,
+    read_ticket_snapshot,
+)
+from ..services.tickets import (
+    fetch_guild_tickets,
+    render_tickets_today,
+    render_tickets_yesterday,
+    DAILY_TICKET_GOAL,
+)
+from ..keyboards.guild_select import make_keyboard_guilds
 
 log = logging.getLogger(__name__)
 
-TICKET_CONTRIBUTION_TYPE = 2
-DAILY_TICKET_GOAL = 600
+MADRID_TZ = ZoneInfo("Europe/Madrid")
+
+# ---------------------------------------------------------------------------
+# Command entry point
+# ---------------------------------------------------------------------------
+
+async def cmd_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Entry point: /tickets"""
+    ss = open_ss()
+    user_id = update.effective_user.id
+    guilds = usuarios_guilds_for_user(ss, user_id)
+
+    if not guilds:
+        await update.message.reply_text("❌ You are not registered in any guild.")
+        return
+
+    # Filter to guilds where the user has leadership role
+    leadership_guilds = [
+        (label, gid, gname)
+        for label, gid, gname in guilds
+        if user_has_leadership_role(ss, user_id, gname)
+    ]
+
+    if not leadership_guilds:
+        await update.message.reply_text(
+            "❌ You need Officer or Leader role to use /tickets."
+        )
+        return
+
+    if len(leadership_guilds) > 1:
+        opts = [(label, gid) for label, gid, _ in leadership_guilds]
+        kb = make_keyboard_guilds(opts, "tickets")
+        await update.message.reply_text(
+            "Choose a guild to check tickets:", reply_markup=kb
+        )
+        return
+
+    # Single guild — skip guild selector
+    label, gid, gname = leadership_guilds[0]
+    await _show_mode_selector(update, context, gid, label, via_callback=False)
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Guild selected (only reached when multiple guilds exist)
 # ---------------------------------------------------------------------------
 
-class MemberTickets:
-    """Holds ticket data for a single guild member."""
+async def cb_tickets_guild(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("tickets:"):
+        return
 
-    __slots__ = ("player_id", "player_name", "current_value", "lifetime_value")
+    gid = data.split(":", 1)[1]
+    ss = open_ss()
 
-    def __init__(
-        self,
-        player_id: str,
-        player_name: str,
-        current_value: int,
-        lifetime_value: int,
-    ) -> None:
-        self.player_id = player_id
-        self.player_name = player_name
-        self.current_value = current_value
-        self.lifetime_value = lifetime_value
+    if not user_has_leadership_role(ss, q.from_user.id, _guild_name_for_id(ss, gid)):
+        await q.edit_message_text("❌ You don't have Officer/Leader permissions for this guild.")
+        return
 
-    @property
-    def missing_today(self) -> int:
-        return max(0, DAILY_TICKET_GOAL - self.current_value)
-
-    @property
-    def completed_today(self) -> bool:
-        return self.current_value >= DAILY_TICKET_GOAL
+    label, _, _ = resolve_label_name_rote_by_id(ss, gid)
+    await _show_mode_selector(update, context, gid, label, via_callback=True)
 
 
 # ---------------------------------------------------------------------------
-# API fetching
+# Mode selector (Today / Yesterday)
 # ---------------------------------------------------------------------------
 
-def fetch_guild_tickets(guild_id: str) -> List[MemberTickets]:
-    """
-    Fetches the guild from comlink and extracts ticket contributions
-    (memberContribution type=2) for every member.
+async def _show_mode_selector(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    gid: str,
+    label: str,
+    via_callback: bool,
+) -> None:
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Today (live)", callback_data=f"ticketstoday:{gid}"),
+            InlineKeyboardButton("📅 Yesterday (missed)", callback_data=f"ticketsyest:{gid}"),
+        ]
+    ])
+    text = f"🎫 *{_escape_md(label)}* — Ticket checker\n\nChoose a report:"
 
-    Returns a list of MemberTickets sorted by player name.
-
-    Raises:
-        RuntimeError: propagated from comlink on network/HTTP errors.
-    """
-    if not guild_id:
-        raise ValueError("guild_id must not be empty")
-
-    log.info("Fetching guild tickets for guild_id=%s", guild_id)
-    gdata = fetch_guild({"guildId": guild_id, "includeRecentGuildActivityInfo": True})
-
-    members: List[Dict[str, Any]] = (
-        _safe_get(gdata, ["guild", "member"])
-        or _safe_get(gdata, ["member"])
-        or []
-    )
-
-    result: List[MemberTickets] = []
-    for member in members:
-        if not isinstance(member, dict):
-            continue
-
-        player_id = str(member.get("playerId") or "").strip()
-        player_name = str(member.get("playerName") or "").strip()
-
-        if not player_id:
-            log.warning("Skipping member with no playerId (name=%r)", player_name)
-            continue
-
-        current_val, lifetime_val = _extract_ticket_values(member)
-
-        result.append(
-            MemberTickets(
-                player_id=player_id,
-                player_name=player_name,
-                current_value=current_val,
-                lifetime_value=lifetime_val,
-            )
+    if via_callback:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2
         )
 
-    result.sort(key=lambda m: m.player_name.lower())
-    log.info("Fetched ticket data for %d members (guild_id=%s)", len(result), guild_id)
-    return result
+
+# ---------------------------------------------------------------------------
+# Today (live)
+# ---------------------------------------------------------------------------
+
+async def cb_tickets_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("ticketstoday:"):
+        return
+
+    gid = data.split(":", 1)[1]
+    await _fetch_and_show_today(q, gid)
 
 
-def _extract_ticket_values(member: Dict[str, Any]) -> Tuple[int, int]:
-    """
-    Extracts (currentValue, lifetimeValue) for contribution type=2 (tickets).
-    Returns (0, 0) if the contribution entry is absent.
-    """
-    contributions: List[Dict[str, Any]] = member.get("memberContribution") or []
-    for contrib in contributions:
-        if not isinstance(contrib, dict):
-            continue
-        if _to_int(contrib.get("type")) == TICKET_CONTRIBUTION_TYPE:
-            return (
-                _to_int(contrib.get("currentValue")),
-                _to_int(contrib.get("lifetimeValue")),
-            )
-    return 0, 0
+async def _fetch_and_show_today(q, gid: str) -> None:
+    """Shared logic for initial load and refresh of Today view."""
+    ss = open_ss()
+    label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+
+    await q.edit_message_text(
+        f"⏳ Fetching live ticket data for *{_escape_md(label)}*…",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    try:
+        members = fetch_guild_tickets(gid)
+    except Exception as exc:
+        log.error("Error fetching tickets for guild %s: %s", gid, exc)
+        await q.edit_message_text(
+            f"❌ Failed to fetch ticket data for *{_escape_md(label)}*\\.\n\n"
+            f"`{_escape_md(str(exc))}`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    text = render_tickets_today(members, label)
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"ticketstoday:{gid}"),
+            InlineKeyboardButton("📅 Yesterday", callback_data=f"ticketsyest:{gid}"),
+        ],
+        [InlineKeyboardButton("« Back", callback_data=f"ticketsback:{gid}")],
+    ])
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
 
 
 # ---------------------------------------------------------------------------
-# Message rendering
+# Yesterday (missed)
 # ---------------------------------------------------------------------------
 
-def render_tickets_today(
-    members: List[MemberTickets],
-    guild_label: str,
-) -> str:
-    """
-    Renders the 'Today (live)' message.
-    Only lists members who have NOT yet reached the daily goal.
-    All user-supplied and numeric content is escaped for MarkdownV2.
-    """
-    delinquents = [m for m in members if not m.completed_today]
-    label = _escape_md(guild_label)
+async def cb_tickets_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("ticketsyest:"):
+        return
 
-    if not delinquents:
-        total = _escape_md(str(len(members)))
-        goal  = _escape_md(str(DAILY_TICKET_GOAL))
-        return f"✅ *{label}* — All {total} members have reached their {goal} ticket goal today\\!"
+    gid = data.split(":", 1)[1]
+    ss = open_ss()
+    label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
 
-    count_str = _escape_md(f"{len(delinquents)}/{len(members)}")
-    lines = [f"🎫 *{label}* — Missing tickets today \\({count_str}\\):\n"]
-    for m in sorted(delinquents, key=lambda x: x.current_value):
-        name    = _escape_md(m.player_name)
-        current = _escape_md(str(m.current_value))
-        goal    = _escape_md(str(DAILY_TICKET_GOAL))
-        lines.append(f"• {name} \\({current}/{goal}\\)")
+    # Check snapshot existence first — cheap, no API call
+    snapshot_result = read_ticket_snapshot(ss, gname)
 
-    return "\n".join(lines)
+    if snapshot_result is None:
+        today_str = date.today().isoformat()
+        await q.edit_message_text(
+            f"ℹ️ *{_escape_md(label)}* — No snapshot available yet\\.\n\n"
+            f"The first snapshot will be taken automatically 5 minutes before "
+            f"the configured reset time\\. Come back after that\\!",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    snapshot_date, snapshot_data = snapshot_result
+
+    await q.edit_message_text(
+        f"⏳ Fetching live data for *{_escape_md(label)}*…",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    try:
+        members_live = fetch_guild_tickets(gid)
+    except Exception as exc:
+        log.error("Error fetching tickets for guild %s: %s", gid, exc)
+        await q.edit_message_text(
+            f"❌ Failed to fetch live data for *{_escape_md(label)}*\\.\n\n"
+            f"`{_escape_md(str(exc))}`",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        return
+
+    text = render_tickets_yesterday(members_live, snapshot_data, label)
+
+    # Append snapshot date as footer
+    text += f"\n\n_Snapshot taken: {_escape_md(snapshot_date)}_"
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Today", callback_data=f"ticketstoday:{gid}"),
+            InlineKeyboardButton("« Back", callback_data=f"ticketsback:{gid}"),
+        ]
+    ])
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
 
 
-def render_tickets_yesterday(
-    members_live: List[MemberTickets],
-    snapshot: Dict[str, int],  # player_name (lower) -> lifetime_value at snapshot
-    guild_label: str,
-) -> str:
-    """
-    Renders the 'Yesterday (missed)' message.
+# ---------------------------------------------------------------------------
+# Back to mode selector
+# ---------------------------------------------------------------------------
 
-    Logic:
-      delta = current_lifetime - snapshot_lifetime
-      if delta < DAILY_TICKET_GOAL → missed
+async def cb_tickets_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    if not data.startswith("ticketsback:"):
+        return
 
-    Members not in the snapshot are flagged separately (joined after snapshot).
-    All user-supplied and numeric content is escaped for MarkdownV2.
-    """
-    missed: List[Tuple[str, int]] = []   # (player_name, delta)
-    new_members: List[str] = []          # names not in snapshot
-
-    for m in members_live:
-        key = m.player_name.lower()
-        if key not in snapshot:
-            new_members.append(m.player_name)
-            continue
-        delta = m.lifetime_value - snapshot[key]
-        if delta < DAILY_TICKET_GOAL:
-            missed.append((m.player_name, max(0, delta)))
-
-    label = _escape_md(guild_label)
-
-    if not missed and not new_members:
-        return f"✅ *{label}* — Everyone contributed their tickets yesterday\\!"
-
-    lines = [f"📅 *{label}* — Missed tickets yesterday:\n"]
-
-    if missed:
-        missed.sort(key=lambda x: x[1])  # ascending by tickets contributed
-        goal = _escape_md(str(DAILY_TICKET_GOAL))
-        for name, contributed in missed:
-            esc_name        = _escape_md(name)
-            esc_contributed = _escape_md(str(contributed))
-            lines.append(f"• {esc_name} \\({esc_contributed}/{goal}\\)")
-
-    if new_members:
-        lines.append("\n⚠️ *New members \\(no snapshot data\\):*")
-        for name in sorted(new_members):
-            lines.append(f"• {_escape_md(name)}")
-
-    return "\n".join(lines)
+    gid = data.split(":", 1)[1]
+    ss = open_ss()
+    label, _, _ = resolve_label_name_rote_by_id(ss, gid)
+    await _show_mode_selector(update, context, gid, label, via_callback=True)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_get(d: Any, path: List[Any], default: Any = None) -> Any:
-    cur = d
-    for key in path:
-        if isinstance(cur, dict) and key in cur:
-            cur = cur[key]
-        else:
-            return default
-    return cur
-
-
-def _to_int(val: Any, default: int = 0) -> int:
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return default
+def _guild_name_for_id(ss, guild_id: str) -> str:
+    """Returns guild_name for a guild_id, or empty string if not found."""
+    _, gname, _ = resolve_label_name_rote_by_id(ss, guild_id)
+    return gname
 
 
 def _escape_md(text: str) -> str:
     """Escapes special characters for Telegram MarkdownV2."""
     special = r"\_*[]()~`>#+-=|{}.!"
     return "".join(f"\\{ch}" if ch in special else ch for ch in str(text))
+
+
+# ---------------------------------------------------------------------------
+# Handler registration
+# ---------------------------------------------------------------------------
+
+def get_handlers():
+    return [
+        CommandHandler("tickets", cmd_tickets),
+        CallbackQueryHandler(cb_tickets_guild,     pattern=r"^tickets:"),
+        CallbackQueryHandler(cb_tickets_today,     pattern=r"^ticketstoday:"),
+        CallbackQueryHandler(cb_tickets_yesterday, pattern=r"^ticketsyest:"),
+        CallbackQueryHandler(cb_tickets_back,      pattern=r"^ticketsback:"),
+    ]
