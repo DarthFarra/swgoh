@@ -8,10 +8,43 @@ from telegram.ext import ApplicationBuilder, ContextTypes
 from .config import BOT_TOKEN
 from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
+
+class _RedactTokenFilter(logging.Filter):
+    """
+    Strips the bot token from log messages before they are written.
+    The Telegram API embeds the token in every URL:
+      https://api.telegram.org/bot<TOKEN>/method
+    This filter replaces the token with '***' in all log records.
+    """
+    def __init__(self, token: str):
+        super().__init__()
+        self._token = token
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._token:
+            record.msg = str(record.msg).replace(self._token, "***")
+            record.args = tuple(
+                str(a).replace(self._token, "***") if isinstance(a, str) else a
+                for a in (record.args or ())
+            )
+        return True
+
+
+def _setup_logging(token: str) -> None:
+    """
+    Configure logging with token redaction applied to every handler.
+    Must be called after the token is known so the filter can be seeded.
+    """
+    fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    logging.basicConfig(level=logging.INFO, format=fmt)
+
+    redact = _RedactTokenFilter(token)
+    # Apply to the root logger so every handler (including httpx) is covered
+    root = logging.getLogger()
+    for handler in root.handlers:
+        handler.addFilter(redact)
+
+
 log = logging.getLogger(__name__)
 
 
@@ -30,9 +63,9 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    _setup_logging(BOT_TOKEN)
 
-    # Global error handler — logs every unhandled exception with full traceback
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_error_handler(error_handler)
 
     for handler in (
