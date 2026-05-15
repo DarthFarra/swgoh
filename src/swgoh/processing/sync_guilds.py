@@ -25,6 +25,8 @@ except Exception:
 from ..http import COMLINK_BASE
 from ..creds import load_credentials          # ← single source of truth
 from ..sheets import spreadsheet as open_spreadsheet  # ← single source of truth
+from .. import config as cfg
+
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -32,24 +34,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("sync_guilds")
 
-# ----------------- ENV / CONFIG -----------------
-SHEET_GUILDS = os.getenv("GUILDS_SHEET", "Guilds")
-SHEET_PLAYERS = os.getenv("PLAYERS_SHEET", "Players")
-SHEET_PLAYER_UNITS = os.getenv("PLAYER_UNITS_SHEET", "Player_Units")
-SHEET_PLAYER_SKILLS = os.getenv("PLAYER_SKILLS_SHEET", "Player_Skills")
+# ----------------- CONFIG (sourced from core — no os.getenv here) -----------------
+SHEET_GUILDS        = cfg.SHEET_GUILDS
+SHEET_PLAYERS       = cfg.SHEET_PLAYERS
+SHEET_PLAYER_UNITS  = cfg.SHEET_PLAYER_UNITS
+SHEET_PLAYER_SKILLS = cfg.SHEET_PLAYER_SKILLS
+SHEET_CHARACTERS    = cfg.SHEET_CHARACTERS
+SHEET_SHIPS         = cfg.SHEET_SHIPS
+EXCLUDE_BASEID_CONTAINS = cfg.EXCLUDE_BASEID_CONTAINS
+TZ                  = cfg.TZ
 
-SHEET_CHARACTERS = os.getenv("CHARACTERS_SHEET", "Characters")
-SHEET_SHIPS = os.getenv("SHIPS_SHEET", "Ships")
-SHEET_ZETAS = os.getenv("CHAR_ZETAS_SHEET", "CharactersZetas")
-SHEET_OMIS  = os.getenv("CHAR_OMICRONS_SHEET", "CharactersOmicrons")
+# These two have no bot-facing use so are not in core config,
+# but remain overridable via env.
+import os as _os
+SHEET_ZETAS = _os.getenv("CHAR_ZETAS_SHEET",    "CharactersZetas")
+SHEET_OMIS  = _os.getenv("CHAR_OMICRONS_SHEET", "CharactersOmicrons")
+del _os
 
-EXCLUDE_BASEID_CONTAINS = [
-    s.strip().upper()
-    for s in os.getenv("EXCLUDE_BASEID_CONTAINS", "").split(",")
-    if s.strip()
-]
-
-TZ = ZoneInfo(os.getenv("ID_ZONA", "Europe/Amsterdam"))
 
 
 def get_filter_ids_from_env() -> set[str]:
@@ -83,7 +84,7 @@ def now_ts() -> str:
 
 
 def preflight_comlink() -> bool:
-    base = os.getenv("COMLINK_BASE", "").strip()
+    base = COMLINK_BASE
     log.info("COMLINK_BASE host check starting.")
     try:
         u = urlparse(base)
