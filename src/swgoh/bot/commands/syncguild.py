@@ -1,29 +1,32 @@
 # src/swgoh/bot/commands/syncguild.py
+"""
+/syncguild command.
+
+Previously routed guild sync through an Apps Script webhook to work around
+Railway execution time limits. That dependency has been removed:
+  - sync_runner.run_sync_guilds_once() runs the sync directly in a thread
+    via asyncio.to_thread(), keeping the event loop unblocked.
+  - No external HTTP call to a third-party webhook.
+  - No APPS_SCRIPT_WEBHOOK_URL env var required.
+"""
 from __future__ import annotations
 
-import os
 import asyncio
 import logging
 
-import requests
 from telegram import Update
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 
 from ..services.sheets import open_ss, already_synced_today, resolve_label_name_rote_by_id
 from ..services.auth import user_authorized_guilds, user_has_role_in_guild
 from ..keyboards.guild_select import make_keyboard_guilds
-from ..security import (
-    validate_guild_id,
-    CallbackValidationError,
-)
+from ..security import validate_guild_id, CallbackValidationError
+from ..services.sync_runner import run_sync_guilds_once
 
 log = logging.getLogger(__name__)
 
-APPS_SCRIPT_URL     = os.getenv("APPS_SCRIPT_WEBHOOK_URL")
-APPS_SCRIPT_TIMEOUT = int(os.getenv("APPS_SCRIPT_TIMEOUT", "350"))
 
-
-async def cmd_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ss   = open_ss()
     opts = user_authorized_guilds(ss, update.effective_user.id)  # [(label, gid)]
 
@@ -39,7 +42,7 @@ async def cmd_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
     data = q.data or ""
@@ -50,7 +53,7 @@ async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = q.from_user.id
     ss      = open_ss()
 
-    # Validate guild_id against guilds the user is actually authorized for
+    # Validate guild_id against guilds the user is authorised for.
     authorized = user_authorized_guilds(ss, user_id)
     known_ids  = {gid for _, gid in authorized}
     try:
@@ -59,7 +62,7 @@ async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Gremio no válido.")
         return
 
-    # Belt-and-suspenders: role check on the resolved guild
+    # Belt-and-suspenders: explicit role check on the resolved guild.
     if not user_has_role_in_guild(ss, user_id, gid):
         await q.edit_message_text("❌ No tienes permisos para sincronizar este gremio.")
         return
@@ -70,72 +73,25 @@ async def cb_syncguild(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     label, _, _ = resolve_label_name_rote_by_id(ss, gid)
-
-    if not APPS_SCRIPT_URL:
-        await q.edit_message_text("❌ Error: APPS_SCRIPT_WEBHOOK_URL no configurado.")
-        log.error("APPS_SCRIPT_WEBHOOK_URL is not set.")
-        return
-
     await q.edit_message_text(
         f"⏳ Sincronizando {label}…\n\n_Esto puede tardar varios minutos._",
         parse_mode="Markdown",
     )
 
     try:
-        result = await _call_apps_script(gid)
-        if result.get("status") == "success":
-            summary = result.get("result", "Completado")
-            await q.edit_message_text(
-                f"✅ Sincronización completada para {label}.\n\n`{summary}`",
-                parse_mode="Markdown",
-            )
-        else:
-            error_msg = result.get("message", "Error desconocido")
-            await q.edit_message_text(f"❌ Error sincronizando {label}.\n\n{error_msg}")
+        await run_sync_guilds_once(gid)
+        await q.edit_message_text(f"✅ Sincronización completada para {label}.")
 
-    except asyncio.TimeoutError:
-        await q.edit_message_text(
-            f"⏱️ {label}: La sincronización está tomando más tiempo del esperado.\n\n"
-            "El proceso continúa en segundo plano. Verifica los datos en unos minutos."
-        )
-        log.warning("Timeout waiting for Apps Script response for guild %s", gid)
-
-    except requests.RequestException as e:
-        await q.edit_message_text(f"❌ Error de conexión sincronizando {label}.")
-        log.error("Request error calling Apps Script for guild %s: %s", gid, e)
-
-    except Exception as e:
-        await q.edit_message_text(f"❌ Error inesperado sincronizando {label}.")
-        log.exception("Unexpected error in cb_syncguild for guild %s", gid)
-
-
-async def _call_apps_script(guild_id: str) -> dict:
-    """
-    POST to the Apps Script webhook with the guild_id to sync.
-    Runs in a thread pool to avoid blocking the asyncio event loop.
-    """
-    payload = {"action": "sync_guilds", "filterGuildIds": [guild_id]}
-    loop    = asyncio.get_event_loop()
-
-    def _sync_request() -> dict:
-        response = requests.post(
-            APPS_SCRIPT_URL,
-            json=payload,
-            timeout=APPS_SCRIPT_TIMEOUT,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, _sync_request),
-            timeout=APPS_SCRIPT_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        log.warning("Apps Script timeout for guild %s", guild_id)
+    except asyncio.CancelledError:
+        # PTB shutdown during a long sync — let it propagate.
         raise
-    except requests.Timeout:
-        raise asyncio.TimeoutError()
+
+    except Exception:
+        log.exception("Unexpected error in cb_syncguild for guild %s", gid)
+        await q.edit_message_text(
+            f"❌ Error inesperado sincronizando {label}.\n"
+            "Revisa los logs para más detalles."
+        )
 
 
 def get_handlers():
