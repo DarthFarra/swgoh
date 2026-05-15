@@ -766,7 +766,3 @@ def read_ticket_snapshot(ss, guild_name: str) -> Optional[tuple[str, Dict[str, i
         return None
  
     return snapshot_date, result
- 
-
-
-1Password menu is available. Press down arrow to select.
