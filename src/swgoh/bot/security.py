@@ -4,7 +4,7 @@ Security utilities for the Telegram bot.
 
 Provides:
   - Callback data validation (whitelist-based)
-  - Per-user session state stored in bot_data (avoids 64-byte callback_data limit)
+  - Per-user session state stored in application.bot_data
   - Per-user command rate limiting (in-process, resets on restart)
 """
 from __future__ import annotations
@@ -12,33 +12,42 @@ from __future__ import annotations
 import time
 import logging
 import functools
-from typing import Any, Callable, Coroutine, Optional
+from typing import Any, Callable, Coroutine
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 log = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _bot_data(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    """
+    Access bot_data reliably via context.application.bot_data.
+    This works in PTB v20 regardless of context type configuration,
+    unlike context.bot_data which can be unavailable depending on
+    how the Application was built.
+    """
+    return context.application.bot_data
+
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
 
-# Minimum seconds between successive command invocations per user.
-# Adjust per-command by passing cooldown_seconds to rate_limit().
 _DEFAULT_COOLDOWN = 10.0
-
-# bot_data key that stores the rate-limit table: {user_id: {command: last_call_ts}}
 _RATE_KEY = "__rate_limits__"
 
 
 def rate_limit(
     cooldown_seconds: float = _DEFAULT_COOLDOWN,
-    message: str = "⏳ Please wait a few seconds before using this command again.",
+    message: str = "⏳ Por favor espera unos segundos antes de usar este comando de nuevo.",
 ):
     """
     Decorator for async Telegram command handlers.
-    Silently enforces a per-user cooldown; sends `message` if the cooldown
-    has not elapsed yet.
+    Enforces a per-user cooldown. Sends `message` if the cooldown has not elapsed.
 
     Usage:
         @rate_limit(cooldown_seconds=15)
@@ -51,11 +60,11 @@ def rate_limit(
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = update.effective_user.id if update.effective_user else None
             if user_id is None:
-                # No user context — allow through
                 return await handler(update, context)
 
             now = time.monotonic()
-            rate_table: dict = context.bot_data.setdefault(_RATE_KEY, {})
+            bot_data = _bot_data(context)
+            rate_table: dict = bot_data.setdefault(_RATE_KEY, {})
             user_table: dict = rate_table.setdefault(user_id, {})
             last_call: float = user_table.get(command_key, 0.0)
 
@@ -69,7 +78,7 @@ def rate_limit(
                     await update.message.reply_text(message)
                 elif update.callback_query:
                     await update.callback_query.answer(
-                        f"Please wait {remaining:.0f}s.", show_alert=False
+                        f"Por favor espera {remaining:.0f}s.", show_alert=False
                     )
                 return
 
@@ -83,18 +92,18 @@ def rate_limit(
 # ---------------------------------------------------------------------------
 # Per-user session state
 # ---------------------------------------------------------------------------
-# Stores bot-side session data in context.bot_data instead of callback_data,
-# which avoids the 64-byte Telegram limit and prevents users from forging state.
+# Session data lives in application.bot_data, keyed by user_id.
+# This avoids the 64-byte Telegram callback_data limit and prevents
+# users from forging flow state.
 #
-# Key structure in bot_data:
-#   "__sessions__" -> {user_id -> {key -> value}}
+# Structure: bot_data["__sessions__"] -> {user_id -> {key -> value}}
 
 _SESSION_KEY = "__sessions__"
 
 
 def session_set(context: ContextTypes.DEFAULT_TYPE, user_id: int, key: str, value: Any) -> None:
     """Store a value in the per-user session."""
-    sessions: dict = context.bot_data.setdefault(_SESSION_KEY, {})
+    sessions: dict = _bot_data(context).setdefault(_SESSION_KEY, {})
     sessions.setdefault(user_id, {})[key] = value
 
 
@@ -105,13 +114,13 @@ def session_get(
     default: Any = None,
 ) -> Any:
     """Retrieve a value from the per-user session."""
-    sessions: dict = context.bot_data.get(_SESSION_KEY, {})
+    sessions: dict = _bot_data(context).get(_SESSION_KEY, {})
     return sessions.get(user_id, {}).get(key, default)
 
 
 def session_clear(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
     """Clear all session state for a user."""
-    sessions: dict = context.bot_data.get(_SESSION_KEY, {})
+    sessions: dict = _bot_data(context).get(_SESSION_KEY, {})
     sessions.pop(user_id, None)
 
 
