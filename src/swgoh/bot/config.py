@@ -16,9 +16,12 @@ USERS_SHEET   = getattr(core_cfg, "SHEET_PLAYERS", None)  # placeholder en caso 
 USERS_SHEET   = getattr(core_cfg, "SHEET_USERS", "Usuarios")  # si tienes SHEET_USERS en tu core, úsalo
 GUILDS_SHEET  = getattr(core_cfg, "SHEET_GUILDS", "Guilds")
 PLAYERS_SHEET = getattr(core_cfg, "SHEET_PLAYERS", "Players")
+TICKET_SNAPSHOTS_SHEET = getattr(core_cfg, "TICKET_SNAPSHOTS_SHEET", "Ticket_Snapshots")
 
 # Pestaña por defecto para ROTE (si en Guilds no hay valor en "ROTE")
 DEFAULT_ROTE_SHEET = os.getenv("DEFAULT_ROTE_SHEET", "Asignaciones ROTE")
+TICKET_SNAPSHOTS_SHEET = os.getenv("TICKET_SNAPSHOTS_SHEET", "Ticket_Snapshots")
+
 
 # Chats permitidos para /syncdata (puedes mantenerlo también en env)
 _raw = os.getenv("SYNC_DATA_ALLOWED_CHATS", "7367477801,30373681")
