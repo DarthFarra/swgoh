@@ -32,21 +32,22 @@ def _refresh_if_needed(creds) -> None:
             raise
 
 
-def _client() -> gspread.Client:
+def _client_unsafe() -> gspread.Client:
+    """
+    Initialize or return the gspread client.
+    MUST be called with _lock already held by the caller.
+    """
     global _gc
-    with _lock:
-        if _gc is None:
-            creds = load_credentials()
-            _gc = gspread.authorize(creds)
-            log.debug("gspread client initialized.")
-        else:
-            # Refresh token if needed before reusing the existing client
-            try:
-                _refresh_if_needed(_gc.auth)
-            except Exception:
-                # On refresh failure, force re-initialization on next call
-                _gc = None
-                raise
+    if _gc is None:
+        creds = load_credentials()
+        _gc = gspread.authorize(creds)
+        log.debug("gspread client initialized.")
+    else:
+        try:
+            _refresh_if_needed(_gc.auth)
+        except Exception:
+            _gc = None
+            raise
     return _gc
 
 
@@ -54,16 +55,14 @@ def spreadsheet() -> gspread.Spreadsheet:
     global _sh
     with _lock:
         if _sh is not None:
-            # Ensure credentials are still valid even for cached spreadsheet
             try:
                 _refresh_if_needed(_sh.client.auth)
             except Exception:
-                # Force full re-initialization
                 _sh = None
                 raise
             return _sh
 
-        gc = _client()
+        gc = _client_unsafe()
         if SPREADSHEET_ID:
             _sh = gc.open_by_key(SPREADSHEET_ID)
         elif SPREADSHEET_NAME:
