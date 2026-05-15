@@ -505,31 +505,14 @@ async def cb_tickets_yesterday(update: Update, context: ContextTypes.DEFAULT_TYP
     if snapshot_result is None:
         await q.edit_message_text(
             f"*{_escape_md(label)}* \u2014 Aun no hay snapshot disponible\\.\n\n"
-            f"El primer snapshot se tomara automaticamente 5 minutos antes de "
-            f"la hora de reinicio configurada\\. Vuelve despues\\!",
+            f"El primer snapshot se tomara automaticamente a la hora de reinicio\\. Vuelve despues\\!",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
-    snapshot_date, snapshot_data = snapshot_result
+    snapshot_date, snapshot_d, snapshot_d1 = snapshot_result
 
-    await q.edit_message_text(
-        f"Obteniendo datos para *{_escape_md(label)}*\u2026",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
-
-    try:
-        members_live = fetch_guild_tickets(gid)
-    except Exception as exc:
-        log.error("Error fetching tickets for guild %s: %s", gid, exc)
-        await q.edit_message_text(
-            f"Error obteniendo datos para *{_escape_md(label)}*\\.\n\n"
-            f"`{_escape_md(str(exc))}`",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
-        return
-
-    text  = render_tickets_yesterday(members_live, snapshot_data, label)
+    text  = render_tickets_yesterday(snapshot_d, snapshot_d1, label)
     text += f"\n\n_Snapshot: {_escape_md(snapshot_date)}_"
 
     kb = InlineKeyboardMarkup([[
