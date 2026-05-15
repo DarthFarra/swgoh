@@ -48,11 +48,11 @@ def rate_limit(
         command_key = handler.__name__
 
         @functools.wraps(handler)
-        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id = update.effective_user.id if update.effective_user else None
             if user_id is None:
                 # No user context — allow through
-                return await handler(update, context, *args, **kwargs)
+                return await handler(update, context)
 
             now = time.monotonic()
             rate_table: dict = context.bot_data.setdefault(_RATE_KEY, {})
@@ -74,7 +74,7 @@ def rate_limit(
                 return
 
             user_table[command_key] = now
-            return await handler(update, context, *args, **kwargs)
+            return await handler(update, context)
 
         return wrapper
     return decorator
