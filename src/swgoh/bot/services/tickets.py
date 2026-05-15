@@ -124,19 +124,23 @@ def render_tickets_today(
     """
     Renders the 'Today (live)' message.
     Only lists members who have NOT yet reached the daily goal.
+    All user-supplied and numeric content is escaped for MarkdownV2.
     """
     delinquents = [m for m in members if not m.completed_today]
+    label = _escape_md(guild_label)
 
     if not delinquents:
-        total = len(members)
-        return (
-            f"✅ *{guild_label}* — All {total} members have reached "
-            f"their {DAILY_TICKET_GOAL} ticket goal today\\!"
-        )
+        total = _escape_md(str(len(members)))
+        goal  = _escape_md(str(DAILY_TICKET_GOAL))
+        return f"✅ *{label}* — All {total} members have reached their {goal} ticket goal today\\!"
 
-    lines = [f"🎫 *{guild_label}* — Missing tickets today ({len(delinquents)}/{len(members)}):\n"]
+    count_str = _escape_md(f"{len(delinquents)}/{len(members)}")
+    lines = [f"🎫 *{label}* — Missing tickets today \\({count_str}\\):\n"]
     for m in sorted(delinquents, key=lambda x: x.current_value):
-        lines.append(f"• {_escape_md(m.player_name)} ({m.current_value}/{DAILY_TICKET_GOAL})")
+        name    = _escape_md(m.player_name)
+        current = _escape_md(str(m.current_value))
+        goal    = _escape_md(str(DAILY_TICKET_GOAL))
+        lines.append(f"• {name} \\({current}/{goal}\\)")
 
     return "\n".join(lines)
 
@@ -154,9 +158,10 @@ def render_tickets_yesterday(
       if delta < DAILY_TICKET_GOAL → missed
 
     Members not in the snapshot are flagged separately (joined after snapshot).
+    All user-supplied and numeric content is escaped for MarkdownV2.
     """
-    missed: List[Tuple[str, int]] = []       # (player_name, delta)
-    new_members: List[str] = []              # names not in snapshot
+    missed: List[Tuple[str, int]] = []   # (player_name, delta)
+    new_members: List[str] = []          # names not in snapshot
 
     for m in members_live:
         key = m.player_name.lower()
@@ -167,18 +172,23 @@ def render_tickets_yesterday(
         if delta < DAILY_TICKET_GOAL:
             missed.append((m.player_name, max(0, delta)))
 
-    if not missed and not new_members:
-        return f"✅ *{guild_label}* — Everyone contributed their tickets yesterday\\!"
+    label = _escape_md(guild_label)
 
-    lines = [f"📅 *{guild_label}* — Missed tickets yesterday:\n"]
+    if not missed and not new_members:
+        return f"✅ *{label}* — Everyone contributed their tickets yesterday\\!"
+
+    lines = [f"📅 *{label}* — Missed tickets yesterday:\n"]
 
     if missed:
-        missed.sort(key=lambda x: x[1])  # sort by tickets contributed (ascending)
+        missed.sort(key=lambda x: x[1])  # ascending by tickets contributed
+        goal = _escape_md(str(DAILY_TICKET_GOAL))
         for name, contributed in missed:
-            lines.append(f"• {_escape_md(name)} ({contributed}/{DAILY_TICKET_GOAL})")
+            esc_name        = _escape_md(name)
+            esc_contributed = _escape_md(str(contributed))
+            lines.append(f"• {esc_name} \\({esc_contributed}/{goal}\\)")
 
     if new_members:
-        lines.append("\n⚠️ *New members (no snapshot data):*")
+        lines.append("\n⚠️ *New members \\(no snapshot data\\):*")
         for name in sorted(new_members):
             lines.append(f"• {_escape_md(name)}")
 
