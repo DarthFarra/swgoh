@@ -41,3 +41,16 @@ TIMEZONE: str = _core.TIMEZONE
 SEND_ASSIGNMENTS_TIME: str = _core.SEND_ASSIGNMENTS_TIME
 SYNC_GUILDS_CRON: str      = _core.SYNC_GUILDS_CRON
 SYNC_DATA_CRON: str        = _core.SYNC_DATA_CRON
+
+# Additional tab names used by /omicrones
+CHAR_OMICRONS_SHEET:      str = _core.SHEET_CHARACTERS_OMICRONS
+CHAR_ZETAS_SHEET:         str = _core.SHEET_CHARACTERS_ZETAS
+OMICRON_PRIORITIES_SHEET: str = _core.SHEET_OMICRON_PRIORITIES
+ 
+# Unit catalogs — needed to translate Comlink base_ids to character names.
+CHARACTERS_SHEET:         str = _core.SHEET_CHARACTERS
+SHIPS_SHEET:              str = _core.SHEET_SHIPS
+ 
+# /omicrones tunables
+OMICRON_MIN_RELIC:        int = _core.OMICRON_MIN_RELIC
+OMICRON_RECOMMEND_TOP_N:  int = _core.OMICRON_RECOMMEND_TOP_N
