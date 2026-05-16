@@ -450,6 +450,37 @@ def list_players_for_guild(ss, guild_name: str) -> List[Tuple[str, str]]:
                 players.append((name, name))
     return sorted(players, key=lambda x: x[0].lower())
 
+def player_id_for_alias(ss, guild_name: str, alias: str) -> Optional[str]:
+    """
+    Returns the Player Id for (guild_name, alias), or None if
+    no match. Case-insensitive on alias; exact match on guild_name.
+ 
+    The Player Id column is populated by /syncguild. If a freshly
+    registered user runs /omicrones before the next /syncguild, they'll
+    get None here — the caller should explain that politely.
+    """
+    ws = ss.worksheet(PLAYERS_SHEET)
+    headers, rows = _get_all(ws)
+    hl = [h.lower() for h in headers]
+    try:
+        i_pid  = hl.index("player id")
+        i_name = hl.index("player name")
+        i_gn   = hl.index("guild name")
+    except ValueError:
+        return None
+ 
+    anorm = (alias or "").strip().lower()
+    for r in rows:
+        gn = (r[i_gn] if i_gn < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        name = (r[i_name] if i_name < len(r) else "").strip()
+        if name.strip().lower() != anorm:
+            continue
+        pid = (r[i_pid] if i_pid < len(r) else "").strip()
+        return pid or None
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Asignaciones ROTE

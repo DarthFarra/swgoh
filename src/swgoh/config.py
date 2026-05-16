@@ -105,6 +105,13 @@ SHEET_CHARACTERS:      str = _optional("SHEET_CHARACTERS",      "Characters")
 SHEET_SHIPS:           str = _optional("SHEET_SHIPS",           "Ships")
 SHEET_USERS:           str = _optional("SHEET_USERS",           "Usuarios")
 SHEET_ASSIGNMENTS:     str = _optional("SHEET_ASSIGNMENTS",     "Asignaciones ROTE")
+SHEET_CHARACTERS_ZETAS:    str = _optional("SHEET_CHARACTERS_ZETAS",    "CharactersZetas")
+SHEET_CHARACTERS_OMICRONS: str = _optional("SHEET_CHARACTERS_OMICRONS", "CharactersOmicrons")
+
+# OmicronPriorities — owned by guild officers, read by /omicrones.
+# Auto-created on first read if missing.
+SHEET_OMICRON_PRIORITIES:  str = _optional("SHEET_OMICRON_PRIORITIES",  "OmicronPriorities")
+ 
 
 # Fallback ROTE sheet name used when a guild has no ROTE column configured.
 # Overridable via env if your default sheet has a different name.
@@ -181,3 +188,15 @@ HTTP_TIMEOUT:  float = _float("HTTP_TIMEOUT_SECONDS",  30.0)
 
 OMICRON_MODE_MAP_JSON: str = _optional("OMICRON_MODE_MAP_JSON")
 OMICRON_MODE_MAP:      str = _optional("OMICRON_MODE_MAP")
+
+# ---------------------------------------------------------------------------
+# Omicron recommendations (/omicrones command)
+# ---------------------------------------------------------------------------
+ 
+# Minimum relic level a character must have for its omicron to be
+# recommended. Default R5 keeps the list focused on usable characters.
+# Set to 0 to include any unlocked character (incl. sub-relic).
+OMICRON_MIN_RELIC: int = _int("OMICRON_MIN_RELIC", 5)
+ 
+# Maximum number of recommendations returned per /omicrones invocation.
+OMICRON_RECOMMEND_TOP_N: int = _int("OMICRON_RECOMMEND_TOP_N", 5)
