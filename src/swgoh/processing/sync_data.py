@@ -351,7 +351,7 @@ def run() -> Dict[str, int]:
         char_skill_concat = (f"{character_name}|{friendly_skill}" if character_name else friendly_skill)
 
         
-        for tier_idx, tr in enumerate(tiers, start=1):
+        for in_game_tier, tr in enumerate(tiers, start=2):
             if not isinstance(tr, dict):
                 continue
             is_zeta = bool(tr.get("isZetaTier"))
@@ -377,8 +377,7 @@ def run() -> Dict[str, int]:
                 recipe_id,
                 character_name,
                 char_skill_concat,
-                tier_idx,  # NEW: 1-based tier index where this is a zeta/omicron tier
-
+                in_game_tier,   # NEW: in-game tier number (1-indexed, base=1)
             ]
             if is_zeta:
                 zetas_rows.append(row)
