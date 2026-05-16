@@ -9,6 +9,28 @@ parsing in two places invites drift; one shared module fixes both.
 
 Everything here is pure: no I/O, no global state, no logging side
 effects. That makes it trivial to unit-test and safe to reuse.
+
+----------------------------------------------------------------------
+TIER NUMBERING CONVENTION — read before touching tier code below
+----------------------------------------------------------------------
+The number written to Player_Skills (via this module) and to
+CharactersOmicrons.tier (via sync_data.run()) is always the IN-GAME
+tier — the number a player sees on their screen in SWGOH.
+
+That's not what Comlink returns natively:
+  - Comlink's player skill `tier` field is the 0-indexed position in
+    the skill's tiers list.
+  - The tiers list itself starts at in-game tier 2 — the base ability
+    (in-game tier 1) is not in the list.
+  - Net: in_game_tier = comlink_raw_tier + 2.
+
+Likewise the CharactersOmicrons.tier column is written as
+`enumerate(tiers, start=1) + 1` in sync_data.run() so it matches.
+
+Picking the in-game number as the canonical convention means humans
+debugging the sheet read the same numbers they see in-game. The cost
+is one `+2` here and one `+1` in sync_data — both with comments.
+----------------------------------------------------------------------
 """
 from __future__ import annotations
 
@@ -23,8 +45,7 @@ from typing import Any, Dict, List, Optional
 #   currentTier = 1  → "R0"    (just unlocked relics, level 0)
 #   currentTier = 14 → "R13"   (max)
 #
-# Keep this map as the single source of truth. sync_guilds aliases it
-# as RELIC_MAP for backwards-compatibility.
+# sync_guilds aliases this as RELIC_MAP for backwards-compatibility.
 # ---------------------------------------------------------------------------
 
 RELIC_DISPLAY: Dict[int, str] = {
@@ -56,6 +77,17 @@ def relic_level(current_tier: int) -> int:
         return -1
     # s starts with 'R' followed by digits — guaranteed by the map content.
     return int(s[1:])
+
+
+# ---------------------------------------------------------------------------
+# Tier conversion constant
+# ---------------------------------------------------------------------------
+
+# Comlink raw tier → in-game tier offset.
+# Confirmed empirically at two tier levels:
+#   in-game 8 (omicron applied) → comlink raw 6
+#   in-game 6 (zeta - 1)        → comlink raw 4
+COMLINK_TO_INGAME_TIER_OFFSET = 2
 
 
 # ---------------------------------------------------------------------------
@@ -104,18 +136,27 @@ def _base_id(unit: Dict[str, Any]) -> str:
 
 def extract_skill_tiers_by_id(roster: List[Dict[str, Any]]) -> Dict[str, int]:
     """
-    Returns {skill_id: max_tier_int} across all units in the roster.
+    Returns {skill_id: max_in_game_tier} across all units in the roster.
+
+    The returned tier is the IN-GAME tier (what the user sees on their
+    screen). See the module docstring for the offset reasoning.
 
     If the same skill_id appears under multiple units (shouldn't happen
-    in normal data, but we don't trust the wire), the maximum tier wins —
-    matching what sync_guilds.py used to do inline.
+    in normal data, but we don't trust the wire), the maximum tier wins.
 
     Tolerates the several field-name variants the Comlink schema has
     used: `skill` / `skills` / `skillList`, and tier under any of
     `tier` / `currentTier` / `selectedTier` / `tierIndex`.
 
-    No filtering happens here. Callers apply their own filters
-    (e.g. sync_guilds excludes skill IDs containing 'SUMMON').
+    A skill present in the roster with comlink_raw_tier=0 is included
+    with in-game-tier=2 (because in-game tier 1 = base ability is
+    implicit and never returned). The FIRST occurrence of a skill_id
+    must always be recorded, even if the value would be the floor — see
+    the sentinel check below.
+
+    No domain filtering happens here. Callers apply their own filters
+    (e.g. sync_guilds excludes skill IDs containing 'SUMMON' and
+    intersects with the zeta/omicron catalog).
     """
     out: Dict[str, int] = {}
     for unit in roster or []:
@@ -150,7 +191,14 @@ def extract_skill_tiers_by_id(roster: List[Dict[str, Any]]) -> Dict[str, int]:
             except (TypeError, ValueError):
                 tier_int = 0
 
-            if tier_int > out.get(sid, 0):
+            # Convert Comlink's 0-indexed tier-list-position-starting-at-2
+            # into the in-game tier number. See module docstring.
+            tier_int += COMLINK_TO_INGAME_TIER_OFFSET
+
+            # Sentinel check, NOT "tier_int > existing or 0". The latter
+            # would silently drop the first occurrence when the converted
+            # tier equals 0, defeating the point of tracking it.
+            if sid not in out or tier_int > out[sid]:
                 out[sid] = tier_int
     return out
 
