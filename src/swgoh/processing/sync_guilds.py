@@ -26,6 +26,7 @@ from ..http import COMLINK_BASE
 from ..creds import load_credentials          # ← single source of truth
 from ..sheets import spreadsheet as open_spreadsheet  # ← single source of truth
 from .. import config as cfg
+from . import _roster_parse as rp
 
 
 logging.basicConfig(
@@ -58,11 +59,8 @@ def get_filter_ids_from_env() -> set[str]:
 
 
 DIV_MAP   = {25: "1", 20: "2", 15: "3", 10: "4", 5: "5"}
-RELIC_MAP = {
-    14: "R13", 13: "R12", 12: "R11", 11: "R10", 10: "R9",
-    9: "R8", 8: "R7", 7: "R6", 6: "R5", 5: "R4",
-    4: "R3", 3: "R2", 2: "R1", 1: "R0", 0: "<G13",
-}
+RELIC_MAP = rp.RELIC_DISPLAY  # alias — single source of truth
+
 ROLE_MAP = {2: "Miembro", 3: "Oficial", 4: "Lider"}
 
 GUILDS_HEADER_SYNONYMS = {"GP": ["GP", "Guild GP"]}
@@ -409,23 +407,12 @@ def roster_to_unit_values(
     roster_units: List[Dict[str, Any]],
     is_ship_by_base: Dict[str, bool],
 ) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for ru in roster_units or []:
-        defid = str(ru.get("definitionId") or "").strip()
-        if not defid:
-            continue
-        base = defid.split(":")[0]
-        if not base or _exclude_baseid(base):
-            continue
-        if is_ship_by_base.get(base, False):
-            out[base] = "Nave"
-            continue
-        relic = 0
-        rel_obj = ru.get("relic") or {}
-        if isinstance(rel_obj, dict):
-            relic = _to_int(rel_obj.get("currentTier"), 0)
-        out[base] = RELIC_MAP.get(relic, RELIC_MAP[0])
-    return out
+    raw = rp.extract_relic_tiers_by_base_id(roster_units, is_ship_by_base)
+    return {
+        base: ("Nave" if v is None else RELIC_MAP.get(v, RELIC_MAP[0]))
+        for base, v in raw.items()
+        if not _exclude_baseid(base)
+    }
 
 
 # ----------------- SKILL CATALOG (Zetas + Omicrons) -----------------
@@ -812,39 +799,15 @@ def run(filter_guild_ids: Optional[Set[str]] = None) -> str:
 
             if skill_id_to_header:
                 rowdict = skills_matrix.setdefault((guild_name, pname), {})
-                for ru in roster:
-                    skills = (
-                        ru.get("skill")
-                        or ru.get("skills")
-                        or ru.get("skillList")
-                        or []
-                    )
-                    if not isinstance(skills, list):
+                skill_tiers = rp.extract_skill_tiers_by_id(roster)
+                for sid, tier_int in skill_tiers.items():
+                    if sid not in skill_id_to_header or _exclude_skillid(sid):
                         continue
-                    for s in skills:
-                        if not isinstance(s, dict):
-                            continue
-                        sid = s.get("id") or s.get("skillId") or s.get("idRef")
-                        if not sid:
-                            continue
-                        sid = str(sid).strip()
-                        if sid not in skill_id_to_header or _exclude_skillid(sid):
-                            continue
-                        tier = s.get("tier")
-                        if tier is None:
-                            tier = s.get(
-                                "currentTier",
-                                s.get("selectedTier", s.get("tierIndex", 0)),
-                            )
-                        try:
-                            tier_int = int(tier)
-                        except Exception:
-                            tier_int = 0
-                        header = skill_id_to_header[sid]
-                        prevv = rowdict.get(header)
-                        if prevv is None or tier_int > _to_int(prevv, 0):
-                            rowdict[header] = str(tier_int)
-
+                    header = skill_id_to_header[sid]
+                    prevv = rowdict.get(header)
+                    if prevv is None or tier_int > _to_int(prevv, 0):
+                        rowdict[header] = str(tier_int)
+                        
         processed += 1
 
     if final_players_rows != players_existing_rows:
