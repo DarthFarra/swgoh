@@ -350,16 +350,15 @@ def run() -> Dict[str, int]:
         character_name = (unit_friendly_by_base.get(bases[0], "") if bases else "")
         char_skill_concat = (f"{character_name}|{friendly_skill}" if character_name else friendly_skill)
 
-        for tr in tiers:
+        
+        for tier_idx, tr in enumerate(tiers, start=1):
             if not isinstance(tr, dict):
                 continue
             is_zeta = bool(tr.get("isZetaTier"))
-            is_omicron = bool(tr.get("isOmicronTier"))  # ← filtro exacto pedido
-
+            is_omicron = bool(tr.get("isOmicronTier"))
             if not (is_zeta or is_omicron):
                 continue
 
-            # recipeId (varios nombres posibles)
             recipe_id = ""
             for k in ("recipeId", "tierUpRecipeId", "upgradeRecipeId", "upgradeRecipeReference"):
                 v = tr.get(k)
@@ -378,6 +377,8 @@ def run() -> Dict[str, int]:
                 recipe_id,
                 character_name,
                 char_skill_concat,
+                tier_idx,  # NEW: 1-based tier index where this is a zeta/omicron tier
+
             ]
             if is_zeta:
                 zetas_rows.append(row)
@@ -402,7 +403,7 @@ def run() -> Dict[str, int]:
 
     headers_skills = [
         "skillid", "abilityReference", "skill name", "skill name key", "abilityReference_NAME",
-        "omicronMode", "omicronModeText", "recipeId", "CharacterName", "CharacterName|skill name"
+        "omicronMode", "omicronModeText", "recipeId", "CharacterName", "CharacterName|skill name", "tier",
     ]
     write_sheet(ws_zetas, headers_skills, zetas_rows)
     write_sheet(ws_omis, headers_skills, omicrons_rows)
