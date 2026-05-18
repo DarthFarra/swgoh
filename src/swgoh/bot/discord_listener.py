@@ -121,6 +121,14 @@ class _TBListenerClient(discord.Client):
         Filter then dispatch. Any exception here is caught at the
         outermost level so a single bad message can't crash the listener.
         """
+        # TEMPORARY DEBUG — remove after diagnosis
+        log.info(
+          "DEBUG message: author_id=%s author=%s channel_id=%s attachments=%s",
+          message.author.id,
+          message.author,
+          message.channel.id,
+          [a.filename for a in message.attachments],
+        )
         try:
             await self._handle_message(message)
         except Exception:
