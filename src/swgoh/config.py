@@ -200,3 +200,33 @@ OMICRON_MIN_RELIC: int = _int("OMICRON_MIN_RELIC", 5)
  
 # Maximum number of recommendations returned per /omicrones invocation.
 OMICRON_RECOMMEND_TOP_N: int = _int("OMICRON_RECOMMEND_TOP_N", 5)
+
+# ---------------------------------------------------------------------------
+# Discord listener (TB export bridge)
+# ---------------------------------------------------------------------------
+# All four are required only if you want the Discord → Telegram bridge
+# enabled. If any is missing the listener logs a warning and skips startup;
+# the rest of the bot keeps running.
+#
+# - DISCORD_BOT_TOKEN: the bot token from the Discord developer portal.
+#   Treat as a secret; never commit.
+# - DISCORD_C3PO_USER_ID: numeric user ID of the C3PO bot in your server.
+#   Right-click C3PO → Copy User ID (developer mode required).
+# - DISCORD_WATCH_CHANNEL_ID: numeric ID of the channel where you run
+#   /tb export. Right-click channel → Copy Channel ID.
+# - TB_AUTO_FORWARD_CHAT_ID: numeric Telegram chat ID where auto-summaries
+#   should be posted. For group chats this is a negative number.
+
+DISCORD_BOT_TOKEN:         str = _optional("DISCORD_BOT_TOKEN")
+DISCORD_C3PO_USER_ID:      int = _int("DISCORD_C3PO_USER_ID",      752366060312723546)
+DISCORD_WATCH_CHANNEL_ID:  int = _int("DISCORD_WATCH_CHANNEL_ID",  1505865122982137876)
+TB_AUTO_FORWARD_CHAT_ID:   int = _int("TB_AUTO_FORWARD_CHAT_ID",   7367477801)
+
+# Optional: chats allowed to run /tb_status, /tb_failed_specials, /tb_top.
+# Defaults to SYNC_DATA_ALLOWED_CHATS if not set.
+_raw_tb_chats = _optional("TB_REPORTS_ALLOWED_CHATS")
+TB_REPORTS_ALLOWED_CHATS: set[str] = (
+    {s.strip() for s in _raw_tb_chats.split(",") if s.strip()}
+    if _raw_tb_chats
+    else SYNC_DATA_ALLOWED_CHATS
+)
