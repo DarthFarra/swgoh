@@ -25,7 +25,18 @@ from pathlib import Path
 _here = Path(__file__).resolve().parent
 sys.path.insert(0, str(_here.parent / "src"))
 
-from swgoh.tb import parse_tb_snapshot, ParseError, TBSnapshot  # noqa: E402
+from swgoh.tb import (  # noqa: E402
+    parse_tb_snapshot,
+    ParseError,
+    TBSnapshot,
+    members_missing_deployment,
+    members_with_no_strikes,
+    members_with_no_summary,
+    members_with_failed_specials,
+    phase_progress,
+    time_remaining,
+    top_contributors,
+)
 
 
 logging.basicConfig(
@@ -178,6 +189,113 @@ def print_potential_slackers(snap: TBSnapshot) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def print_analysis_demo(snap: TBSnapshot) -> None:
+    """
+    Exercise the analysis module against the snapshot and print results.
+    This is intentionally chatty — the point is to verify the analysis
+    functions produce sensible output before we wire up formatters.
+    """
+    print()
+    print("=" * 70)
+    print("  ANALYSIS DEMO — testing pure-function queries")
+    print("=" * 70)
+
+    # Phase progress for current round
+    progress = phase_progress(snap)
+    if progress:
+        print()
+        print(f"--- Phase {progress.phase} progress ---")
+        print(f"  Active members:     {progress.members_with_any_activity}/{progress.members_total}")
+        print(f"  Total summary pts:  {_fmt_int(progress.total_summary)}")
+        print(f"  Total power:        {_fmt_int(progress.total_power)}")
+        print(f"  Units donated:      {_fmt_int(progress.total_unit_donated)}")
+        print(f"  Strike attempts:    {_fmt_int(progress.total_strike_attempts)}")
+        print(f"  Strikes completed:  {_fmt_int(progress.total_strike_encounters)}")
+        print(f"  Covert attempts:    {_fmt_int(progress.total_covert_attempts)}")
+        print(f"  Coverts completed:  {_fmt_int(progress.total_covert_completes)}")
+
+    # Time remaining
+    remaining = time_remaining(snap)
+    if remaining is not None:
+        secs = int(remaining.total_seconds())
+        if secs > 0:
+            h, rem = divmod(secs, 3600)
+            m, _ = divmod(rem, 60)
+            print(f"  Time remaining:     {h}h {m}m")
+        else:
+            print(f"  Time remaining:     phase ended {-secs // 60}m ago")
+
+    # Missing deployment (current phase, 95% threshold)
+    gaps = members_missing_deployment(snap)
+    print()
+    print(f"--- Missing deployment (<95%) in current phase ({len(gaps)} members) ---")
+    if not gaps:
+        print("  ✓ Everyone has deployed at least 95% of their roster GP.")
+    else:
+        for gap in gaps[:10]:  # cap to top 10 in this demo
+            print(
+                f"  {gap.member.player_name:<35} "
+                f"deployed {_fmt_gp(gap.deployed)}/{_fmt_gp(gap.roster)} "
+                f"({gap.pct_deployed:.0%})  "
+                f"remaining: {_fmt_gp(gap.remaining)}"
+            )
+        if len(gaps) > 10:
+            print(f"  ... and {len(gaps) - 10} more")
+
+    # No strikes attempted (current phase)
+    no_strikes = members_with_no_strikes(snap)
+    print()
+    print(f"--- No combat missions attempted in current phase ({len(no_strikes)} members) ---")
+    if not no_strikes:
+        print("  ✓ Every member attempted at least one combat mission.")
+    else:
+        for m in no_strikes[:15]:
+            print(f"  {m.player_name}")
+        if len(no_strikes) > 15:
+            print(f"  ... and {len(no_strikes) - 15} more")
+
+    # Fully inactive
+    no_summary = members_with_no_summary(snap)
+    print()
+    print(f"--- Fully AFK in current phase (zero summary points) ({len(no_summary)} members) ---")
+    if not no_summary:
+        print("  ✓ Every member has contributed at least some points.")
+    else:
+        for m in no_summary[:15]:
+            print(f"  {m.player_name}")
+
+    # Failed specials (across all phases — interesting for post-mortem)
+    print()
+    print("--- Special-mission failures (post-mortem view across all phases) ---")
+    total_failures = 0
+    for phase in snap.phases_present:
+        failures = members_with_failed_specials(snap, phase=phase)
+        if not failures:
+            continue
+        print(f"  Phase {phase}: {len(failures)} members with failed specials")
+        total_failures += len(failures)
+        for f in failures[:3]:
+            print(
+                f"    {f.member.player_name:<35} "
+                f"attempted={f.attempted}  completed={f.completed}  failed={f.failed}"
+            )
+        if len(failures) > 3:
+            print(f"    ... and {len(failures) - 3} more in this phase")
+    if total_failures == 0:
+        print("  ✓ No special-mission failures in any phase.")
+
+    # Top contributors by different metrics
+    print()
+    print("--- Top contributors (across the whole map) ---")
+    for metric in ("summary", "power", "strike_encounter", "covert_complete"):
+        top = top_contributors(snap, n=3, by=metric)
+        if not top:
+            continue
+        print(f"  By {metric}:")
+        for row in top:
+            print(f"    {row.member.player_name:<35} {_fmt_int(row.value):>14}")
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(f"Usage: {argv[0]} <path-to-c3po-tb-export.json>", file=sys.stderr)
@@ -206,6 +324,7 @@ def main(argv: list[str]) -> int:
     print_phase_breakdown(snap)
     print_zone_states_by_phase(snap)
     print_potential_slackers(snap)
+    print_analysis_demo(snap)
     return 0
 
 
