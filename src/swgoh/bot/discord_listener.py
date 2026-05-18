@@ -115,6 +115,13 @@ class _TBListenerClient(discord.Client):
             self.user, self.user.id if self.user else "?",
             self._watch_channel_id, self._c3po_user_id,
         )
+      # TEMPORARY: log actual negotiated intents
+        log.info(
+          "DEBUG intents: message_content=%s guild_messages=%s guilds=%s",
+          self.intents.message_content,
+          self.intents.guild_messages,
+          self.intents.guilds,
+        )
 
     async def on_message(self, message: discord.Message) -> None:
         """
