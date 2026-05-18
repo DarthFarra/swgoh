@@ -1,4 +1,4 @@
-# SWGOH — Data + Bot
+# SWGOH — Data + Bot Aroa
 
 ## Architecture
 
