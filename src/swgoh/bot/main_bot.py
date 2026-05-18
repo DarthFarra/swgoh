@@ -41,8 +41,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-logging.getLogger("discord").setLevel(logging.INFO)
-
 
 # ---------------------------------------------------------------------------
 # Helpers
