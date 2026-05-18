@@ -115,12 +115,7 @@ class _TBListenerClient(discord.Client):
     async def on_ready(self) -> None:
         """Logged once after connect / reconnect. Useful for verifying
         the bot is up and in the right server."""
-        log.info(
-            "Discord listener ready: user=%s id=%s watching channel_id=%d "
-            "for messages from C3PO (id=%d)",
-            self.user, self.user.id if self.user else "?",
-            self._watch_channel_id, self._c3po_user_id,
-        )
+      
 
     async def on_message(self, message: discord.Message) -> None:
         """
