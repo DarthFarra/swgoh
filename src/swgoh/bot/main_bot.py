@@ -17,6 +17,8 @@ Pi / local deployment:
   Set SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON in .env.
   The systemd unit file (systemd/swgoh-bot.service) keeps this process alive.
 """
+logging.getLogger("discord").setLevel(logging.INFO)
+
 from __future__ import annotations
 
 import asyncio
