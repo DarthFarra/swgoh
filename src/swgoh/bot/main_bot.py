@@ -41,6 +41,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Install token-redaction filter on every root handler so secrets
+# don't leak through httpx/PTB/discord.py log lines.
+from .logging_filters import install_token_redaction  # noqa: E402
+install_token_redaction()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
