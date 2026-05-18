@@ -35,6 +35,13 @@ from .analysis import (
     DEFAULT_DEPLOYMENT_THRESHOLD_PCT,
     DEFAULT_TOP_N,
 )
+from .formatters import (
+    format_auto_summary,
+    format_status,
+    format_failed_specials,
+    format_top_contributors,
+    format_no_data,
+)
 
 __all__ = [
     # Models
@@ -60,6 +67,12 @@ __all__ = [
     "time_remaining",
     "top_contributors",
     "member_phase_breakdown",
+    # Formatters
+    "format_auto_summary",
+    "format_status",
+    "format_failed_specials",
+    "format_top_contributors",
+    "format_no_data",
     # Constants
     "DEFAULT_DEPLOYMENT_THRESHOLD_PCT",
     "DEFAULT_TOP_N",
