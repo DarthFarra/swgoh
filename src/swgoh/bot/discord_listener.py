@@ -80,26 +80,32 @@ _LISTENER_KEY = "__discord_listener__"
 
 class _TBListenerClient(discord.Client):
     """
-    Minimal discord.py client. Holds references to the PTB Application
-    (for cache access and Telegram sending) and to our config values.
+    Minimal discord.py client. Holds direct references to PTB's bot_data
+    (for cache access) and Bot (for outbound Telegram messages), rather
+    than the Application itself.
 
-    Why a subclass: discord.py's recommended pattern is event handlers
-    as methods on a Client subclass. Could also use the decorator-based
-    @client.event pattern, but subclassing keeps state (the PTB
-    application reference) cleanly encapsulated.
+    Why not store the Application: discord.py's Client has an `application`
+    attribute of its own (auto-populated post-login with the bot's
+    AppInfo). Storing PTB's Application as `self.application` would
+    collide; storing as `self._application` should be safe, but in
+    practice the internals of discord.py have caused this to be
+    overwritten in some setups. Storing bot_data + bot avoids the
+    question entirely.
     """
 
     def __init__(
         self,
         *,
-        application: Application,
+        ptb_bot_data: dict,
+        ptb_bot,                      # telegram.Bot, type-import-free
         c3po_user_id: int,
         watch_channel_id: int,
         auto_forward_chat_id: int,
         intents: discord.Intents,
     ) -> None:
         super().__init__(intents=intents)
-        self._application = application
+        self._ptb_bot_data = ptb_bot_data
+        self._ptb_bot = ptb_bot
         self._c3po_user_id = c3po_user_id
         self._watch_channel_id = watch_channel_id
         self._auto_forward_chat_id = auto_forward_chat_id
@@ -115,27 +121,12 @@ class _TBListenerClient(discord.Client):
             self.user, self.user.id if self.user else "?",
             self._watch_channel_id, self._c3po_user_id,
         )
-      # TEMPORARY: log actual negotiated intents
-        log.info(
-          "DEBUG intents: message_content=%s guild_messages=%s guilds=%s",
-          self.intents.message_content,
-          self.intents.guild_messages,
-          self.intents.guilds,
-        )
 
     async def on_message(self, message: discord.Message) -> None:
         """
         Filter then dispatch. Any exception here is caught at the
         outermost level so a single bad message can't crash the listener.
         """
-        # TEMPORARY DEBUG — remove after diagnosis
-        log.info(
-          "DEBUG message: author_id=%s author=%s channel_id=%s attachments=%s",
-          message.author.id,
-          message.author,
-          message.channel.id,
-          [a.filename for a in message.attachments],
-        )
         try:
             await self._handle_message(message)
         except Exception:
@@ -235,7 +226,7 @@ class _TBListenerClient(discord.Client):
 
         # Update the in-memory cache so /tb_status and friends see it.
         tb_cache.set_latest(
-            self._application.bot_data,
+            self._ptb_bot_data,
             snapshot,
             source_filename=attachment.filename,
         )
@@ -263,7 +254,7 @@ class _TBListenerClient(discord.Client):
         notification is preferable to crashing the listener.
         """
         try:
-            await self._application.bot.send_message(
+            await self._ptb_bot.send_message(
                 chat_id=self._auto_forward_chat_id,
                 text=text,
                 parse_mode="Markdown",
@@ -369,7 +360,8 @@ async def start_discord_listener(application: Application) -> None:
         return
 
     client = _TBListenerClient(
-        application=application,
+        ptb_bot_data=application.bot_data,
+        ptb_bot=application.bot,
         c3po_user_id=c3po_id,
         watch_channel_id=channel_id,
         auto_forward_chat_id=forward_chat,
