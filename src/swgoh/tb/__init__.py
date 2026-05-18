@@ -14,13 +14,53 @@ from .models import (
     CategoryCounts,
 )
 from .parser import parse_tb_snapshot, ParseError
+from .analysis import (
+    # Result types
+    DeploymentGap,
+    SpecialFailure,
+    Contribution,
+    PhaseProgress,
+    # Exception-list queries
+    members_missing_deployment,
+    members_with_no_strikes,
+    members_with_no_summary,
+    members_with_failed_specials,
+    # Aggregate queries
+    phase_progress,
+    time_remaining,
+    # Ranking queries
+    top_contributors,
+    member_phase_breakdown,
+    # Constants
+    DEFAULT_DEPLOYMENT_THRESHOLD_PCT,
+    DEFAULT_TOP_N,
+)
 
 __all__ = [
+    # Models
     "TBSnapshot",
     "Member",
     "PhaseStats",
     "ZoneStats",
     "CategoryCounts",
+    # Parser
     "parse_tb_snapshot",
     "ParseError",
+    # Analysis result types
+    "DeploymentGap",
+    "SpecialFailure",
+    "Contribution",
+    "PhaseProgress",
+    # Analysis queries
+    "members_missing_deployment",
+    "members_with_no_strikes",
+    "members_with_no_summary",
+    "members_with_failed_specials",
+    "phase_progress",
+    "time_remaining",
+    "top_contributors",
+    "member_phase_breakdown",
+    # Constants
+    "DEFAULT_DEPLOYMENT_THRESHOLD_PCT",
+    "DEFAULT_TOP_N",
 ]
