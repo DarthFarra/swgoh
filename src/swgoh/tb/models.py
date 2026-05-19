@@ -156,6 +156,20 @@ class TBSnapshot:
     total_stats: Dict[str, CategoryCounts]   # keyed by player_id
     zones: Dict[str, ZoneStats]
 
+    # Per-zone per-member summary contribution: zone_id -> {player_id -> points}.
+    # Only `summary` is captured here (not all 8 counters) — adding the others
+    # would 8x memory for no current consumer. If we later need per-zone strike
+    # or covert breakdowns, add them as parallel dicts then.
+    # A missing (zone_id, player_id) pair means zero contribution.
+    zone_member_summary: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
+    # Per-zone per-member GP deployed: zone_id -> {player_id -> power}.
+    # Same structure as zone_member_summary but captures the `power_zone_*`
+    # entries from currentStat. Used to compute "GP undeployed to active zones"
+    # in the auto-message header. Empty for snapshots parsed by an older
+    # version of the parser (degrades the undeployed-GP display gracefully).
+    zone_member_power: Dict[str, Dict[str, int]] = field(default_factory=dict)
+
     # Meta
     snapshot_taken_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
