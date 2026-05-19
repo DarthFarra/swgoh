@@ -27,15 +27,19 @@ from typing import Iterable, List, Optional, Sequence
 from .analysis import (
     DEFAULT_DEPLOYMENT_THRESHOLD_PCT,
     DeploymentGap,
+    PlanetReport,
     SpecialFailure,
+    StrikeMissionStatus,
+    active_planet_zones,
     members_missing_deployment,
     members_with_failed_specials,
-    members_with_no_strikes,
-    members_with_no_summary,
-    phase_progress,
+    planet_report,
+    territory_progress,
     time_remaining,
     top_contributors,
+    undeployed_gp_for_active_zones,
 )
+from .map_config import MapConfig, PlanetConfig
 from .models import Member, TBSnapshot
 
 log = logging.getLogger(__name__)
@@ -229,92 +233,44 @@ def _format_gap_line(gap: DeploymentGap) -> str:
     )
 
 
-def _no_strikes_section(
-    snap: TBSnapshot,
-    phase: Optional[int],
+def _territories_section(
+    snap: TBSnapshot, phase: Optional[int]
 ) -> List[str]:
-    """Members who haven't attempted any combat mission this phase."""
-    missing = members_with_no_strikes(snap, phase=phase)
-    if not missing:
+    """
+    Per-territory progress for the current phase.
+
+    Each territory line:
+      "T2: 257.6M  ·  35/50 contributing  ·  Strikes 5/5  ✓"
+
+    Bonus territories ("_bonus" zone IDs) are labeled "T3 Bonus" so officers
+    can distinguish them from the base territory at the same position.
+
+    Locked territories are skipped silently — they have no useful progress.
+    Strikes line is omitted when the territory has no strike zones (early
+    phases sometimes have no combat missions).
+
+    Returns [] if no unlocked territories exist for this phase.
+    """
+    territories = territory_progress(snap, phase=phase, include_locked=False)
+    if not territories:
         return []
 
-    lines: List[str] = [
-        f"*No combat missions attempted* ({len(missing)}):"
-    ]
-    rendered = [f"  • {_name(m)}" for m in missing]
-    lines.extend(_truncate_list(rendered))
-    return lines
+    lines: List[str] = ["*Territories:*"]
+    for t in territories:
+        is_bonus = t.zone_id.endswith("_bonus")
+        label = f"T{t.position}{' Bonus' if is_bonus else ''}"
 
+        # Completion glyph. Both "completed" (3) and "finalized" (4) get ✓.
+        # "Open but not done" (2) gets nothing — it's the normal in-progress state.
+        glyph = " ✓" if t.is_completed else ""
 
-def _afk_section(snap: TBSnapshot, phase: Optional[int]) -> List[str]:
-    """
-    Fully-AFK members (zero summary points). Often overlaps with
-    no-strikes, but a member who deployed GP without doing strikes
-    would only appear in the strikes section — and vice-versa for
-    someone who did strikes but didn't deploy. Showing both gives
-    officers a complete picture.
-    """
-    afk = members_with_no_summary(snap, phase=phase)
-    if not afk:
-        return []
-
-    lines: List[str] = [
-        f"*Fully inactive this phase* ({len(afk)}):"
-    ]
-    rendered = [f"  • {_name(m)}" for m in afk]
-    lines.extend(_truncate_list(rendered))
-    return lines
-
-
-def _progress_section(snap: TBSnapshot, phase: Optional[int]) -> List[str]:
-    """
-    Compact aggregate progress for the phase.
-
-    Note on stat semantics:
-      * strike_attempt   = number of distinct combat MISSIONS engaged (one
-                           per strike zone the player entered).
-      * strike_encounter = total wave-battles fought inside those missions
-                           (each mission has multiple waves; this is the
-                           finer-grained count).
-      * covert_attempt / covert_complete are 1:1 (per mission), so the
-                           "completed/attempted" framing is correct there.
-
-    For officer purposes we surface strike_attempt (mission engagement) and
-    omit strike_encounter — the wave count is mostly noise at this scope.
-    Coverts are shown as completed/attempted because that ratio is real.
-    """
-    prog = phase_progress(snap, phase=phase)
-    if prog is None:
-        return []
-
-    active_pct = (
-        prog.members_with_any_activity / prog.members_total
-        if prog.members_total else 0.0
-    )
-
-    lines: List[str] = [
-        "*Phase progress:*",
-        (
-            f"  Active: {prog.members_with_any_activity}/{prog.members_total} "
-            f"({active_pct:.0%})  ·  "
-            f"Summary: {_fmt_gp(prog.total_summary)}  ·  "
-            f"Power: {_fmt_gp(prog.total_power)}"
-        ),
-    ]
-
-    # Strike + covert line. Omit each side independently if all-zero;
-    # render only what's meaningful.
-    strike_part = (
-        f"Strike missions: {prog.total_strike_attempts}"
-        if prog.total_strike_attempts else None
-    )
-    covert_part = (
-        f"Coverts: {prog.total_covert_completes}/{prog.total_covert_attempts}"
-        if prog.total_covert_attempts else None
-    )
-    parts = [p for p in (strike_part, covert_part) if p is not None]
-    if parts:
-        lines.append("  " + "  ·  ".join(parts))
+        parts = [
+            f"*{label}*: {_fmt_gp(t.score)}",
+            f"{t.contributing_members}/{t.members_total} contributing",
+        ]
+        if t.strikes_total > 0:
+            parts.append(f"Strikes {t.strikes_completed}/{t.strikes_total}")
+        lines.append("  " + "  ·  ".join(parts) + glyph)
 
     return lines
 
@@ -356,64 +312,427 @@ def _assemble(sections: Iterable[List[str]]) -> str:
 # Public formatters
 # ---------------------------------------------------------------------------
 
-def format_auto_summary(
-    snap: TBSnapshot,
-    *,
-    threshold_pct: float = DEFAULT_DEPLOYMENT_THRESHOLD_PCT,
-) -> str:
+def _planet_header_line(report: PlanetReport, planet_cfg: Optional[PlanetConfig]) -> str:
     """
-    Build the message posted automatically when a new TB export arrives.
+    First line of a planet block:
+      "*Mandalore* — Stars 1/1"
+      "*T1* (phase 4) — Stars ?"   (config missing → fallback label)
 
-    Concise, exception-focused, current phase only. If nothing is wrong
-    (nobody missing deployment, no AFKs, no strike skips), we still post
-    a short "all clear" message so officers know the export was received
-    and processed.
+    Star info is included only when config provides thresholds (max_stars
+    > 0). Otherwise we show just the planet name and let the score line
+    below carry the progress signal.
     """
-    sections: List[List[str]] = [
-        _header_lines(snap),
-        _deployment_section(snap, phase=None, threshold=threshold_pct),
-        _no_strikes_section(snap, phase=None),
-        _afk_section(snap, phase=None),
+    name = planet_cfg.planet_name if planet_cfg else _label_from_zone_id(report.zone_id)
+    if report.max_stars > 0:
+        return f"*{_escape_md(name)}* — Stars {report.current_stars}/{report.max_stars}"
+    return f"*{_escape_md(name)}*"
+
+
+def _label_from_zone_id(zone_id: str) -> str:
+    """
+    Fallback display label when no PlanetConfig is available.
+
+    'tb3_mixed_phase04_conflict03'        -> 'Phase 4 T3'
+    'tb3_mixed_phase04_conflict03_bonus'  -> 'Phase 4 T3 Bonus'
+    """
+    # Extract phase number
+    phase_match = ""
+    for i, c in enumerate(zone_id):
+        if zone_id[i:i+5] == "phase":
+            j = i + 5
+            while j < len(zone_id) and zone_id[j].isdigit():
+                phase_match += zone_id[j]
+                j += 1
+            break
+    # Extract conflict position
+    pos_match = ""
+    idx = zone_id.find("conflict")
+    if idx >= 0:
+        j = idx + len("conflict")
+        while j < len(zone_id) and zone_id[j].isdigit():
+            pos_match += zone_id[j]
+            j += 1
+    is_bonus = zone_id.endswith("_bonus")
+    phase_part = f"Phase {int(phase_match)} " if phase_match else ""
+    pos_part = f"T{int(pos_match)}" if pos_match else "?"
+    bonus_part = " Bonus" if is_bonus else ""
+    return f"{phase_part}{pos_part}{bonus_part}"
+
+
+def _platoon_lines(report: PlanetReport) -> List[str]:
+    """
+    Render the Platoons section:
+      "Platoons: 4/6 — 32.0M points remaining"
+      (omitted if all 6 are complete OR if config didn't provide
+       platoon math)
+    """
+    p = report.platoons
+    if p is None:
+        return []
+    if p.is_complete:
+        return []  # hidden per spec
+    return [
+        f"  Platoons: {p.completed}/{p.total} — "
+        f"{_fmt_gp(p.points_remaining)} points for completing"
     ]
 
-    # If only the header has content, render the all-clear message.
-    if all(len(s) == 0 for s in sections[1:]):
-        sections.append([
-            "✅ All members deployed, attempting strikes, and active this phase.",
-        ])
 
-    return _assemble(sections)
+def _threshold_lines(report: PlanetReport, planet_cfg: Optional[PlanetConfig]) -> List[str]:
+    """
+    Render "To star N: X points missing" lines for each unreached threshold.
+
+    Hidden thresholds (those already achieved) don't appear, per spec.
+    For reward-only thresholds (stars=0), we render "To reward N" instead
+    of "To star" — clearer for the Zeffo/Mandalore pattern where the first
+    two thresholds are rewards, not stars.
+
+    Threshold indexing is 1-based and consistent with the config sheet's
+    t1/t2/t3 columns (which the formatter doesn't see directly, but the
+    user thinks in terms of).
+    """
+    lines: List[str] = []
+    if not planet_cfg or not planet_cfg.thresholds:
+        return lines
+
+    # Build a mapping from gap value to its 1-based threshold number in
+    # the config. This handles the case where some earlier thresholds
+    # were achieved (not in thresholds_remaining) — we still want the
+    # remaining one to be labelled with its config position.
+    threshold_index: dict[int, int] = {
+        t.value: i + 1 for i, t in enumerate(planet_cfg.thresholds)
+    }
+
+    for gap in report.thresholds_remaining:
+        idx = threshold_index.get(gap.value, 0)
+        label = f"reward {idx}" if gap.stars == 0 else f"star {idx}"
+        lines.append(
+            f"  To {label}: {_fmt_gp(gap.points_short)} points missing"
+        )
+
+    return lines
+
+
+def _mission_lines(
+    report: PlanetReport,
+    strike_name_lookup,
+) -> List[str]:
+    """
+    Render the Combat Missions block:
+      "Combat Missions — Est. potential remaining: 288.8M"
+      "  Mission 1: 23/50 (avg 1.6M) — Est. potential 43.6M"
+      "  ..."
+
+    `strike_name_lookup` is a callable(strike_zone_id) -> Optional[str]
+    (the MapConfig.strike_name method). When None, missions display as
+    "Mission 1", "Mission 2", etc.
+
+    Skips completely if the planet has no missions (e.g. some TB types
+    have planets without combat missions).
+    """
+    if not report.missions:
+        return []
+
+    lines: List[str] = [
+        f"  Combat Missions — Est. potential remaining: "
+        f"{_fmt_gp(report.missions_combined_total_est)}"
+    ]
+
+    for i, mission in enumerate(report.missions, start=1):
+        # Try friendly name from config, fall back to "Mission N"
+        friendly = strike_name_lookup(mission.zone_id) if strike_name_lookup else None
+        name = _escape_md(friendly) if friendly else f"Mission {i}"
+
+        if mission.players_participated == 0:
+            # No attempts yet — show 0/N, no avg, no potential extrapolation
+            # (extrapolating from zero data is meaningless).
+            lines.append(
+                f"    • {name}: 0/{mission.members_total} "
+                f"(no attempts yet)"
+            )
+        else:
+            lines.append(
+                f"    • {name}: {mission.players_participated}/{mission.members_total} "
+                f"(avg {_fmt_gp(mission.avg_score)}) — "
+                f"Est. potential {_fmt_gp(mission.estimated_potential)}"
+            )
+
+    return lines
+
+
+def _non_participants_lines(report: PlanetReport) -> List[str]:
+    """
+    Render the "not participated yet" section:
+      "Not participated yet (12):"
+      "  • PlayerA, PlayerB, PlayerC, ..., and 4 more"
+
+    Empty list → nothing rendered.
+    Names are escaped and shown comma-separated on a single line for
+    compactness (vs one-per-line which blows up message length).
+    """
+    non_participants = report.non_participants
+    if not non_participants:
+        return []
+
+    names = [_escape_md(_name(m)) for m in non_participants]
+
+    # Compact rendering: comma-separated on one line, with "+N more" if
+    # we'd exceed MAX_LIST_ITEMS.
+    if len(names) <= MAX_LIST_ITEMS:
+        names_str = ", ".join(names)
+    else:
+        head = ", ".join(names[:MAX_LIST_ITEMS])
+        names_str = f"{head}, and {len(names) - MAX_LIST_ITEMS} more"
+
+    return [
+        f"  Not participated yet ({len(non_participants)}):",
+        f"    {names_str}",
+    ]
+
+
+def _format_planet_block(
+    report: PlanetReport,
+    planet_cfg: Optional[PlanetConfig],
+    strike_name_lookup,
+) -> List[str]:
+    """
+    Render one planet's full block: header + thresholds + platoons + missions
+    + non-participants.
+
+    Returns a list of lines (no trailing blank line). Caller joins with
+    blank-line separators between planets.
+    """
+    block: List[str] = [_planet_header_line(report, planet_cfg)]
+    block.extend(_threshold_lines(report, planet_cfg))
+    block.extend(_platoon_lines(report))
+    block.extend(_mission_lines(report, strike_name_lookup))
+    block.extend(_non_participants_lines(report))
+    return block
+
+
+def _undeployed_gp_lines(snap: TBSnapshot, active_zones: List[str]) -> List[str]:
+    """
+    Single-line GP summary for the header.
+
+    Only rendered if zone_member_power data is available (modern snapshots).
+    Falls back silently if not — better to omit a line than to show a
+    misleading "0 undeployed" value.
+    """
+    undeployed, total = undeployed_gp_for_active_zones(snap, active_zones)
+    if not snap.zone_member_power:
+        # No power_zone data; skip the line rather than show a wrong "0".
+        return []
+    deployed = total - undeployed
+    return [
+        f"  GP: {_fmt_gp(total)} total · "
+        f"{_fmt_gp(deployed)} deployed · "
+        f"{_fmt_gp(undeployed)} undeployed"
+    ]
+
+
+def format_planet_briefing(
+    snap: TBSnapshot,
+    map_config: MapConfig,
+    *,
+    age_minutes: int = 0,
+    include_stale_hint: bool = True,
+) -> List[str]:
+    """
+    Build the C3PO-style auto-status / on-demand-status output.
+
+    Returns a LIST of messages (each <= SOFT_MESSAGE_CAP chars). Callers
+    that want a single string can ''.join() them, but they'll usually
+    send each as a separate Telegram message.
+
+    Layout per planet (active zones only, state in {2, 3}):
+
+      *<Planet name>* — Stars X/Y
+        To star N: P points missing      (one per unreached threshold)
+        Platoons: X/6 — Y points for completing
+        Combat Missions — Est. potential remaining: Z
+          • Mission name: A/50 (avg M) — Est. potential P
+          • ...
+        Not participated yet (N):
+          PlayerA, PlayerB, ...
+
+    Args:
+      map_config: lookups for planet names, thresholds, strike names.
+        Pass an empty MapConfig() if config not loaded — output will
+        use generic labels and skip star/threshold/platoon info.
+      age_minutes: how stale the underlying export is (for /tb_status).
+        0 for auto-forward.
+      include_stale_hint: whether to append the "data is N min old" line.
+        Auto-forward passes False (the message arrives at age 0).
+
+    Multi-message split:
+      If the total content exceeds SOFT_MESSAGE_CAP, we split at planet
+      boundaries — never mid-planet. Each output string starts with a
+      continuation marker ("...") so officers know it's part 2 of N.
+    """
+    # Header section: always present.
+    header_lines = _header_lines(snap)
+    active = active_planet_zones(snap)
+    header_lines.extend(_undeployed_gp_lines(snap, active))
+
+    if not active:
+        # No active zones — phase might be between rounds, or all zones
+        # are LOCKED/COMPLETED. Emit just the header with an explanatory
+        # line.
+        header_lines.append("")
+        header_lines.append("_No active planets at this snapshot._")
+        if include_stale_hint:
+            header_lines.extend(_data_age_footer(snap, age_minutes))
+        return [_enforce_message_cap("\n".join(header_lines))]
+
+    # Build each planet block.
+    planet_blocks: List[List[str]] = []
+    for zone_id in active:
+        planet_cfg = map_config.planet(zone_id) if not map_config.is_empty else None
+        # Extract config values for planet_report
+        if planet_cfg is not None:
+            platoon_count = planet_cfg.platoon_count
+            points_per_platoon = planet_cfg.points_per_platoon
+            thresholds = [(t.value, t.stars) for t in planet_cfg.thresholds]
+        else:
+            platoon_count = None
+            points_per_platoon = None
+            thresholds = None
+
+        report = planet_report(
+            snap, zone_id,
+            platoon_count=platoon_count,
+            points_per_platoon=points_per_platoon,
+            thresholds=thresholds,
+        )
+        if report is None:
+            continue
+        block = _format_planet_block(
+            report,
+            planet_cfg,
+            map_config.strike_name if not map_config.is_empty else None,
+        )
+        planet_blocks.append(block)
+
+    # Optional stale-data footer (appended to the LAST message).
+    footer_lines: List[str] = []
+    if include_stale_hint:
+        footer_lines = _data_age_footer(snap, age_minutes)
+
+    # Pack header + planet blocks + footer into messages, splitting at
+    # planet boundaries when needed.
+    return _pack_into_messages(header_lines, planet_blocks, footer_lines)
+
+
+def _pack_into_messages(
+    header_lines: List[str],
+    planet_blocks: List[List[str]],
+    footer_lines: List[str],
+) -> List[str]:
+    """
+    Pack content into Telegram-sized messages.
+
+    First message: header + as many planet blocks as fit.
+    Subsequent messages: continuation marker + remaining planet blocks.
+    Footer: appended to the LAST message only.
+
+    Splits ONLY at planet boundaries — never mid-planet — so each
+    planet's info stays together visually.
+
+    Returns at least one string. Always respects SOFT_MESSAGE_CAP.
+    """
+    messages: List[str] = []
+    current_lines: List[str] = list(header_lines)
+    used_blank_line_to_planet = False
+
+    def current_size() -> int:
+        return len("\n".join(current_lines))
+
+    for block in planet_blocks:
+        # Each planet block is preceded by a blank line for visual
+        # separation (unless we're at the very start of a message).
+        candidate_lines = current_lines + [""] + block
+        candidate_size = len("\n".join(candidate_lines))
+
+        if candidate_size > SOFT_MESSAGE_CAP and len(current_lines) > len(header_lines):
+            # This planet doesn't fit. Flush the current message and start
+            # a new one with this planet at the top.
+            messages.append("\n".join(current_lines).rstrip())
+            current_lines = ["_(continued)_", ""] + block
+        elif candidate_size > SOFT_MESSAGE_CAP:
+            # Edge case: the very first planet is too big to fit even
+            # in a fresh message. We accept the overflow (better to
+            # send a 4500-char message than to lose the planet info).
+            # Telegram will accept up to 4096, and our cap is 3500 with
+            # 596 chars headroom; a single planet block exceeding 3500
+            # would have to be quite elaborate.
+            current_lines = candidate_lines
+            log.warning(
+                "Planet block exceeds SOFT_MESSAGE_CAP (%d chars); "
+                "sending anyway. Consider trimming long mission name list.",
+                candidate_size,
+            )
+        else:
+            current_lines = candidate_lines
+
+    # Append footer to whatever message we're currently building.
+    if footer_lines:
+        current_lines.append("")
+        current_lines.extend(footer_lines)
+
+    if current_lines:
+        messages.append("\n".join(current_lines).rstrip())
+
+    # Final cap enforcement — should be a no-op for well-formed input
+    # but defensive.
+    return [_enforce_message_cap(m) for m in messages]
+
+
+def format_auto_summary(
+    snap: TBSnapshot,
+    map_config: Optional[MapConfig] = None,
+) -> List[str]:
+    """
+    Build the message(s) posted automatically when a new TB export arrives.
+
+    Same content as format_status, minus the data-age hint (which is
+    meaningless for a just-received export — age is zero by definition).
+    Returns a list because the content can exceed Telegram's 4096-char
+    limit and gets split at planet boundaries.
+
+    Args:
+      map_config: planet/threshold/strike-name lookups. If None or empty,
+        labels fall back to generic identifiers and star info is skipped.
+
+    Returns:
+      List of message strings, in order. Usually 1 element; can be 2+
+      for late-phase exports with many active planets.
+    """
+    return format_planet_briefing(
+        snap,
+        map_config if map_config else MapConfig(),
+        age_minutes=0,
+        include_stale_hint=False,
+    )
 
 
 def format_status(
     snap: TBSnapshot,
     *,
+    map_config: Optional[MapConfig] = None,
     age_minutes: int = 0,
-    threshold_pct: float = DEFAULT_DEPLOYMENT_THRESHOLD_PCT,
-) -> str:
+) -> List[str]:
     """
     Build the response to /tb_status.
 
-    Same exception-list content as the auto-summary, plus a one-line
-    progress block, plus a data-age hint if the snapshot is stale.
-
-    Args:
-      age_minutes: how long since the snapshot was received. The caller
-        knows this (it lives next to the cache); we don't compute it
-        ourselves because TBSnapshot.snapshot_taken_at is "when we parsed
-        it," which can differ from "when the command was issued" by a
-        few seconds — irrelevant for officers, but it lets the caller
-        decide which clock to use.
+    Same content as format_auto_summary plus a stale-data footer when the
+    cached snapshot is more than a few minutes old. Returns a list of
+    messages for the same multi-message reason as format_auto_summary.
     """
-    sections: List[List[str]] = [
-        _header_lines(snap),
-        _progress_section(snap, phase=None),
-        _deployment_section(snap, phase=None, threshold=threshold_pct),
-        _no_strikes_section(snap, phase=None),
-        _afk_section(snap, phase=None),
-        _data_age_footer(snap, age_minutes),
-    ]
-    return _assemble(sections)
+    return format_planet_briefing(
+        snap,
+        map_config if map_config else MapConfig(),
+        age_minutes=age_minutes,
+        include_stale_hint=True,
+    )
 
 
 def format_failed_specials(snap: TBSnapshot) -> str:
