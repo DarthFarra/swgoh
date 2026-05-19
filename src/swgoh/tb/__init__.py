@@ -20,6 +20,7 @@ from .analysis import (
     SpecialFailure,
     Contribution,
     PhaseProgress,
+    TerritoryProgress,
     # Exception-list queries
     members_missing_deployment,
     members_with_no_strikes,
@@ -27,6 +28,7 @@ from .analysis import (
     members_with_failed_specials,
     # Aggregate queries
     phase_progress,
+    territory_progress,
     time_remaining,
     # Ranking queries
     top_contributors,
@@ -58,12 +60,14 @@ __all__ = [
     "SpecialFailure",
     "Contribution",
     "PhaseProgress",
+    "TerritoryProgress",
     # Analysis queries
     "members_missing_deployment",
     "members_with_no_strikes",
     "members_with_no_summary",
     "members_with_failed_specials",
     "phase_progress",
+    "territory_progress",
     "time_remaining",
     "top_contributors",
     "member_phase_breakdown",

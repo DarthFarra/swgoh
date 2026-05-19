@@ -50,7 +50,7 @@ from ..tb import (
     parse_tb_snapshot,
 )
 from . import config as bot_cfg
-from .services import tb_cache
+from .services import tb_cache, tb_map_config_cache
 
 log = logging.getLogger(__name__)
 
@@ -115,7 +115,12 @@ class _TBListenerClient(discord.Client):
     async def on_ready(self) -> None:
         """Logged once after connect / reconnect. Useful for verifying
         the bot is up and in the right server."""
-      
+        log.info(
+            "Discord listener ready: user=%s id=%s watching channel_id=%d "
+            "for messages from C3PO (id=%d)",
+            self.user, self.user.id if self.user else "?",
+            self._watch_channel_id, self._c3po_user_id,
+        )
 
     async def on_message(self, message: discord.Message) -> None:
         """
@@ -228,13 +233,14 @@ class _TBListenerClient(discord.Client):
 
         # Auto-forward the summary to the officers' chat.
         try:
-            summary = format_auto_summary(snapshot)
-            await self._notify_officers(summary)
+            map_config = tb_map_config_cache.get(self._ptb_bot_data)
+            messages = format_auto_summary(snapshot, map_config)
+            await self._notify_officers(messages)
             log.info(
                 "Auto-forwarded TB summary for instance=%s round=%d "
-                "to chat_id=%d",
+                "(%d messages) to chat_id=%d",
                 snapshot.instance_id, snapshot.current_round,
-                self._auto_forward_chat_id,
+                len(messages), self._auto_forward_chat_id,
             )
         except Exception:
             log.exception(
@@ -242,24 +248,33 @@ class _TBListenerClient(discord.Client):
                 "updated successfully."
             )
 
-    async def _notify_officers(self, text: str) -> None:
+    async def _notify_officers(self, messages) -> None:
         """
-        Send a message to the configured officers' chat via the PTB Bot.
-        Any failure is logged but doesn't propagate — losing one
-        notification is preferable to crashing the listener.
+        Send one or more messages to the configured officers' chat via
+        the PTB Bot. Accepts either a single string or a list[str] (the
+        formatter returns lists to support Telegram's 4096-char limit).
+
+        Each message is sent independently — a failure on one doesn't
+        affect the others. Losing one notification is preferable to
+        crashing the listener.
         """
-        try:
-            await self._ptb_bot.send_message(
-                chat_id=self._auto_forward_chat_id,
-                text=text,
-                parse_mode="Markdown",
-                disable_web_page_preview=True,
-            )
-        except TelegramError as e:
-            log.warning(
-                "Telegram send_message failed (chat_id=%d): %s",
-                self._auto_forward_chat_id, e,
-            )
+        if isinstance(messages, str):
+            messages = [messages]
+        for i, text in enumerate(messages):
+            if not text.strip():
+                continue
+            try:
+                await self._ptb_bot.send_message(
+                    chat_id=self._auto_forward_chat_id,
+                    text=text,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+            except TelegramError as e:
+                log.warning(
+                    "Telegram send_message failed (chat_id=%d, msg %d/%d): %s",
+                    self._auto_forward_chat_id, i + 1, len(messages), e,
+                )
 
 
 # ---------------------------------------------------------------------------

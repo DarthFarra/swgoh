@@ -374,29 +374,43 @@ def _parse_zone_block(
 def _parse_current_stat(
     stat_list: Any,
     known_player_ids: set[str],
-) -> Tuple[Dict[int, PhaseStats], Dict[str, CategoryCounts]]:
+) -> Tuple[
+    Dict[int, PhaseStats],
+    Dict[str, CategoryCounts],
+    Dict[str, Dict[str, int]],
+    Dict[str, Dict[str, int]],
+]:
     """
     Process the currentStat array into:
       - phase_stats: phase_number -> PhaseStats (per-member counters per phase)
       - total_stats: player_id    -> CategoryCounts (global totals across the map)
+      - zone_member_summary: zone_id -> {player_id -> summary points contributed}
+      - zone_member_power: zone_id -> {player_id -> GP deployed}
 
-    Zone-granularity stats are aggregated into the phase they belong to
-    (which is the natural rollup) — we don't keep zone-level per-member
-    detail in this version. If a future feature needs it (e.g. "who has
-    no points in the bonus zone of phase 4"), we'd add a parallel
-    zone_member_stats dict here. Skipping it now keeps memory bounded.
+    For phase rollups: zone-granularity stats are NOT counted into phase totals
+    (CG already provides per-phase rollups via `<prefix>_round_N`, and the
+    sums equal each other — verified empirically).
 
-    Returns ({}, {}) for malformed input rather than raising — same
-    fail-soft principle as elsewhere.
+    For zone-level data: we capture two families:
+      * summary  — used for "contributors per zone" and "platoon math"
+      * power    — used for "undeployed GP to active zones" in the header
+
+    Other zone-level families (strike, covert) are skipped to keep memory
+    bounded. If a future feature needs them, add parallel dicts here.
+
+    Returns ({}, {}, {}, {}) for malformed input rather than raising —
+    same fail-soft principle as elsewhere.
     """
     if not isinstance(stat_list, list):
         log.warning("Expected `currentStat` to be a list, got %s", type(stat_list))
-        return {}, {}
+        return {}, {}, {}, {}
 
     # Mutable accumulators keyed by (phase, player_id) and player_id.
     # We materialize CategoryCounts (frozen) only once at the end.
     phase_accum: Dict[int, Dict[str, Dict[str, int]]] = {}
     total_accum: Dict[str, Dict[str, int]] = {}
+    zone_summary_accum: Dict[str, Dict[str, int]] = {}
+    zone_power_accum: Dict[str, Dict[str, int]] = {}
 
     unknown_seen: set[str] = set()
 
@@ -417,15 +431,16 @@ def _parse_current_stat(
                 unknown_seen.add(stat_id)
             continue
 
-        granularity, phase, _zone_id = _stat_granularity(stat_id)
+        granularity, phase, zone_id = _stat_granularity(stat_id)
 
-        # We only care about "total" and "phase" — zone-level is rolled up
-        # via its phase already in CG's data (the round_N totals equal the
-        # sum of zone totals for that round, verified empirically).
         if granularity == "unknown":
             log.debug("Unparseable mapStatId granularity: %r", stat_id)
             continue
-        if granularity == "zone":
+
+        # For zone-level: we care about summary (contributor count, platoon
+        # math) and power (undeployed-GP calculation). Skip other zone-level
+        # families — they'd grow the dict without a consumer.
+        if granularity == "zone" and field_name not in ("summary", "power"):
             continue
 
         player_stats = stat.get("playerStat") or []
@@ -450,10 +465,16 @@ def _parse_current_stat(
             if granularity == "total":
                 bucket = total_accum.setdefault(member_id, {})
                 bucket[field_name] = bucket.get(field_name, 0) + score
-            else:  # "phase"
+            elif granularity == "phase":
                 assert phase is not None  # narrowed by granularity check
                 ph_bucket = phase_accum.setdefault(phase, {}).setdefault(member_id, {})
                 ph_bucket[field_name] = ph_bucket.get(field_name, 0) + score
+            else:  # "zone" — only field_name in ("summary", "power") reaches here
+                assert zone_id is not None
+                if field_name == "summary":
+                    zone_summary_accum.setdefault(zone_id, {})[member_id] = score
+                else:  # "power"
+                    zone_power_accum.setdefault(zone_id, {})[member_id] = score
 
     # Materialize into frozen CategoryCounts.
     phase_stats_out: Dict[int, PhaseStats] = {}
@@ -469,7 +490,7 @@ def _parse_current_stat(
         for pid, fields in total_accum.items()
     }
 
-    return phase_stats_out, total_stats_out
+    return phase_stats_out, total_stats_out, zone_summary_accum, zone_power_accum
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +532,7 @@ def parse_tb_snapshot(raw: Dict[str, Any]) -> TBSnapshot:
     members = _parse_members(members_raw)
     known_ids = set(members.keys())
 
-    phase_stats, total_stats = _parse_current_stat(
+    phase_stats, total_stats, zone_member_summary, zone_member_power = _parse_current_stat(
         raw.get("currentStat"),
         known_player_ids=known_ids,
     )
@@ -536,6 +557,8 @@ def parse_tb_snapshot(raw: Dict[str, Any]) -> TBSnapshot:
         phase_stats=phase_stats,
         total_stats=total_stats,
         zones=zones,
+        zone_member_summary=zone_member_summary,
+        zone_member_power=zone_member_power,
     )
 
     log.info(
