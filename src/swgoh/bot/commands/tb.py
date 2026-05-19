@@ -39,7 +39,7 @@ from ...tb import (
     format_top_contributors,
 )
 from ..security import rate_limit
-from ..services import tb_cache
+from ..services import tb_cache, tb_map_config_cache
 from .. import config as bot_cfg
 
 log = logging.getLogger(__name__)
@@ -84,6 +84,35 @@ async def _check_authorized(update: Update) -> bool:
     return False
 
 
+async def _send_messages(update: Update, messages) -> None:
+    """
+    Send a list of message strings as separate Telegram messages.
+
+    The formatter returns a list because TB output can exceed Telegram's
+    4096-char limit and we split at planet boundaries. Each element is
+    a complete, parse-able Markdown message; they're sent in order.
+
+    If a single send fails (network, rate limit), we log and continue
+    with the next — losing one message is better than failing the whole
+    response.
+
+    Accepts either a list[str] (new formatter contract) or a plain str
+    (back-compat for formatters not yet migrated, e.g. format_failed_specials).
+    """
+    if isinstance(messages, str):
+        messages = [messages]
+    for i, msg in enumerate(messages):
+        if not msg.strip():
+            continue
+        try:
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        except Exception:
+            log.exception(
+                "Failed to send TB message %d/%d (continuing with remaining).",
+                i + 1, len(messages),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -111,11 +140,13 @@ async def cmd_tb_status(
         )
         return
 
-    msg = format_status(
+    map_config = tb_map_config_cache.get(context.application.bot_data)
+    messages = format_status(
         entry.snapshot,
+        map_config=map_config,
         age_minutes=tb_cache.age_minutes(entry),
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _send_messages(update, messages)
 
 
 @rate_limit(cooldown_seconds=5)
@@ -138,7 +169,7 @@ async def cmd_tb_failed_specials(
         return
 
     msg = format_failed_specials(entry.snapshot)
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _send_messages(update, msg)
 
 
 # Metrics we accept as the `by` argument to /tb_top. Kept here (rather
@@ -196,7 +227,7 @@ async def cmd_tb_top(
         n=n,
         phase=None,        # always global for this command
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await _send_messages(update, msg)
 
 
 def _parse_top_args(args: list[str]) -> tuple[str, int, Optional[str]]:
