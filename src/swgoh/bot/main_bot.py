@@ -179,6 +179,22 @@ def main() -> None:
             send_time.strftime("%H:%M"), TIMEZONE,
         )
 
+      # Load TB map config from Sheets into bot_data so commands and
+        # listener can use it. Fail-soft: missing sheets just degrade
+        # the output to generic labels.
+        from .services import tb_map_config_cache  # local import to avoid circular
+        cfg = tb_map_config_cache.load_into_bot_data(application.bot_data)
+        if cfg.is_empty:
+            log.warning(
+                "TB map config is empty — TB messages will use generic "
+                "planet labels (T1, T2...). Check TB_Map_Config tab."
+            )
+        else:
+            log.info(
+                "TB map config loaded: %d planets, %d mission names.",
+                len(cfg.planets), len(cfg.strike_names),
+            )
+
         # 6. Discord listener (optional; skipped if not configured)
         await start_discord_listener(application)
 
