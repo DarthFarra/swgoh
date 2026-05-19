@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .models import (
     CategoryCounts,
@@ -119,6 +119,176 @@ class PhaseProgress:
     total_covert_completes: int
     members_with_any_activity: int      # how many members have summary > 0
     members_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlatoonStatus:
+    """
+    Platoon completion info for one planet.
+
+    Platoons are all-or-nothing: a partially-filled platoon (1-14 of 15
+    units donated) gives 0 score. The `completed` count is derived from
+    the zone score arithmetic: `(zone_score - member_summary_sum) /
+    points_per_platoon`, rounded to nearest int. Small rounding artifacts
+    (~0.01% of zone score) appear in real CG data — those are tolerated.
+
+    Fields:
+      completed         - how many platoons are fully filled (0..platoon_count)
+      total             - total platoons on the planet (typically 6)
+      points_per_platoon - bonus points per completed platoon
+      points_earned     - completed × points_per_platoon
+      points_remaining  - (total − completed) × points_per_platoon
+    """
+    completed: int
+    total: int
+    points_per_platoon: int
+    points_earned: int
+    points_remaining: int
+
+    @property
+    def is_complete(self) -> bool:
+        return self.completed >= self.total
+
+
+@dataclass(frozen=True, slots=True)
+class StrikeMissionStatus:
+    """
+    One combat mission's status.
+
+    Fields:
+      zone_id              - full strike zone id, e.g. "..._strike01"
+      players_participated - attempts so far (max attempts = members_total)
+      members_total        - guild size, the denominator in "23/50"
+      total_score          - cumulative score earned on this mission
+      avg_score            - total_score / participated (0 if no attempts)
+      estimated_potential  - avg × (members_total − participated)
+      is_complete          - whether the zone is in state 3 or 4
+    """
+    zone_id: str
+    players_participated: int
+    members_total: int
+    total_score: int
+    avg_score: int
+    estimated_potential: int
+    is_complete: bool
+
+    @property
+    def remaining_attempts(self) -> int:
+        return max(0, self.members_total - self.players_participated)
+
+
+@dataclass(frozen=True, slots=True)
+class ThresholdGap:
+    """
+    A single unreached threshold.
+
+    Fields:
+      value         - the score threshold (target)
+      stars         - stars granted at this threshold (0 for reward-only)
+      points_short  - how many points are still needed to reach it
+    """
+    value: int
+    stars: int
+    points_short: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlanetReport:
+    """
+    Complete progress snapshot for one active planet.
+
+    Bundles every value the formatter needs to render a planet block,
+    so the formatter is purely presentational and doesn't have to call
+    six functions. Designed to be cheap to compute (one pass over the
+    snapshot data per planet).
+
+    Fields:
+      zone_id                       - full conflict zone id
+      zone_state                    - 1=LOCKED 2=ACTIVE 3=OPEN 4=COMPLETED
+      score                         - total zone score (includes platoons)
+      current_stars                 - stars earned at this score (via config)
+      max_stars                     - max stars possible (from config)
+      thresholds_remaining          - list of unreached thresholds, ascending
+      platoons                      - PlatoonStatus or None if config missing
+      missions                      - list of StrikeMissionStatus, in zone_id sort order
+      missions_combined_total_est   - sum of mission estimated potentials
+      non_participants              - members with 0 summary contribution to this zone
+    """
+    zone_id: str
+    zone_state: int
+    score: int
+    current_stars: int
+    max_stars: int
+    thresholds_remaining: List[ThresholdGap]
+    platoons: Optional[PlatoonStatus]
+    missions: List[StrikeMissionStatus]
+    missions_combined_total_est: int
+    non_participants: List[Member]
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseProgress:
+    """
+    Aggregate progress for a single phase.
+
+    All values are guild-wide sums across members. Zone-state counts let
+    the formatter say "4/6 strikes cleared" without re-querying zones.
+    """
+    phase: int
+    total_summary: int
+    total_power: int
+    total_unit_donated: int
+    total_strike_attempts: int
+    total_strike_encounters: int
+    total_covert_attempts: int
+    total_covert_completes: int
+    members_with_any_activity: int      # how many members have summary > 0
+    members_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class TerritoryProgress:
+    """
+    Progress for a single conflict zone (a 'territory' in user-facing terms).
+
+    Designed for the per-territory line in /tb_status:
+      "Territory 2:  257.6M  ·  35/50 contributing  ✓ completed"
+
+    Fields:
+      zone_id        - raw, e.g. "tb3_mixed_phase01_conflict02"
+      phase, position - derived from zone_id (position is the trailing
+                        "conflict_N" number, 1-based).
+      zone_state     - 1=locked, 2=open, 3=completed, 4=finalized (see ZoneStats).
+      score          - the zone's total score from conflictZoneStatus.
+                       This includes deployment bonuses, not just member
+                       contributions. It's what counts toward star thresholds.
+      contributing_members - number of members with > 0 summary points
+                       contributed to this zone.
+      members_total  - guild member count for the denominator.
+      strikes_completed / strikes_total
+                     - count of strike zones inside this conflict by state.
+                       strikes_total may be 0 in early phases that have no
+                       combat missions.
+    """
+    zone_id: str
+    phase: int
+    position: int           # 1-based conflict position within phase
+    zone_state: int
+    score: int
+    contributing_members: int
+    members_total: int
+    strikes_completed: int
+    strikes_total: int
+
+    @property
+    def is_completed(self) -> bool:
+        """Zone is in a 'done' state (3 or 4)."""
+        return self.zone_state in (3, 4)
+
+    @property
+    def is_locked(self) -> bool:
+        """Zone is still locked (state 1)."""
+        return self.zone_state == 1
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +494,430 @@ def phase_progress(
         members_with_any_activity=members_active,
         members_total=snap.member_count,
     )
+
+
+# Pattern to recognise conflict zones — i.e. territories — vs strike/covert/recon.
+# Conflict zones have IDs like "tb3_mixed_phase01_conflict02" with optionally
+# a "_bonus" suffix. They are top-level scoring entities, whereas strike/covert
+# zones are nested combat/special missions inside a conflict.
+def _is_conflict_zone(zone_id: str) -> bool:
+    """
+    True if zone_id is a top-level conflict (territory) zone.
+
+    Excludes:
+      - Strike/covert/recon sub-zones (they're inside conflicts, not territories).
+      - "_specialmission" zones, which appear in strikeZoneStatus but are
+        special-mission metadata entries (score=0, no real data) rather than
+        actual territories. We discovered these in real exports — they leak
+        through the simpler "no _strike/_covert/_recon" check and pollute the
+        territory list with empty rows.
+    """
+    if "_strike" in zone_id or "_covert" in zone_id or "_recon" in zone_id:
+        return False
+    if zone_id.endswith("_specialmission"):
+        return False
+    return "_conflict" in zone_id
+
+
+def _position_from_conflict_id(zone_id: str) -> int:
+    """
+    Extract the trailing conflict number: "tb3_mixed_phase04_conflict02" -> 2.
+    Returns 0 if no number is found (defensive; shouldn't happen in real data).
+
+    Bonus conflicts ("..._conflict03_bonus") share the position of their parent
+    (3 in that example) but we treat them as their own territory for display
+    purposes. We return the position number; the caller can sort by position.
+    """
+    # Strip "_bonus" if present so we look at the core conflict number.
+    core = zone_id
+    if core.endswith("_bonus"):
+        core = core[: -len("_bonus")]
+    # Find "conflict" followed by digits at the end.
+    idx = core.rfind("_conflict")
+    if idx == -1:
+        return 0
+    tail = core[idx + len("_conflict"):]
+    digits = []
+    for ch in tail:
+        if ch.isdigit():
+            digits.append(ch)
+        else:
+            break
+    try:
+        return int("".join(digits)) if digits else 0
+    except ValueError:
+        return 0
+
+
+def territory_progress(
+    snap: TBSnapshot,
+    phase: Optional[int] = None,
+    *,
+    include_locked: bool = False,
+) -> List[TerritoryProgress]:
+    """
+    Per-territory progress for a phase, ordered by position.
+
+    A "territory" is one entry in conflictZoneStatus — a top-level
+    scoring zone like "tb3_mixed_phase01_conflict02". Strike, covert,
+    and recon sub-zones are aggregated into their parent conflict's
+    record (strike completion counts), not returned as separate territories.
+
+    Args:
+      phase: which phase to report on. None = current_round.
+      include_locked: if False (default), zones in state 1 (locked) are
+        omitted from the result. Locked zones have no useful progress
+        data so showing them just adds noise.
+
+    Returns:
+      Empty list if no conflict zones exist for that phase (e.g. caller
+      asked about a phase that hasn't been reached). Otherwise sorted
+      by position (1, 2, 3, ...).
+    """
+    target_phase = _phase_or_current(snap, phase)
+
+    # Collect all conflict zones for this phase. We iterate snap.zones once
+    # rather than filtering inside conflictZoneStatus, because by the time
+    # we have a TBSnapshot the parser has already normalized zones into a
+    # single dict keyed by zone_id.
+    conflict_zones = [
+        z for z in snap.zones.values()
+        if z.phase == target_phase and _is_conflict_zone(z.zone_id)
+    ]
+    if not conflict_zones:
+        return []
+
+    # Pre-compute strike zone counts per conflict. Strike zone IDs have the
+    # form "<conflict_zone_id>_strike<NN>" — we group by the prefix.
+    # We exclude "_specialmission" entries which also live in strikeZoneStatus
+    # but aren't real combat missions (metadata zones with score=0).
+    strike_counts: Dict[str, Tuple[int, int]] = {}  # conflict_id -> (completed, total)
+    for z in snap.zones.values():
+        if z.phase != target_phase or z.zone_type != "strike":
+            continue
+        if "_strike" not in z.zone_id:
+            # e.g. "_specialmission" — not a real strike zone.
+            continue
+        # Derive parent conflict id by stripping "_strikeNN" suffix.
+        idx = z.zone_id.rfind("_strike")
+        if idx == -1:
+            continue
+        parent = z.zone_id[:idx]
+        comp, total = strike_counts.get(parent, (0, 0))
+        total += 1
+        if z.zone_state in (3, 4):
+            comp += 1
+        strike_counts[parent] = (comp, total)
+
+    out: List[TerritoryProgress] = []
+    for zone in conflict_zones:
+        if not include_locked and zone.zone_state == 1:
+            continue
+        # Contributing members: those with > 0 summary points in this zone.
+        contributing = sum(
+            1 for pts in snap.zone_member_summary.get(zone.zone_id, {}).values()
+            if pts > 0
+        )
+        strikes_comp, strikes_total = strike_counts.get(zone.zone_id, (0, 0))
+        out.append(TerritoryProgress(
+            zone_id=zone.zone_id,
+            phase=zone.phase,
+            position=_position_from_conflict_id(zone.zone_id),
+            zone_state=zone.zone_state,
+            score=zone.score,
+            contributing_members=contributing,
+            members_total=snap.member_count,
+            strikes_completed=strikes_comp,
+            strikes_total=strikes_total,
+        ))
+
+    # Sort by position; "_bonus" zones share the parent position number but
+    # come after the parent — secondary sort on the full zone_id puts the
+    # base "_conflict03" before "_conflict03_bonus" alphabetically.
+    out.sort(key=lambda t: (t.position, t.zone_id))
+    return out
+
+
+def members_not_participating_in_zone(
+    snap: TBSnapshot,
+    zone_id: str,
+) -> List[Member]:
+    """
+    Return members with zero summary contribution to a specific zone.
+
+    Uses the `zone_member_summary` field captured by the parser. A member
+    is "not participating" in a zone if they don't appear in the
+    contribution map for that zone (or appear with score 0, but the parser
+    drops zero entries).
+
+    The returned list is alphabetically sorted by player name for stable
+    display across exports.
+
+    Args:
+      zone_id: full conflict zone id, e.g. "tb3_mixed_phase04_conflict03_bonus"
+
+    Returns:
+      Empty list if everyone participated, or if the zone has no
+      contribution data at all.
+    """
+    contributors = set(snap.zone_member_summary.get(zone_id, {}).keys())
+    non_participants = [
+        m for pid, m in snap.members.items()
+        if pid not in contributors
+    ]
+    non_participants.sort(key=_stable_sort_key_by_name)
+    return non_participants
+
+
+def _strike_mission_details(
+    snap: TBSnapshot,
+    conflict_zone_id: str,
+) -> List[StrikeMissionStatus]:
+    """
+    All strike (combat mission) zones inside a conflict zone, ordered by
+    zone_id (so strike01 comes before strike02, etc.).
+
+    Excludes `_specialmission` zones (metadata entries with score=0 that
+    show up in strikeZoneStatus but aren't real missions).
+
+    Skips strikes with `_strike` not in their ID — extra defensive filter
+    for the same case.
+
+    Returns empty list if no strike zones are found (e.g. for a conflict
+    that has no combat missions in this TB type).
+    """
+    members_total = snap.member_count
+    out: List[StrikeMissionStatus] = []
+
+    for zone in snap.zones.values():
+        if zone.zone_type != "strike":
+            continue
+        if "_strike" not in zone.zone_id:
+            continue
+        if "_specialmission" in zone.zone_id:
+            continue
+        # Strike zone IDs have the form "<conflict>_strike<NN>". Find
+        # the conflict prefix by stripping the "_strike..." suffix.
+        idx = zone.zone_id.rfind("_strike")
+        if zone.zone_id[:idx] != conflict_zone_id:
+            continue
+
+        participated = zone.players_participated
+        total_score = zone.score
+        avg = total_score // participated if participated > 0 else 0
+        remaining = max(0, members_total - participated)
+        est_potential = avg * remaining
+
+        out.append(StrikeMissionStatus(
+            zone_id=zone.zone_id,
+            players_participated=participated,
+            members_total=members_total,
+            total_score=total_score,
+            avg_score=avg,
+            estimated_potential=est_potential,
+            is_complete=zone.zone_state in (3, 4),
+        ))
+
+    out.sort(key=lambda m: m.zone_id)
+    return out
+
+
+def _platoon_status(
+    zone_score: int,
+    summary_zone_sum: int,
+    platoon_count: int,
+    points_per_platoon: int,
+) -> Optional[PlatoonStatus]:
+    """
+    Derive platoon completion from the score arithmetic.
+
+    The bonus score on a conflict zone = `zone_score - sum(member contributions)`,
+    and that bonus is composed of N × points_per_platoon where N is the
+    number of completed platoons (all-or-nothing per platoon).
+
+    Returns None if points_per_platoon is 0 (config missing or zero — we
+    can't divide).
+
+    The rounding handles the small (<1%) noise we observe in real CG data
+    where summary sums occasionally drift by a few thousand points from
+    what arithmetic predicts.
+    """
+    if points_per_platoon <= 0 or platoon_count <= 0:
+        return None
+
+    bonus_score = max(0, zone_score - summary_zone_sum)
+    ideal = bonus_score / points_per_platoon
+    completed = max(0, min(platoon_count, round(ideal)))
+
+    # Sanity warning if rounding distance is large — could indicate the
+    # config has wrong points_per_platoon for this zone.
+    error = abs(bonus_score - completed * points_per_platoon)
+    error_pct = error / max(1, zone_score)
+    if error_pct > 0.05:
+        log.warning(
+            "Platoon math sanity: zone bonus=%d, expected %d×%d=%d, "
+            "off by %d (%.1f%% of zone score). Check points_per_platoon "
+            "in TB_Map_Config.",
+            bonus_score, completed, points_per_platoon,
+            completed * points_per_platoon, error, error_pct * 100,
+        )
+
+    return PlatoonStatus(
+        completed=completed,
+        total=platoon_count,
+        points_per_platoon=points_per_platoon,
+        points_earned=completed * points_per_platoon,
+        points_remaining=(platoon_count - completed) * points_per_platoon,
+    )
+
+
+def planet_report(
+    snap: TBSnapshot,
+    zone_id: str,
+    *,
+    platoon_count: Optional[int] = None,
+    points_per_platoon: Optional[int] = None,
+    thresholds: Optional[List[Tuple[int, int]]] = None,
+) -> Optional[PlanetReport]:
+    """
+    Build the full progress report for one planet (conflict zone).
+
+    Args:
+      zone_id: full conflict zone id
+      platoon_count: from map_config; None disables platoon section
+      points_per_platoon: from map_config; None disables platoon section
+      thresholds: list of (value, stars) tuples, in ascending order; from
+        map_config. None or empty disables star info.
+
+    Returns None if the zone doesn't exist in the snapshot. (Shouldn't
+    happen if the caller filtered first, but defensive.)
+
+    The function reads three things from the snapshot:
+      1. The zone's score and state (snap.zones)
+      2. Member contributions to this zone (snap.zone_member_summary)
+      3. Strike sub-zones for this conflict (filtered from snap.zones)
+
+    All values are computed in one pass — no I/O, no expensive ops.
+    """
+    zone = snap.zones.get(zone_id)
+    if zone is None:
+        return None
+
+    score = zone.score
+
+    # Star/threshold calculations (only if config provided thresholds)
+    current_stars = 0
+    max_stars = 0
+    thresholds_remaining: List[ThresholdGap] = []
+    if thresholds:
+        # Sort thresholds ascending by value to be safe (config loader does
+        # this already, but defensive).
+        sorted_thresholds = sorted(thresholds, key=lambda t: t[0])
+        for value, stars in sorted_thresholds:
+            max_stars += stars
+            if score >= value:
+                current_stars += stars
+            else:
+                thresholds_remaining.append(ThresholdGap(
+                    value=value,
+                    stars=stars,
+                    points_short=value - score,
+                ))
+
+    # Platoon status (only if config provided platoon math)
+    summary_zone_sum = sum(snap.zone_member_summary.get(zone_id, {}).values())
+    platoons: Optional[PlatoonStatus] = None
+    if platoon_count is not None and points_per_platoon is not None:
+        platoons = _platoon_status(
+            zone_score=score,
+            summary_zone_sum=summary_zone_sum,
+            platoon_count=platoon_count,
+            points_per_platoon=points_per_platoon,
+        )
+
+    # Strike missions for this conflict
+    missions = _strike_mission_details(snap, zone_id)
+    missions_combined_total_est = sum(m.estimated_potential for m in missions)
+
+    # Members with zero contribution
+    non_participants = members_not_participating_in_zone(snap, zone_id)
+
+    return PlanetReport(
+        zone_id=zone_id,
+        zone_state=zone.zone_state,
+        score=score,
+        current_stars=current_stars,
+        max_stars=max_stars,
+        thresholds_remaining=thresholds_remaining,
+        platoons=platoons,
+        missions=missions,
+        missions_combined_total_est=missions_combined_total_est,
+        non_participants=non_participants,
+    )
+
+
+def active_planet_zones(snap: TBSnapshot) -> List[str]:
+    """
+    All zone IDs that are currently active (state 2 ACTIVE or 3 OPEN).
+
+    These are the planets accepting attacks right now — what officers
+    want to see in the auto-message. Excludes LOCKED (state 1, not yet
+    available) and COMPLETED (state 4, phase ended, locked in).
+
+    Returns zone IDs sorted by (phase, position) so the output is
+    deterministic across exports.
+    """
+    out: List[Tuple[int, int, str]] = []
+    for zone in snap.zones.values():
+        if not _is_conflict_zone(zone.zone_id):
+            continue
+        if zone.zone_state not in (2, 3):
+            continue
+        position = _position_from_conflict_id(zone.zone_id)
+        out.append((zone.phase, position, zone.zone_id))
+    out.sort()
+    # Bonus zones share parent's position — use full zone_id as tiebreaker
+    # so "..._conflict03" sorts before "..._conflict03_bonus" alphabetically.
+    out.sort(key=lambda t: (t[0], t[1], t[2]))
+    return [zid for _, _, zid in out]
+
+
+def undeployed_gp_for_active_zones(
+    snap: TBSnapshot,
+    active_zone_ids: List[str],
+) -> Tuple[int, int]:
+    """
+    Compute (undeployed_gp_total, total_gp) summed across the guild for
+    the *currently active* zones.
+
+    Definition (agreed in conversation): "GP not deployed to active zones
+    in the current round." Note that in SWGoH, a single member's GP is
+    deployable to one (and only one) zone per phase; carry-over zones
+    from earlier phases keep their original deployments. So "undeployed
+    to active zones" = total GP minus the sum of what each member has
+    deployed to any currently-active zone.
+
+    Reads `zone_member_power` (per-zone deployment) populated by the
+    parser. If that field is missing or empty (e.g. a snapshot from an
+    older parser version), returns (0, total_gp) to make the absence
+    visible rather than silently wrong.
+    """
+    total_gp = sum(m.galactic_power for m in snap.members.values())
+
+    if not snap.zone_member_power:
+        # Parser didn't capture power_zone data. Return total_gp and 0
+        # undeployed so caller can decide whether to display this section.
+        return 0, total_gp
+
+    # For each member, sum their power contribution across all active zones.
+    per_member_deployed: Dict[str, int] = {}
+    for zone_id in active_zone_ids:
+        for pid, power in snap.zone_member_power.get(zone_id, {}).items():
+            per_member_deployed[pid] = per_member_deployed.get(pid, 0) + power
+
+    total_deployed = sum(per_member_deployed.values())
+    undeployed = max(0, total_gp - total_deployed)
+    return undeployed, total_gp
 
 
 def time_remaining(snap: TBSnapshot) -> Optional[timedelta]:
