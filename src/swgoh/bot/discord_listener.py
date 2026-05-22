@@ -43,14 +43,26 @@ from typing import Optional
 import discord
 from telegram.error import TelegramError
 from telegram.ext import Application
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 
 from ..tb import (
     ParseError,
     format_auto_summary,
     parse_tb_snapshot,
 )
+
+from ..tb.formatters import auto_summary_undeployed
+
 from . import config as bot_cfg
 from .services import tb_cache, tb_map_config_cache
+from .services.sheets import open_ss, resolve_label_name_by_guild_id
+from .services.tb_undeployed_cache import (
+    UndeployedMember,
+    UndeployedSnapshot,
+    set_snapshot as set_undeployed_snapshot,
+  )
+
 
 log = logging.getLogger(__name__)
 
@@ -230,51 +242,159 @@ class _TBListenerClient(discord.Client):
             snapshot,
             source_filename=attachment.filename,
         )
-
-        # Auto-forward the summary to the officers' chat.
+      # Auto-forward the summary to the officers' chat.
+      try:
+        map_config = tb_map_config_cache.get(self._ptb_bot_data)
+        messages = format_auto_summary(snapshot, map_config)
+        # Capture the undeployed list at THIS exact moment, so the
+        # auto-summary's inline buttons act on the same members the
+        # message displays — not a recomputed list.
+        undeployed_rows = auto_summary_undeployed(snapshot)
+        
+        # Resolve sheet-side guild label (None if guild not in sheet —
+        # in which case we still post the message, just without buttons).
+        label, _gname = (None, None)
         try:
-            map_config = tb_map_config_cache.get(self._ptb_bot_data)
-            messages = format_auto_summary(snapshot, map_config)
-            await self._notify_officers(messages)
-            log.info(
-                "Auto-forwarded TB summary for instance=%s round=%d "
-                "(%d messages) to chat_id=%d",
-                snapshot.instance_id, snapshot.current_round,
-                len(messages), self._auto_forward_chat_id,
-            )
+          ss = open_ss()
+          label, _gname = resolve_label_name_by_guild_id(ss, snapshot.guild_id)
         except Exception:
-            log.exception(
-                "Failed to format or forward auto-summary; cache was still "
-                "updated successfully."
+          # Sheets unreachable. Send the message text-only — better
+          # than failing the whole notification.
+          log.exception("Sheets lookup failed; sending auto-summary without buttons.")
+        
+        await self._notify_officers(
+          messages,
+          guild_id=snapshot.guild_id if undeployed_rows and label else None,
+          undeployed_rows=undeployed_rows if label else (),
+          guild_name_for_cache=snapshot.guild_name,
+        )
+        log.info(
+          "Auto-forwarded TB summary for instance=%s round=%d "
+          "guild=%s undeployed=%d (%d messages) to chat_id=%d",
+          snapshot.instance_id, snapshot.current_round,
+          snapshot.guild_id, len(undeployed_rows),
+          len(messages), self._auto_forward_chat_id,
+        )
+      except Exception:
+        log.exception(
+          "Failed to format or forward auto-summary; cache was still "
+          "updated successfully."
+        )      
+
+# ----------------------------------------------------------------------------
+# Replacement of `_notify_officers`
+# ----------------------------------------------------------------------------
+ 
+async def _notify_officers(
+    self,
+    messages,
+    *,
+    guild_id: Optional[str] = None,
+    undeployed_rows: tuple = (),
+    guild_name_for_cache: str = "",
+) -> None:
+    """
+    Send one or more messages to the officers' chat via the PTB Bot.
+ 
+    If `guild_id` is provided AND `undeployed_rows` is non-empty, we
+    attach inline buttons to the LAST message ("Send DMs", "Publish to
+    channel") and cache the undeployed list keyed by the resulting
+    Telegram message_id so the callback handlers can act on it.
+ 
+    Buttons are attached only to the last message of a multi-message
+    response because:
+      - Officers see the buttons in context with the displayed list.
+      - Adding buttons to each part would duplicate the action targets.
+      - The current minimal format always produces one message, but
+        the API contract handles future multi-message cases cleanly.
+ 
+    Args:
+      messages: str or list[str] from format_auto_summary.
+      guild_id: snap.guild_id (C3PO/CG id). When None, no buttons attached.
+      undeployed_rows: tuple of _UndeployedRow from auto_summary_undeployed.
+        Empty means no buttons (and no cache write).
+      guild_name_for_cache: snap.guild_name, denormalized into the cache
+        so callbacks don't need to re-read the snapshot.
+    """
+    if isinstance(messages, str):
+        messages = [messages]
+ 
+    attach_buttons = bool(guild_id) and bool(undeployed_rows)
+ 
+    for i, text in enumerate(messages):
+        if not text.strip():
+            continue
+ 
+        is_last = (i == len(messages) - 1)
+        reply_markup = None
+        if attach_buttons and is_last:
+            reply_markup = _build_undeployed_keyboard(guild_id)
+ 
+        try:
+            sent = await self._ptb_bot.send_message(
+                chat_id=self._auto_forward_chat_id,
+                text=text,
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+                reply_markup=reply_markup,
             )
-
-    async def _notify_officers(self, messages) -> None:
-        """
-        Send one or more messages to the configured officers' chat via
-        the PTB Bot. Accepts either a single string or a list[str] (the
-        formatter returns lists to support Telegram's 4096-char limit).
-
-        Each message is sent independently — a failure on one doesn't
-        affect the others. Losing one notification is preferable to
-        crashing the listener.
-        """
-        if isinstance(messages, str):
-            messages = [messages]
-        for i, text in enumerate(messages):
-            if not text.strip():
-                continue
-            try:
-                await self._ptb_bot.send_message(
-                    chat_id=self._auto_forward_chat_id,
-                    text=text,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
+        except TelegramError as e:
+            log.warning(
+                "Telegram send_message failed (chat_id=%d, msg %d/%d): %s",
+                self._auto_forward_chat_id, i + 1, len(messages), e,
+            )
+            continue
+ 
+        # If this is the last message AND we attached buttons, cache
+        # the undeployed list keyed by the sent message_id so the
+        # callbacks can act on it later.
+        if attach_buttons and is_last and sent is not None:
+            cache_members = tuple(
+                UndeployedMember(
+                    player_id=r.player_id,
+                    player_name=r.player_name,
+                    deployed_gp=r.deployed_gp,
+                    roster_gp=r.roster_gp,
+                    missing_gp=r.missing_gp,
+                    pct_deployed=r.pct_deployed,
                 )
-            except TelegramError as e:
-                log.warning(
-                    "Telegram send_message failed (chat_id=%d, msg %d/%d): %s",
-                    self._auto_forward_chat_id, i + 1, len(messages), e,
-                )
+                for r in undeployed_rows
+            )
+            set_undeployed_snapshot(
+                self._ptb_bot_data,
+                message_id=sent.message_id,
+                snapshot=UndeployedSnapshot(
+                    guild_id=guild_id,
+                    guild_name=guild_name_for_cache,
+                    members=cache_members,
+                ),
+            )
+ 
+ 
+def _build_undeployed_keyboard(guild_id: str) -> "InlineKeyboardMarkup":
+    """
+    Two buttons: send DMs, publish to channel. Same row.
+ 
+    callback_data encodes the guild_id so the handler doesn't need
+    user_data session state (which would tie buttons to whoever sent
+    the auto-summary, but the bot — not a user — sent it).
+ 
+    Callback prefixes are namespaced with `tbu` (TB undeployed) to
+    avoid collision with the existing `tickets*` callbacks.
+    """
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # local import to avoid moving file-level imports
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📨 Enviar DMs",
+                callback_data=f"tbudm:{guild_id}",
+            ),
+            InlineKeyboardButton(
+                "📢 Publicar en avisos",
+                callback_data=f"tbupub:{guild_id}",
+            ),
+        ],
+    ])
 
 
 # ---------------------------------------------------------------------------
