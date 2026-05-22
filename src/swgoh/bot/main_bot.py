@@ -29,7 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram.ext import ApplicationBuilder
 
 from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE
-from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications,)
+from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications
 from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs
 from .jobs.send_assignments_daily import job_send_assignments
