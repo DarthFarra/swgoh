@@ -157,6 +157,104 @@ def get_channel_config_for_guild(
         return channel_id, thread_id
     return None, None
 
+def get_tb_channel_config_for_guild(
+    ss, guild_name: str
+) -> tuple[Optional[str], Optional[int]]:
+    """
+    Returns (channel_id, tb_thread_id) for guild_name.
+ 
+    Reuses the existing `announcements_channel` column (same channel as
+    ticket notifications) but pulls the thread id from a SEPARATE
+    column `tb_notifications_thread` — TB and tickets live in different
+    forum topics within the same channel.
+ 
+    Returns (None, None) if:
+      - the guild row isn't found,
+      - announcements_channel is missing or empty,
+      - the tb_notifications_thread column is absent.
+ 
+    Returns (channel_id, None) if the channel is configured but the
+    thread column is missing/empty/unparseable — caller can still post,
+    just to the channel's default topic.
+ 
+    Why a separate function vs extending get_channel_config_for_guild:
+      The existing function returns (channel, announcements_thread).
+      Changing its return type would break every caller; adding a
+      sibling function localizes the change. The implementation duplicates
+      ~10 lines, which is acceptable given the column-name difference is
+      the actual contract.
+    """
+    ws = ss.worksheet(GUILDS_SHEET)
+    headers, rows = _get_all(ws)
+    hl = [h.strip().lower() for h in headers]
+ 
+    if "guild name" not in hl or "announcements_channel" not in hl:
+        return None, None
+ 
+    i_name = hl.index("guild name")
+    i_ch   = hl.index("announcements_channel")
+    i_thread = (
+        hl.index("tb_notifications_thread")
+        if "tb_notifications_thread" in hl
+        else None
+    )
+ 
+    for r in rows:
+        gn = (r[i_name] if i_name < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        channel_id = (r[i_ch] if i_ch < len(r) else "").strip() or None
+        thread_id: Optional[int] = None
+        if i_thread is not None:
+            raw_thread = (r[i_thread] if i_thread < len(r) else "").strip()
+            if raw_thread:
+                try:
+                    thread_id = int(raw_thread)
+                except ValueError:
+                    log.warning(
+                        "Guilds row for %r has malformed tb_notifications_thread: %r",
+                        guild_name, raw_thread,
+                    )
+        return channel_id, thread_id
+ 
+    return None, None
+ 
+ 
+def resolve_label_name_by_guild_id(
+    ss, guild_id: str
+) -> tuple[Optional[str], Optional[str]]:
+    """
+    Look up (label, guild_name) for a C3PO/CG guild id.
+ 
+    Used by the TB auto-summary path which only has the CG guild_id
+    (from snap.guild_id or the export filename prefix) and needs to
+    find the sheet's stored label + name.
+ 
+    Returns (None, None) if the guild isn't in the sheet — caller
+    should treat that as "not configured for TB notifications" and
+    skip the buttons.
+ 
+    The existing `resolve_label_name_rote_by_id` returns a 3-tuple
+    that includes ROTE-specific data we don't need here. A new lookup
+    keeps the contract small.
+    """
+    ws = ss.worksheet(GUILDS_SHEET)
+    headers, rows = _get_all(ws)
+    hl = [h.strip().lower() for h in headers]
+    if "guild id" not in hl or "guild name" not in hl:
+        return None, None
+    i_id   = hl.index("guild id")
+    i_name = hl.index("guild name")
+    # "label" column is optional; fall back to guild name when absent.
+    i_lbl  = hl.index("label") if "label" in hl else None
+    for r in rows:
+        gid = (r[i_id] if i_id < len(r) else "").strip()
+        if gid != guild_id:
+            continue
+        gn = (r[i_name] if i_name < len(r) else "").strip()
+        lbl = (r[i_lbl] if (i_lbl is not None and i_lbl < len(r)) else "").strip()
+        return (lbl or gn), gn
+    return None, None
 
 # ---------------------------------------------------------------------------
 # Usuarios
