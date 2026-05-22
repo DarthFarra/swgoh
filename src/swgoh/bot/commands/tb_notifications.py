@@ -2,14 +2,14 @@
 """
 Callback handlers for the auto-summary's inline buttons.
 
-The buttons themselves are built in discord_listener._build_undeployed_keyboard
-and attached to the auto-summary message when it's sent. This module
-provides the four callbacks that handle them:
+The buttons are built in discord_listener._build_undeployed_keyboard and
+attached to the auto-summary message when it's sent. This module provides
+the four callbacks that handle them:
 
-  tbudm:{guild_id}          — DM confirm step (shows Yes/Cancel)
-  tbudmconfirm:{guild_id}   — DM execution (sends DMs, reports result)
-  tbupub:{guild_id}         — Publish-to-channel confirm step
-  tbupubconfirm:{guild_id}  — Publish execution
+  tbudm:{guild_id}                          — DM confirm step
+  tbudmconfirm:{guild_id}:{original_msg_id} — DM execution
+  tbupub:{guild_id}                         — Publish-to-channel confirm
+  tbupubconfirm:{guild_id}:{original_msg_id}— Publish execution
 
 Pattern follows commands/tickets.py — same two-step confirm-then-act
 shape, same MarkdownV2 dialect for the result messages, same "edit the
@@ -22,17 +22,38 @@ Authorization:
   member could tap a button. So we authorize at the action site.
 
 Cache contract:
-  The undeployed list is read from `tb_undeployed_cache` keyed by
-  `update.callback_query.message.message_id`. If the cache entry is
-  gone (>48h TTL, or bot restart), we show "session expired" and stop.
-  This is intentional and acceptable — the message is stale enough
-  that re-running /tb export is the right action.
+  The undeployed list is read from `tb_undeployed_cache`, keyed by the
+  ORIGINAL auto-summary's message_id. The CONFIRM step reads that id
+  directly from q.message.message_id (the buttons live on the original).
+  The EXECUTE step receives the original's message_id THROUGH the
+  callback_data, encoded by the confirm handler when it built the
+  Yes-button.
+
+  Why callback_data and not Telegram's reply_to_message:
+    PTB v20's Message.reply_text() does NOT set reply_to_message_id by
+    default — that's the v13 behavior. We could pass do_quote=True to
+    restore it, but encoding the message_id explicitly in callback_data
+    is robust against future PTB API changes and removes the implicit
+    dependency on Telegram's "did the reply chain attach?" semantics.
+
+If the cache entry is gone (>48h TTL, or bot restart), we show
+"session expired" and stop. This is intentional and acceptable —
+the message is stale enough that re-running /tb export is the right
+action.
 
 PTB API note:
   bot_data is accessed via `context.application.bot_data` — NOT via
   `q.bot.application.bot_data`. CallbackQuery has no public `.bot`
   attribute in PTB v20+. The `context` argument is the canonical
   access path for application state inside a callback.
+
+Callback_data size budget:
+  Telegram caps callback_data at 64 bytes. With the encoded form:
+    "tbudmconfirm:<22-char-guild-id>:<up-to-19-digit-message-id>"
+    = 12 + 1 + 22 + 1 + 19 = 55 bytes max.
+  Comfortable headroom. We hard-check in _build_confirm_callback() so
+  any future prefix change that pushes us over gets caught at build
+  time rather than failing silently when Telegram rejects the keyboard.
 """
 from __future__ import annotations
 
@@ -69,6 +90,10 @@ _CB_DM_CONFIRM_PREFIX     = "tbudm:"
 _CB_DM_EXECUTE_PREFIX     = "tbudmconfirm:"
 _CB_PUB_CONFIRM_PREFIX    = "tbupub:"
 _CB_PUB_EXECUTE_PREFIX    = "tbupubconfirm:"
+_CB_CANCEL_PREFIX         = "tbucancel:"
+
+# Telegram's hard limit on callback_data; we enforce in _build_confirm_callback.
+_CALLBACK_DATA_MAX_BYTES = 64
 
 
 # ---------------------------------------------------------------------------
@@ -99,30 +124,85 @@ def _disable_buttons_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([])
 
 
+def _build_confirm_callback(
+    execute_prefix: str,
+    guild_id: str,
+    original_message_id: int,
+) -> str:
+    """
+    Build a confirm-step Yes-button callback_data, embedding the original
+    auto-summary's message_id so the execute handler can find the cache
+    entry without depending on Telegram's reply-linkage semantics.
+
+    Raises ValueError if the result exceeds Telegram's 64-byte limit.
+    This is a build-time guard: if our prefix or id formats ever grow
+    such that we'd silently fail at button-creation time, we want a loud
+    error instead.
+    """
+    data = f"{execute_prefix}{guild_id}:{original_message_id}"
+    if len(data.encode("utf-8")) > _CALLBACK_DATA_MAX_BYTES:
+        raise ValueError(
+            f"callback_data exceeds {_CALLBACK_DATA_MAX_BYTES}-byte limit: "
+            f"{len(data)} bytes for {data!r}"
+        )
+    return data
+
+
+def _parse_execute_callback(
+    data: str,
+    expected_prefix: str,
+) -> Optional[tuple[str, int]]:
+    """
+    Parse an execute-step callback_data: "prefix:guild_id:message_id".
+
+    Returns (guild_id, message_id) on success, None on any malformed input.
+    Logs a warning when malformed because that means we built a button
+    incorrectly somewhere, not a user issue.
+    """
+    if not data.startswith(expected_prefix):
+        return None
+    tail = data[len(expected_prefix):]
+    parts = tail.rsplit(":", 1)  # rsplit so guild_id with hypothetical ':' survives
+    if len(parts) != 2:
+        log.warning("Malformed execute callback_data: %r", data)
+        return None
+    guild_id, msg_id_str = parts
+    if not guild_id:
+        log.warning("Empty guild_id in callback_data: %r", data)
+        return None
+    try:
+        msg_id = int(msg_id_str)
+    except ValueError:
+        log.warning("Non-integer message_id in callback_data: %r", data)
+        return None
+    return guild_id, msg_id
+
+
 # ---------------------------------------------------------------------------
 # Resolver helpers
 #
 # Both the CONFIRM step (button on the auto-summary message) and the
 # EXECUTE step (button on the confirm dialog) need to:
 #   1. Validate the callback_data prefix and extract guild_id.
-#   2. Look up the cached undeployed snapshot by message_id.
+#   2. Look up the cached undeployed snapshot by the ORIGINAL auto-
+#      summary's message_id.
 #   3. Resolve the guild label/name from the sheet.
 #   4. Authorize the user as a guild officer.
 #
-# They differ in WHICH message_id keys the cache:
-#   - CONFIRM step: q.message.message_id IS the original auto-summary.
-#   - EXECUTE step: q.message is the confirm dialog. The original
-#     auto-summary is q.message.reply_to_message (Telegram populates
-#     this when the dialog was sent via reply_text()).
+# They differ in WHERE the original message_id comes from:
+#   - CONFIRM step: q.message.message_id IS the original.
+#   - EXECUTE step: the original's message_id is encoded in callback_data
+#     (see _build_confirm_callback above).
 # ---------------------------------------------------------------------------
 
-async def _resolve_or_reply(
+async def _resolve_confirm_step(
     q,
     context: ContextTypes.DEFAULT_TYPE,
     callback_data_prefix: str,
 ) -> Optional[tuple[str, str, str, UndeployedSnapshot]]:
     """
-    CONFIRM-step resolver. Cache key is q.message.message_id.
+    CONFIRM-step resolver. Cache key is q.message.message_id (the
+    auto-summary message itself).
 
     Returns (guild_id, sheet_label, sheet_gname, cached_snapshot) on
     success; returns None and posts a user-facing error if any step fails.
@@ -145,8 +225,10 @@ async def _resolve_or_reply(
         try:
             await q.edit_message_reply_markup(reply_markup=None)
         except Exception:
-            # Best-effort: the message may no longer be editable.
-            log.debug("Could not remove buttons from expired auto-summary.", exc_info=True)
+            log.debug(
+                "Could not remove buttons from expired auto-summary.",
+                exc_info=True,
+            )
         await q.message.reply_text(
             "_Sesión expirada \\(este mensaje tiene más de 48h o el bot "
             "se reinició\\)\\. Ejecuta /tb export en Discord para refrescar\\._",
@@ -155,9 +237,8 @@ async def _resolve_or_reply(
         return None
 
     if snapshot.guild_id != guild_id:
-        # Defensive: button claims one guild, cache says another.
         log.error(
-            "Cache guild_id mismatch: button=%s cache=%s message_id=%d",
+            "Cache guild_id mismatch (confirm): button=%s cache=%s message_id=%d",
             guild_id, snapshot.guild_id, q.message.message_id,
         )
         await q.answer("Estado inconsistente. Reintenta /tb export.", show_alert=True)
@@ -172,41 +253,34 @@ async def _resolve_execute_step(
     prefix: str,
 ) -> Optional[tuple[str, str, str, UndeployedSnapshot]]:
     """
-    EXECUTE-step resolver. Cache key is the ORIGINAL auto-summary's
-    message_id, reached via q.message.reply_to_message (populated by
-    Telegram when the confirm dialog was sent via reply_text()).
+    EXECUTE-step resolver. Cache key is the original auto-summary's
+    message_id, extracted from callback_data (NOT from reply_to_message,
+    which is unreliable in PTB v20 group/topic chats).
     """
-    data = q.data or ""
-    if not data.startswith(prefix):
-        await q.answer()
-        return None
-    guild_id = data[len(prefix):]
-    if not guild_id:
+    parsed = _parse_execute_callback(q.data or "", prefix)
+    if parsed is None:
         await q.answer("Datos inválidos.", show_alert=True)
         return None
-
-    original = q.message.reply_to_message
-    if original is None:
-        # Shouldn't happen given how we built the dialog, but cope.
-        log.warning("Execute callback fired with no reply_to_message; q.message=%r", q.message)
-        await q.answer("No encuentro el mensaje original.", show_alert=True)
-        return None
+    guild_id, original_message_id = parsed
 
     snapshot = get_undeployed_snapshot(
-        context.application.bot_data, original.message_id
+        context.application.bot_data, original_message_id
     )
     if snapshot is None:
         await q.answer()
-        await q.edit_message_text(
-            "_Sesión expirada\\. Ejecuta /tb export para refrescar\\._",
-            parse_mode=ParseMode.MARKDOWN_V2,
-        )
+        try:
+            await q.edit_message_text(
+                "_Sesión expirada\\. Ejecuta /tb export para refrescar\\._",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+        except Exception:
+            log.debug("Could not edit expired confirm dialog.", exc_info=True)
         return None
 
     if snapshot.guild_id != guild_id:
         log.error(
             "Cache guild_id mismatch (execute): button=%s cache=%s message_id=%d",
-            guild_id, snapshot.guild_id, original.message_id,
+            guild_id, snapshot.guild_id, original_message_id,
         )
         await q.answer("Estado inconsistente.", show_alert=True)
         return None
@@ -223,8 +297,7 @@ async def _resolve_authorization(
     Common authorization tail: look up the guild in the sheet,
     re-verify the user has the leadership role.
 
-    Factored out because both confirm and execute resolvers need the
-    same exact behavior here, and duplication would invite drift.
+    Factored out because both resolvers need identical behavior here.
     """
     try:
         ss = open_ss()
@@ -235,7 +308,6 @@ async def _resolve_authorization(
         return None
 
     if not gname:
-        # Guild exists in cache but not in sheet — config drift.
         log.warning(
             "TB undeployed callback for guild_id=%s but no matching sheet row.",
             guild_id,
@@ -257,9 +329,15 @@ async def _resolve_authorization(
 # ---------------------------------------------------------------------------
 
 async def cb_tbu_dm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Step 1 of DM flow — show the confirmation dialog."""
+    """
+    Step 1 of DM flow — show the confirmation dialog.
+
+    The Yes-button's callback_data embeds the auto-summary's message_id
+    so the execute step can find the cache entry without depending on
+    Telegram's reply-linkage semantics.
+    """
     q = update.callback_query
-    resolved = await _resolve_or_reply(q, context, _CB_DM_CONFIRM_PREFIX)
+    resolved = await _resolve_confirm_step(q, context, _CB_DM_CONFIRM_PREFIX)
     if resolved is None:
         return
     guild_id, label, _gname, snapshot = resolved
@@ -267,22 +345,25 @@ async def cb_tbu_dm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     n = len(snapshot.members)
     if n == 0:
-        # Defensive — empty undeployed list shouldn't have shown buttons,
-        # but cope.
         await q.message.reply_text(
             "Todos han desplegado\\. Nada que enviar\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
         )
         return
 
+    # q.message.message_id IS the original auto-summary at confirm time.
+    yes_callback = _build_confirm_callback(
+        _CB_DM_EXECUTE_PREFIX, guild_id, q.message.message_id
+    )
+
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"Sí, enviar a {n}",
-            callback_data=f"{_CB_DM_EXECUTE_PREFIX}{guild_id}",
+            callback_data=yes_callback,
         ),
         InlineKeyboardButton(
             "Cancelar",
-            callback_data=f"tbucancel:{guild_id}",
+            callback_data=f"{_CB_CANCEL_PREFIX}{guild_id}",
         ),
     ]])
     await q.message.reply_text(
@@ -363,7 +444,7 @@ async def cb_tbu_publish_confirm(
 ) -> None:
     """Step 1 of publish flow — validate channel config, show confirm."""
     q = update.callback_query
-    resolved = await _resolve_or_reply(q, context, _CB_PUB_CONFIRM_PREFIX)
+    resolved = await _resolve_confirm_step(q, context, _CB_PUB_CONFIRM_PREFIX)
     if resolved is None:
         return
     guild_id, label, gname, snapshot = resolved
@@ -397,14 +478,18 @@ async def cb_tbu_publish_confirm(
         )
         return
 
+    yes_callback = _build_confirm_callback(
+        _CB_PUB_EXECUTE_PREFIX, guild_id, q.message.message_id
+    )
+
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             f"Sí, publicar ({n} miembros)",
-            callback_data=f"{_CB_PUB_EXECUTE_PREFIX}{guild_id}",
+            callback_data=yes_callback,
         ),
         InlineKeyboardButton(
             "Cancelar",
-            callback_data=f"tbucancel:{guild_id}",
+            callback_data=f"{_CB_CANCEL_PREFIX}{guild_id}",
         ),
     ]])
 
