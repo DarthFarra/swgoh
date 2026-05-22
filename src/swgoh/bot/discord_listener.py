@@ -242,44 +242,44 @@ class _TBListenerClient(discord.Client):
             snapshot,
             source_filename=attachment.filename,
         )
-      # Auto-forward the summary to the officers' chat.
-      try:
-        map_config = tb_map_config_cache.get(self._ptb_bot_data)
-        messages = format_auto_summary(snapshot, map_config)
-        # Capture the undeployed list at THIS exact moment, so the
-        # auto-summary's inline buttons act on the same members the
-        # message displays — not a recomputed list.
-        undeployed_rows = auto_summary_undeployed(snapshot)
-        
-        # Resolve sheet-side guild label (None if guild not in sheet —
-        # in which case we still post the message, just without buttons).
-        label, _gname = (None, None)
+        # Auto-forward the summary to the officers' chat.
         try:
-          ss = open_ss()
-          label, _gname = resolve_label_name_by_guild_id(ss, snapshot.guild_id)
-        except Exception:
-          # Sheets unreachable. Send the message text-only — better
-          # than failing the whole notification.
-          log.exception("Sheets lookup failed; sending auto-summary without buttons.")
+          map_config = tb_map_config_cache.get(self._ptb_bot_data)
+          messages = format_auto_summary(snapshot, map_config)
+          # Capture the undeployed list at THIS exact moment, so the
+          # auto-summary's inline buttons act on the same members the
+          # message displays — not a recomputed list.
+          undeployed_rows = auto_summary_undeployed(snapshot)
         
-        await self._notify_officers(
-          messages,
-          guild_id=snapshot.guild_id if undeployed_rows and label else None,
-          undeployed_rows=undeployed_rows if label else (),
-          guild_name_for_cache=snapshot.guild_name,
-        )
-        log.info(
-          "Auto-forwarded TB summary for instance=%s round=%d "
-          "guild=%s undeployed=%d (%d messages) to chat_id=%d",
-          snapshot.instance_id, snapshot.current_round,
-          snapshot.guild_id, len(undeployed_rows),
-          len(messages), self._auto_forward_chat_id,
-        )
-      except Exception:
-        log.exception(
-          "Failed to format or forward auto-summary; cache was still "
-          "updated successfully."
-        )      
+          # Resolve sheet-side guild label (None if guild not in sheet —
+          # in which case we still post the message, just without buttons).
+          label, _gname = (None, None)
+          try:
+            ss = open_ss()
+            label, _gname = resolve_label_name_by_guild_id(ss, snapshot.guild_id)
+          except Exception:
+            # Sheets unreachable. Send the message text-only — better
+            # than failing the whole notification.
+            log.exception("Sheets lookup failed; sending auto-summary without buttons.")
+        
+          await self._notify_officers(
+            messages,
+            guild_id=snapshot.guild_id if undeployed_rows and label else None,
+            undeployed_rows=undeployed_rows if label else (),
+            guild_name_for_cache=snapshot.guild_name,
+          )
+          log.info(
+            "Auto-forwarded TB summary for instance=%s round=%d "
+            "guild=%s undeployed=%d (%d messages) to chat_id=%d",
+            snapshot.instance_id, snapshot.current_round,
+            snapshot.guild_id, len(undeployed_rows),
+            len(messages), self._auto_forward_chat_id,
+          )
+        except Exception:
+          log.exception(
+            "Failed to format or forward auto-summary; cache was still "
+            "updated successfully."
+          )      
 
 # ----------------------------------------------------------------------------
 # Replacement of `_notify_officers`
