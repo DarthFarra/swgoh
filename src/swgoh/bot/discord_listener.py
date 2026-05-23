@@ -32,13 +32,21 @@ What we deliberately do NOT do:
     (Send Messages was deliberately not granted).
   - Trust attachment content blindly. We size-check before download and
     validate the JSON parse before touching the cache.
+
+Telegram routing:
+  - TB_AUTO_FORWARD_CHAT_ID: target chat (required).
+  - TB_AUTO_FORWARD_THREAD_ID: optional forum-topic id within that chat.
+    When set, every outbound message includes message_thread_id; the
+    auto-summary lands in that topic. When 0/unset, no thread is
+    specified — Telegram posts to the chat's main topic (works for
+    non-forum chats and for forum chats' "General" topic alike).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import discord
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -111,6 +119,7 @@ class _TBListenerClient(discord.Client):
         c3po_user_id: int,
         watch_channel_id: int,
         auto_forward_chat_id: int,
+        auto_forward_thread_id: int,
         intents: discord.Intents,
     ) -> None:
         super().__init__(intents=intents)
@@ -119,17 +128,26 @@ class _TBListenerClient(discord.Client):
         self._c3po_user_id = c3po_user_id
         self._watch_channel_id = watch_channel_id
         self._auto_forward_chat_id = auto_forward_chat_id
+        # 0 means "no thread"; the actual send_message call omits the
+        # message_thread_id kwarg entirely in that case so Telegram
+        # treats it as a normal chat post.
+        self._auto_forward_thread_id = auto_forward_thread_id
 
     # ---- discord.py event handlers ----
 
     async def on_ready(self) -> None:
         """Logged once after connect / reconnect. Useful for verifying
         the bot is up and in the right server."""
+        thread_note = (
+            f" thread={self._auto_forward_thread_id}"
+            if self._auto_forward_thread_id else ""
+        )
         log.info(
             "Discord listener ready: user=%s id=%s watching channel_id=%d "
-            "for messages from C3PO (id=%d)",
+            "for messages from C3PO (id=%d); forwarding to chat_id=%d%s",
             self.user, self.user.id if self.user else "?",
             self._watch_channel_id, self._c3po_user_id,
+            self._auto_forward_chat_id, thread_note,
         )
 
     async def on_message(self, message: discord.Message) -> None:
@@ -306,6 +324,13 @@ class _TBListenerClient(discord.Client):
           - The current minimal format always produces one message, but
             the API contract handles future multi-message cases cleanly.
 
+        Thread routing:
+          When self._auto_forward_thread_id is non-zero, message_thread_id
+          is included in the send call so the message lands in that
+          forum topic. When zero, the kwarg is omitted entirely — this
+          is the correct way to "post to no specific thread" on Telegram
+          (passing message_thread_id=0 is NOT the same as omitting it).
+
         Args:
           messages: str or list[str] from format_auto_summary.
           guild_id: snap.guild_id (C3PO/CG id). When None, no buttons attached.
@@ -328,18 +353,28 @@ class _TBListenerClient(discord.Client):
             if attach_buttons and is_last:
                 reply_markup = _build_undeployed_keyboard(guild_id)
 
+            # Build kwargs incrementally so message_thread_id is OMITTED
+            # (not set to 0) when no thread is configured. Telegram
+            # treats absent vs 0 differently, and 0 is rejected on
+            # non-forum chats.
+            send_kwargs: dict[str, Any] = {
+                "chat_id": self._auto_forward_chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+                "reply_markup": reply_markup,
+            }
+            if self._auto_forward_thread_id:
+                send_kwargs["message_thread_id"] = self._auto_forward_thread_id
+
             try:
-                sent = await self._ptb_bot.send_message(
-                    chat_id=self._auto_forward_chat_id,
-                    text=text,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True,
-                    reply_markup=reply_markup,
-                )
+                sent = await self._ptb_bot.send_message(**send_kwargs)
             except TelegramError as e:
                 log.warning(
-                    "Telegram send_message failed (chat_id=%d, msg %d/%d): %s",
-                    self._auto_forward_chat_id, i + 1, len(messages), e,
+                    "Telegram send_message failed (chat_id=%d thread_id=%d, msg %d/%d): %s",
+                    self._auto_forward_chat_id,
+                    self._auto_forward_thread_id,
+                    i + 1, len(messages), e,
                 )
                 continue
 
@@ -464,6 +499,12 @@ async def start_discord_listener(application: Application) -> None:
     c3po_id = getattr(bot_cfg, "DISCORD_C3PO_USER_ID", 0) or 0
     channel_id = getattr(bot_cfg, "DISCORD_WATCH_CHANNEL_ID", 0) or 0
     forward_chat = getattr(bot_cfg, "TB_AUTO_FORWARD_CHAT_ID", 0) or 0
+    # Optional — defaults to 0 (no thread). Negative values are never
+    # valid (Telegram topic ids are positive integers), but we don't
+    # reject them here; the validation happens at send time via the
+    # 'if self._auto_forward_thread_id:' guard, which treats 0 and
+    # negatives equivalently as "do not include the kwarg".
+    forward_thread = getattr(bot_cfg, "TB_AUTO_FORWARD_THREAD_ID", 0) or 0
 
     if not token:
         log.warning("DISCORD_BOT_TOKEN not set; Discord listener disabled.")
@@ -486,12 +527,22 @@ async def start_discord_listener(application: Application) -> None:
         )
         return
 
+    if forward_thread < 0:
+        # Defensive — a negative thread id is never valid. Log and
+        # treat as 0 (= no thread) rather than failing startup.
+        log.warning(
+            "TB_AUTO_FORWARD_THREAD_ID=%d is negative; treating as 0.",
+            forward_thread,
+        )
+        forward_thread = 0
+
     client = _TBListenerClient(
         ptb_bot_data=application.bot_data,
         ptb_bot=application.bot,
         c3po_user_id=c3po_id,
         watch_channel_id=channel_id,
         auto_forward_chat_id=forward_chat,
+        auto_forward_thread_id=forward_thread,
         intents=_build_intents(),
     )
 
