@@ -217,10 +217,21 @@ OMICRON_RECOMMEND_TOP_N: int = _int("OMICRON_RECOMMEND_TOP_N", 5)
 # - TB_AUTO_FORWARD_CHAT_ID: numeric Telegram chat ID where auto-summaries
 #   should be posted. For group chats this is a negative number.
 
+# # Optional:
+# # - TB_AUTO_FORWARD_THREAD_ID: if the auto-forward chat is a forum
+# #   supergroup, the numeric ID of the topic where the summary should
+# #   land. Find it by opening the topic in Telegram, right-click the
+# #   topic title → "Copy Link to Topic" — the URL has the form
+# #   t.me/c/<channel>/<TOPIC_ID>; use that TOPIC_ID. (If the URL ends
+# #   in a third number, that's a specific message inside the topic,
+# #   not the topic id — use the MIDDLE number.)
+# #   Leave unset (or 0) for chats without topics enabled.
+
 DISCORD_BOT_TOKEN:         str = _optional("DISCORD_BOT_TOKEN")
 DISCORD_C3PO_USER_ID:      int = _int("DISCORD_C3PO_USER_ID",      752366060312723546)
 DISCORD_WATCH_CHANNEL_ID:  int = _int("DISCORD_WATCH_CHANNEL_ID",  1505865122982137876)
 TB_AUTO_FORWARD_CHAT_ID:   int = _int("TB_AUTO_FORWARD_CHAT_ID",   7367477801)
+TB_AUTO_FORWARD_THREAD_ID: int = _int("TB_AUTO_FORWARD_THREAD_ID", 0)
 
 # Optional: chats allowed to run /tb_status, /tb_failed_specials, /tb_top.
 # Defaults to SYNC_DATA_ALLOWED_CHATS if not set.
