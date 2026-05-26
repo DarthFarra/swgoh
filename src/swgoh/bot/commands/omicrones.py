@@ -76,10 +76,6 @@ _S_MODES  = "omi_modes"
 CB_GUILD = "omi"
 CB_MODE  = "omimode"
 
-# Hard timeout on the Comlink call. Reasoning: PTB callback queries
-# should answer within ~10s for a good UX, and Comlink player calls
-# normally complete in 1-3s. 10s leaves headroom without making the
-# user stare at "loading…" forever.
 _COMLINK_TIMEOUT_S = 10.0
 
 
@@ -122,7 +118,6 @@ async def cb_omi_guild(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = q.from_user.id
     ss      = open_ss()
 
-    # Never trust callback_data — re-validate against the user's own guilds.
     guilds    = usuarios_guilds_for_user(ss, user_id)
     known_ids = {gid for _, gid, _ in guilds}
     try:
@@ -171,8 +166,6 @@ async def _show_mode_picker(
             await update.message.reply_text(msg)
         return
 
-    # Persist context. Modes can contain spaces, so we pass them by index
-    # in callback_data and keep the actual strings in the session.
     session_set(context, user_id, _S_GID,   gid)
     session_set(context, user_id, _S_GNAME, gname)
     session_set(context, user_id, _S_LABEL, label)
@@ -213,7 +206,6 @@ async def cb_omi_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = q.from_user.id
     ss      = open_ss()
 
-    # Guild whitelist
     guilds    = usuarios_guilds_for_user(ss, user_id)
     known_ids = {gid for _, gid, _ in guilds}
     try:
@@ -224,7 +216,6 @@ async def cb_omi_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
 
-    # Mode whitelist — re-fetch live if the session is gone (process restart).
     modes: List[str] = session_get(context, user_id, _S_MODES) or list_omicron_modes(ss)
     if not (0 <= mode_idx < len(modes)):
         await q.edit_message_text("❌ Modo no válido. Vuelve a empezar con /omicrones.")
@@ -236,7 +227,6 @@ async def cb_omi_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"❌ No encuentro tu alias en '{gname}'.")
         return
 
-    # We need the player's Comlink Player Id, populated by /syncguild.
     player_id = player_id_for_alias(ss, gname, alias)
     if not player_id:
         await q.edit_message_text(
@@ -245,8 +235,6 @@ async def cb_omi_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Read the omicron catalog — needed both for ID→name translation and
-    # to feed the engine.
     catalog = read_omicron_catalog(ss)
     if not catalog:
         await q.edit_message_text(
@@ -256,17 +244,13 @@ async def cb_omi_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     priorities = read_omicron_priorities(ss, gname, mode_text)
 
-    # Progress message — user sees it before the Comlink call starts.
     await q.edit_message_text(
         f"⏳ Consultando Comlink para *{alias}*…",
         parse_mode="Markdown",
     )
 
-    # Unit catalog (base_id → name, base_id → is_ship). Cached 1h.
     base_to_name, is_ship_by_base = load_unit_catalog(ss, context.application.bot_data)
 
-    # Live fetch with timeout. Two failure paths to handle: timeout
-    # (asyncio.TimeoutError) and everything else (network, 5xx, etc.).
     try:
         state = await fetch_player_state(
             player_id=player_id,
@@ -287,7 +271,6 @@ async def cb_omi_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Translate IDs → the keys the engine expects.
     skill_tiers_by_key = _build_skill_tiers_by_key(state.skill_tiers_by_id, catalog)
     relics_by_char = _build_relics_by_char(state.relic_by_base_id, base_to_name)
 
@@ -310,7 +293,7 @@ async def cb_omi_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Translation helpers (Comlink-ID-keyed → engine-key-keyed)
+# Translation helpers
 # ---------------------------------------------------------------------------
 
 def _build_skill_tiers_by_key(
@@ -320,11 +303,6 @@ def _build_skill_tiers_by_key(
     """
     Translate {skill_id: tier} from Comlink into {skill_key_norm: tier}
     using the omicron catalog as the mapping table.
-
-    If a skill_id appears in Comlink data but not in the catalog, it's
-    ignored (we don't care about non-omicron skills here).
-
-    Two catalog entries could in theory share a skill_id; if so, take max.
     """
     out: Dict[str, int] = {}
     for entry in catalog:
@@ -342,10 +320,6 @@ def _build_relics_by_char(
     """
     Translate {base_id: comlink_currentTier|None} into
     {character_name_norm: relic_level_int|None}.
-
-    None propagates (ships). Unknown base_ids (not in the unit catalog)
-    are skipped — without a friendly name we can't match to the catalog's
-    character_name column.
     """
     out: Dict[str, Optional[int]] = {}
     for base_id, current_tier in relic_by_base_id.items():
@@ -389,10 +363,13 @@ def _render_message(
             f"con las columnas: Guild Name, Mode, Skill, Priority, Notes."
         )
 
-    # Case B: priorities exist but no actionable recommendation
+    # Case B: priorities exist but no actionable recommendations to show
     if not recs:
-        if (stats["already_have"] >= stats["priorities_matched_catalog"]
-                and stats["priorities_matched_catalog"] > 0):
+        # B1: nothing actionable AND nothing excluded → user has them all
+        if (stats["actionable_pending"] == 0
+                and stats["excluded_not_owned"] == 0
+                and stats["excluded_low_relic"] == 0
+                and stats["already_have"] > 0):
             return (
                 f"{header}\n"
                 f"🎉 ¡Tienes todos los omicrones prioritarios para "
@@ -400,11 +377,12 @@ def _render_message(
                 f"_({stats['already_have']} de "
                 f"{stats['priorities_matched_catalog']} prioridades cumplidas)_"
             )
+        # B2: nothing actionable because everything is excluded or unmatched
         lines = [header, "No hay recomendaciones aplicables ahora mismo.", ""]
-        lines.append(_stats_block(stats, min_relic))
+        lines.append(_summary_block(stats, min_relic))
         return "\n".join(lines)
 
-    # Case C: actionable recommendations
+    # Case C: actionable recommendations to show
     lines = [header]
     for i, r in enumerate(recs, start=1):
         if r.player_relic is None or r.player_relic < 0:
@@ -416,30 +394,74 @@ def _render_message(
             lines.append(f"   ↳ _{r.notes}_")
 
     lines.append("")
-    lines.append(_stats_block(stats, min_relic))
+    lines.append(_summary_block(stats, min_relic))
     return "\n".join(lines)
 
 
-def _stats_block(stats: Dict[str, int], min_relic: int) -> str:
-    """Compact footer with diagnostic counts."""
-    parts = [
-        f"_Resumen_: "
-        f"{stats['already_have']} tienes / "
-        f"{stats['priorities_matched_catalog']} prioridades del gremio."
-    ]
-    notes = []
-    if stats["excluded_not_owned"]:
-        notes.append(f"{stats['excluded_not_owned']} personajes no desbloqueados")
-    if stats["excluded_low_relic"]:
-        notes.append(f"{stats['excluded_low_relic']} por debajo de R{min_relic}")
-    if stats["priorities_unmatched"]:
-        notes.append(
-            f"{stats['priorities_unmatched']} prioridades sin correspondencia "
-            f"(revisar OmicronPriorities)"
+def _summary_block(stats: Dict[str, int], min_relic: int) -> str:
+    """
+    Build the summary footer.
+
+    Design goals:
+      - Every number is unambiguous: anyone can verify it against the
+        OmicronPriorities sheet without doing arithmetic in their head.
+      - Counters with value 0 are omitted (no "0 personajes excluidos"
+        noise).
+      - The "displayed N of M" line only appears if top_n actually
+        truncated something.
+      - Three sections, each on its own line: progress, truncation,
+        exclusions / catalog issues.
+
+    Reads from these stats keys (see compute_recommendations docstring
+    for invariants):
+      already_have, actionable_pending, recommended,
+      excluded_not_owned, excluded_low_relic, priorities_unmatched
+    """
+    lines: List[str] = []
+
+    # --- Progress line: always shown.
+    # Show "X cumplidas, Y pendientes" relative to actionable items;
+    # the totals (matched / sheet) come after, so users can sanity-check.
+    progress = (
+        f"_Progreso_: {stats['already_have']} cumplidas, "
+        f"{stats['actionable_pending']} pendientes."
+    )
+    lines.append(progress)
+
+    # --- Truncation line: only if top_n actually capped the list.
+    not_shown = stats["actionable_pending"] - stats["recommended"]
+    if not_shown > 0:
+        lines.append(
+            f"_Mostrando_: {stats['recommended']} de "
+            f"{stats['actionable_pending']} pendientes "
+            f"(faltan {not_shown} por mostrar)."
         )
-    if notes:
-        parts.append("_Excluidos_: " + ", ".join(notes) + ".")
-    return "\n".join(parts)
+
+    # --- Exclusions: only if non-zero. Pluralised manually because
+    # Spanish doesn't like English-style "1 personaje(s)".
+    excluded_parts: List[str] = []
+    if stats["excluded_not_owned"]:
+        n = stats["excluded_not_owned"]
+        excluded_parts.append(
+            f"{n} {'personaje no desbloqueado' if n == 1 else 'personajes no desbloqueados'}"
+        )
+    if stats["excluded_low_relic"]:
+        n = stats["excluded_low_relic"]
+        excluded_parts.append(f"{n} por debajo de R{min_relic}")
+    if excluded_parts:
+        lines.append("_Excluidos_: " + ", ".join(excluded_parts) + ".")
+
+    # --- Catalog warning: priorities in the sheet that don't match any
+    # known omicron skill (typos / wrong mode / renamed by CG).
+    if stats["priorities_unmatched"]:
+        n = stats["priorities_unmatched"]
+        lines.append(
+            f"⚠️ {n} "
+            f"{'prioridad' if n == 1 else 'prioridades'} sin correspondencia "
+            f"en el catálogo (revisar *OmicronPriorities*)."
+        )
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
