@@ -37,10 +37,17 @@ from .jobs.send_assignments_daily import job_send_assignments
 from .services.sync_runner import run_sync_guilds_once, run_sync_data
 
 logging.basicConfig(
-    logging.getLogger("httpx").setLevel(logging.WARNING)  
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
+
+# httpx logs full request URLs at INFO, which for Telegram API calls
+# contain the bot token in the path. Silence httpx INFO globally and
+# rely on PTB's own debug logging when we need request visibility.
+# This is defense-in-depth on top of the redaction filter — even if
+# the filter misses a token format, the log line never exists.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 log = logging.getLogger(__name__)
 
 # Install token-redaction filter on every root handler so secrets
