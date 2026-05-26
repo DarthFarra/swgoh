@@ -16,6 +16,13 @@ Architecture notes:
     re-aggregate or re-fetch.
   - Aggregation is a pure function (`aggregate`) — easy to unit-test
     without touching Comlink or gspread.
+
+Mode grouping:
+  Some catalog modes are presentation duplicates of one another
+  (e.g. Grand Arena / Grand Arena 3v3 / Grand Arena 5v5 are all
+  unified under "GAC" in the table). MODE_GROUPS maps raw catalog
+  modes to display modes. Modes not in the map pass through unchanged.
+  Only used by this module; /omicrones still operates on raw modes.
 """
 from __future__ import annotations
 
@@ -32,8 +39,35 @@ from .comlink_player import fetch_player_state, PlayerOmicronState
 log = logging.getLogger(__name__)
 
 
-# Mode abbreviations for the table header. Falls back to the full name
-# for any mode not listed here (e.g., a brand-new mode CG adds).
+# ---------------------------------------------------------------------------
+# Mode grouping & abbreviation
+# ---------------------------------------------------------------------------
+
+# Map raw catalog mode → display mode used in the summary. Add new
+# entries here if CG ever splits a mode into sub-formats again.
+#
+# Important: each raw mode must point to a display mode that is ALSO
+# a valid key in MODE_SHORT (or, equivalently, that fall-through to the
+# raw name is acceptable). "Grand Arena" appears in both because GA 3v3
+# and GA 5v5 both fold into it, and MODE_SHORT already knows it.
+MODE_GROUPS: Dict[str, str] = {
+    "Grand Arena":     "Grand Arena",
+    "Grand Arena 3v3": "Grand Arena",
+    "Grand Arena 5v5": "Grand Arena",
+}
+
+
+def group_mode(mode_text: str) -> str:
+    """
+    Return the display mode for a raw catalog mode_text. Modes not in
+    MODE_GROUPS pass through unchanged.
+    """
+    return MODE_GROUPS.get(mode_text, mode_text)
+
+
+# Abbreviations for the table header / button labels. Falls back to the
+# full name for any mode not listed here (e.g., a brand-new mode CG
+# adds before MODE_SHORT is updated).
 MODE_SHORT: Dict[str, str] = {
     "Territory War":       "TW",
     "Grand Arena":         "GAC",
@@ -64,20 +98,21 @@ class GuildOmicronSummary:
     """
     All the data the renderers (table + drill-down) need.
 
-    guild_id is stored so the drill-down handler can re-check that the
-    clicker is still an officer in this guild — defence in depth in case
-    the cache token leaks.
+    NOTE: `modes`, `catalog_totals`, `catalog_by_mode`, and
+    `skill_counts_by_mode` are keyed by *display* mode (post-grouping),
+    not by raw catalog mode. This is what callers want — they show the
+    user the grouped view.
     """
     guild_id: str
     guild_name: str
     guild_label: str
-    modes: List[str]                                  # alphabetical, stable
-    catalog_totals: Dict[str, int]                    # mode → total in catalog
-    catalog_by_mode: Dict[str, List[OmicronEntry]]    # mode → entries (for drill-down ordering)
+    modes: List[str]                                  # display modes, alphabetical
+    catalog_totals: Dict[str, int]                    # display mode → total in catalog
+    catalog_by_mode: Dict[str, List[OmicronEntry]]    # display mode → entries
     players: List[PlayerOmicronCounts]                # sorted by alias
-    skill_counts_by_mode: Dict[str, Dict[str, int]]   # mode → skill_key → players_with_omicron
-    failed_player_aliases: List[str]                  # for footer
-    total_players: int                                # convenience: len(players)
+    skill_counts_by_mode: Dict[str, Dict[str, int]]   # display mode → skill_key → count
+    failed_player_aliases: List[str]
+    total_players: int
     elapsed_seconds: float
 
 
@@ -95,11 +130,10 @@ def cache_summary(bot_data: dict, summary: GuildOmicronSummary) -> str:
     callback_data. The token is generated with `secrets`, so it can't be
     guessed across summaries.
     """
-    token = secrets.token_urlsafe(6)  # ~8 chars; well under callback_data 64-byte limit
+    token = secrets.token_urlsafe(6)
     cache = bot_data.setdefault(_CACHE_KEY, {})
     cache[token] = (time.monotonic(), summary)
 
-    # Opportunistic pruning. Cache stays small in practice.
     now = time.monotonic()
     expired = [k for k, (ts, _) in cache.items() if now - ts > _CACHE_TTL]
     for k in expired:
@@ -109,7 +143,7 @@ def cache_summary(bot_data: dict, summary: GuildOmicronSummary) -> str:
 
 
 def get_cached_summary(bot_data: dict, token: str) -> Optional[GuildOmicronSummary]:
-    """Return cached summary if still valid; else None (caller shows expiry message)."""
+    """Return cached summary if still valid; else None."""
     cache = bot_data.setdefault(_CACHE_KEY, {})
     entry = cache.get(token)
     if entry is None:
@@ -141,15 +175,8 @@ async def fetch_all_players(
     Fan out fetch_player_state() across `players` with bounded concurrency.
 
     Returns {player_id: state_or_None}. None means the per-player fetch
-    failed — the caller treats it as "no data" and renders that row as
+    failed — the caller treats it as 'no data' and renders that row as
     failed, rather than aborting the whole summary.
-
-    progress(done, total) is awaited after each player completes so the
-    caller can update a Telegram message. Errors raised by `progress` are
-    swallowed — progress reporting must never abort the fetch.
-
-    Concurrency=5 is conservative; Comlink rate limits have been observed
-    around 10-20 req/s. Tune via the caller if needed.
     """
     sem = asyncio.Semaphore(concurrency)
 
@@ -206,20 +233,32 @@ def aggregate(
     Counts an omicron as 'applied' iff player_tier >= entry.omicron_tier
     (both on the in-game tier scale; see _roster_parse for why).
 
-    For players whose fetch failed, the row is still emitted (so the
-    table is dense and aliases are in alphabetical order without gaps);
-    counts are zero and fetch_ok=False. The renderer shows '—' for
-    these cells and a footer counting them.
+    Mode grouping: every catalog entry's raw mode is passed through
+    group_mode() so that, e.g., Grand Arena + Grand Arena 3v3 + Grand
+    Arena 5v5 all roll up into a single "Grand Arena" column. The
+    user-confirmed invariant is that each skill belongs to exactly one
+    raw mode, so summing counts across the grouped raw modes can't
+    double-count any single applied omicron.
+
+    For players whose fetch failed, the row is still emitted with
+    fetch_ok=False so the table stays alphabetically dense; the
+    renderer shows '—' for those cells.
     """
-    modes = sorted({e.mode_text for e in catalog}, key=str.lower)
+    # Compute the *display* mode set: each catalog mode mapped through
+    # group_mode(), then deduplicated and sorted alphabetically.
+    display_modes = sorted(
+        {group_mode(e.mode_text) for e in catalog},
+        key=str.lower,
+    )
 
-    catalog_totals: Dict[str, int] = {m: 0 for m in modes}
-    catalog_by_mode: Dict[str, List[OmicronEntry]] = {m: [] for m in modes}
+    catalog_totals: Dict[str, int] = {m: 0 for m in display_modes}
+    catalog_by_mode: Dict[str, List[OmicronEntry]] = {m: [] for m in display_modes}
     for e in catalog:
-        catalog_totals[e.mode_text] = catalog_totals.get(e.mode_text, 0) + 1
-        catalog_by_mode.setdefault(e.mode_text, []).append(e)
+        dm = group_mode(e.mode_text)
+        catalog_totals[dm] = catalog_totals.get(dm, 0) + 1
+        catalog_by_mode.setdefault(dm, []).append(e)
 
-    skill_counts_by_mode: Dict[str, Dict[str, int]] = {m: {} for m in modes}
+    skill_counts_by_mode: Dict[str, Dict[str, int]] = {m: {} for m in display_modes}
     player_rows: List[PlayerOmicronCounts] = []
     failed: List[str] = []
 
@@ -229,17 +268,18 @@ def aggregate(
             failed.append(alias)
             player_rows.append(PlayerOmicronCounts(
                 alias=alias,
-                counts_by_mode={m: 0 for m in modes},
+                counts_by_mode={m: 0 for m in display_modes},
                 fetch_ok=False,
             ))
             continue
 
-        per_mode = {m: 0 for m in modes}
+        per_mode = {m: 0 for m in display_modes}
         for entry in catalog:
+            dm = group_mode(entry.mode_text)
             player_tier = state.skill_tiers_by_id.get(entry.skill_id, 0)
             if player_tier >= entry.omicron_tier:
-                per_mode[entry.mode_text] = per_mode.get(entry.mode_text, 0) + 1
-                bucket = skill_counts_by_mode.setdefault(entry.mode_text, {})
+                per_mode[dm] = per_mode.get(dm, 0) + 1
+                bucket = skill_counts_by_mode.setdefault(dm, {})
                 bucket[entry.skill_key] = bucket.get(entry.skill_key, 0) + 1
 
         player_rows.append(PlayerOmicronCounts(
@@ -252,7 +292,7 @@ def aggregate(
         guild_id=guild_id,
         guild_name=guild_name,
         guild_label=guild_label,
-        modes=modes,
+        modes=display_modes,
         catalog_totals=catalog_totals,
         catalog_by_mode=catalog_by_mode,
         players=player_rows,
