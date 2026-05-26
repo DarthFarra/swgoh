@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 # Uses MarkdownV2 escaping at format-time, not in the template.
 _DM_REMINDER_TEMPLATE = (
     "⚠️ Recordatorio TB\\! "
-    "Aún te quedan *{missing}* GP por desplegar "
+    "Aún te quedan *{missing}* GP "
     "\\(desplegados {deployed} de {roster}, {pct}%\\)\\. "
     "Despliega lo antes posible\\."
 )
@@ -177,7 +177,7 @@ def _render_channel_post(
         else:
             name_part = _md2(m.player_name)
         missing = _md2(_fmt_gp(m.missing_gp))
-        lines.append(f"• {name_part} — {missing} GP por desplegar")
+        lines.append(f"• {name_part} — {missing} GP")
 
     return "\n".join(lines)
 
