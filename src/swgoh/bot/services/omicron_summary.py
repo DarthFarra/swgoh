@@ -74,6 +74,8 @@ MODE_SHORT: Dict[str, str] = {
     "Territory Battles":   "TB",
     "Conquest":            "CQ",
     "Galactic Challenges": "GC",
+    "Raid":                "Raid",
+
 }
 
 
