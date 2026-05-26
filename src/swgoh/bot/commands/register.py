@@ -129,8 +129,16 @@ async def cb_register_method(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def msg_register_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Defensive: anonymous channel admins, linked-channel auto-forwards,
+    # and similar updates arrive without an effective_user. The filter
+    # in get_handlers() already restricts this handler to private chats,
+    # but we guard here too so the handler is safe even if the filter
+    # is later changed or removed.
+    if not update.effective_user or not update.message:
+        return
     user_id = update.effective_user.id
     waiting = session_get(context, user_id, _S_WAITING, False)
+    
     if not waiting:
         return  # not in a registration flow
 
@@ -187,5 +195,11 @@ def get_handlers():
         CommandHandler("registrar", cmd_register),
         CallbackQueryHandler(cb_register_guild,  pattern=r"^reg:gid:"),
         CallbackQueryHandler(cb_register_method, pattern=r"^regm:"),
-        MessageHandler(filters.TEXT & ~filters.COMMAND, msg_register_value),
+        # Registration only runs in DMs. ChatType.PRIVATE prevents this
+        # handler from firing on group messages, channel auto-forwards,
+        # or anonymous admin posts.
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            msg_register_value,
+        ),
     ]
