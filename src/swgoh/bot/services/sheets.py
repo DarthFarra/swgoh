@@ -548,6 +548,35 @@ def list_players_for_guild(ss, guild_name: str) -> List[Tuple[str, str]]:
                 players.append((name, name))
     return sorted(players, key=lambda x: x[0].lower())
 
+def list_players_with_id_for_guild(ss, guild_name: str) -> List[Tuple[str, str]]:
+    """
+    Returns [(alias, player_id), ...] for the guild, sorted alphabetically
+    on alias (case-insensitive). Players with empty Player Id are
+    excluded (they'll appear after the next /syncguild).
+ 
+    Used by guild-wide commands that need to call Comlink per player
+    (e.g., /omicronsummary). Reads the Players sheet exactly once.
+    """
+    ws = ss.worksheet(PLAYERS_SHEET)
+    headers, rows = _get_all(ws)
+    hl = [h.lower() for h in headers]
+    try:
+        i_gn   = hl.index("guild name")
+        i_name = hl.index("player name")
+        i_pid  = hl.index("player id")
+    except ValueError:
+        return []
+    out: List[Tuple[str, str]] = []
+    for r in rows:
+        gn = (r[i_gn] if i_gn < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        name = (r[i_name] if i_name < len(r) else "").strip()
+        pid  = (r[i_pid]  if i_pid  < len(r) else "").strip()
+        if name and pid:
+            out.append((name, pid))
+    return sorted(out, key=lambda x: x[0].lower())
+
 def player_id_for_alias(ss, guild_name: str, alias: str) -> Optional[str]:
     """
     Returns the Player Id for (guild_name, alias), or None if
