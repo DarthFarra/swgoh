@@ -37,6 +37,7 @@ from .jobs.send_assignments_daily import job_send_assignments
 from .services.sync_runner import run_sync_guilds_once, run_sync_data
 
 logging.basicConfig(
+    logging.getLogger("httpx").setLevel(logging.WARNING)  
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
