@@ -54,6 +54,10 @@ MODE_GROUPS: Dict[str, str] = {
     "Grand Arena":     "Grand Arena",
     "Grand Arena 3v3": "Grand Arena",
     "Grand Arena 5v5": "Grand Arena",
+    "Raid": "Otros",
+    "Galactic Challenges": "Otros",
+    "Conquest": "Otros",
+
 }
 
 
@@ -69,12 +73,14 @@ def group_mode(mode_text: str) -> str:
 # full name for any mode not listed here (e.g., a brand-new mode CG
 # adds before MODE_SHORT is updated).
 MODE_SHORT: Dict[str, str] = {
-    "Territory War":       "TW",
+    "Territory Wars":      "TW",
     "Grand Arena":         "GAC",
     "Territory Battles":   "TB",
     "Conquest":            "CQ",
     "Galactic Challenges": "GC",
     "Raid":                "Raid",
+    "Otros":               "Otros",
+
 
 }
 
