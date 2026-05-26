@@ -175,7 +175,7 @@ def render_tickets_yesterday(
     label = _escape_md(guild_label)
 
     if not missed and not new_members:
-        return f"✅ *{label}* — Todos contribuyeron sus tickets ayer\!"
+        return f"✅ *{label}* — Todos contribuyeron sus tickets ayer\\!"
 
     lines = [f"📅 *{label}* — Tickets pendientes ayer:\n"]
 
