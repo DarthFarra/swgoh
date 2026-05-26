@@ -85,9 +85,14 @@ def _request(path: str, body: Union[dict, list, str, bytes], timeout: float = 30
         # the log line is sufficient; callers don't need the raw body.
         log.error("HTTP %s %s at %s | body_preview=%s", e.code, e.reason, path, err_body)
         raise RuntimeError(f"HTTP {e.code} {e.reason} at {path}") from None
+
     except urllib.error.URLError as e:
-        log.error("URL error at %s: %s", path, e)
-        raise RuntimeError(f"URL error at {path}: {e}") from None
+        # URLError often has no useful str(); the real cause is in .reason
+        # which is typically the underlying OSError/socket.gaierror.
+        reason = getattr(e, "reason", None)
+        detail = f"{type(reason).__name__}: {reason}" if reason else (str(e) or repr(e))
+        log.error("URL error at %s: %s", path, detail)
+        raise RuntimeError(f"URL error at {path}: {detail}") from None
 
 
 # ==========
