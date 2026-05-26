@@ -82,6 +82,26 @@ _MAX_MESSAGE_CHARS = 3800
 # 1500 leaves room for prefix/timestamp formatting.
 _LOG_CHUNK_SIZE = 1500
 
+# Aliases longer than this are truncated for display in the summary
+# table only. The underlying summary.players[i].alias keeps the full
+# value, so sorting and any future export are unaffected. Single-char
+# ellipsis '…' is used as the truncation marker because it counts as
+# one UTF-16 code unit (no budget cost) and signals the cut clearly.
+_MAX_ALIAS_DISPLAY_CHARS = 10
+
+
+def _truncate_alias(alias: str, max_chars: int = _MAX_ALIAS_DISPLAY_CHARS) -> str:
+    """
+    Truncate an alias for display in the summary table.
+
+    Returns the alias unchanged if it's already <= max_chars.
+    Otherwise truncates to exactly max_chars total: max_chars - 1
+    characters of the original followed by a single '…'.
+    """
+    if len(alias) <= max_chars:
+        return alias
+    return alias[: max_chars - 1] + "…"
+
 
 # ---------------------------------------------------------------------------
 # Diagnostic send helper
@@ -399,7 +419,7 @@ def render_summary_table(
 
     alias_w = max(
         len("Jugador"),
-        max(len(p.alias) for p in summary.players),
+        max(len(_truncate_alias(p.alias)) for p in summary.players),
     )
     mode_headers = {
         m: f"{mode_short(m)} ({summary.catalog_totals[m]})"
@@ -431,7 +451,7 @@ def render_summary_table(
 
     player_rows: List[str] = []
     for p in summary.players:
-        row = [p.alias.ljust(alias_w)]
+        row = [_truncate_alias(p.alias).ljust(alias_w)]
         for m in summary.modes:
             cell = "—" if not p.fetch_ok else str(p.counts_by_mode.get(m, 0))
             row.append(cell.ljust(mode_widths[m]))
