@@ -30,6 +30,7 @@ from telegram.ext import ApplicationBuilder
 
 from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE
 from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications
+from .error_handler import on_error
 from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs
 from .jobs.send_assignments_daily import job_send_assignments
@@ -130,6 +131,11 @@ def main() -> None:
         + tb_notifications.get_handlers()
     ):
         app.add_handler(handler)
+
+    # Global error handler — catches any exception that escapes a
+    # registered handler. Without this, PTB logs "No error handlers
+    # are registered" and the error context is lost.
+    app.add_error_handler(on_error)
 
     # --- Parse send-assignments time ---
     send_time = _parse_send_time(SEND_ASSIGNMENTS_TIME, tz)
