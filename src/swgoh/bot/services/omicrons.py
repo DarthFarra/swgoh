@@ -58,7 +58,7 @@ class OmicronEntry:
     character: str
     skill_key: str           # "CharacterName|skill name"
     mode_text: str           # e.g. "Grand Arena"
-    omicron_tier: int        # 1-based tier index where isOmicronTier=true
+    omicron_tier: int        # in-game tier number (1-indexed, base=1)
 
 
 @dataclass(frozen=True)
@@ -269,30 +269,49 @@ def compute_recommendations(
     Inputs:
       catalog            — full omicron catalog (any mode).
       priorities         — guild's priority list for the target mode.
-      player_skill_tiers — {skill_key_norm: max_tier_int}. Skill keys
+      player_skill_tiers — {skill_key_norm: in_game_tier_int}. Skill keys
                            in the form "CharacterName|skill name", lowercased.
       player_relics      — {character_name_norm: relic_level_int|None}.
                            None = ship (excluded), -1 = <G13, 0..13 = R0..R13.
       mode_text          — mode to compute for; case-insensitive.
       min_relic          — minimum relic level a character must have to
                            be eligible.
-      top_n              — max number of recommendations.
+      top_n              — max number of recommendations to RETURN.
+                           Note: every priority is fully classified for
+                           stats; only the displayed list is capped.
 
-    Algorithm:
-      1. Restrict catalog to entries matching mode_text.
-      2. For each priority (sorted by rank ascending — done here so
-         callers can't accidentally break ordering):
-         a. Find the corresponding catalog entry.
-            No match → counted as "priorities_unmatched".
-         b. If player_skill_tiers ≥ omicron_tier → already have, skip.
-         c. If character not owned → exclude_not_owned, skip.
-         d. If character relic < min_relic → exclude_low_relic, skip.
-         e. Otherwise → include in recommendations.
-      3. Return top_n.
+    Algorithm (for each priority, in rank order):
+      a. No matching catalog entry → unmatched, skip.
+      b. Player tier ≥ omicron tier → already have, skip.
+      c. Character not owned        → excluded_not_owned, skip.
+      d. Character relic < min      → excluded_low_relic, skip.
+      e. Otherwise                  → actionable. Append to recs IF still
+                                      under top_n, but always count it
+                                      under actionable_pending.
 
-    Returns recommendations only for omicrons that have a priority entry —
-    unranked omicrons are deliberately not recommended (no guild
-    direction means no opinion).
+    Why no early break: the previous version stopped iterating after
+    appending top_n recommendations. That made every "summary" count
+    depend on top_n — "8 prioridades del gremio" when top_n=5 vs the
+    actual sheet count of, say, 12. We now classify every priority and
+    only cap the *displayed* list, so the summary reflects reality.
+
+    Stats keys:
+      priorities_total           — len(priorities) given as input
+      priorities_matched_catalog — found in catalog for this mode
+      priorities_unmatched       — typos / wrong mode / unknown skills
+      already_have               — player has the omicron applied
+      excluded_not_owned         — character not in roster
+      excluded_low_relic         — character below min_relic
+      actionable_pending         — eligible recommendations regardless of top_n
+      recommended                — len(recs), capped by top_n
+
+    Invariants (useful for testing the renderer):
+      priorities_matched_catalog
+        = already_have + excluded_not_owned + excluded_low_relic + actionable_pending
+      priorities_total
+        = priorities_matched_catalog + priorities_unmatched
+      recommended <= actionable_pending
+      recommended <= top_n
     """
     mode_norm = _norm(mode_text)
 
@@ -312,6 +331,7 @@ def compute_recommendations(
     excluded_low_relic = 0
     excluded_not_owned = 0
     unmatched_priority = 0
+    actionable_pending = 0
 
     for p in sorted_priorities:
         key = _norm(p.skill_key)
@@ -334,23 +354,26 @@ def compute_recommendations(
             excluded_low_relic += 1
             continue
 
-        recs.append(Recommendation(
-            rank=p.rank,
-            character=entry.character,
-            skill_key=entry.skill_key,
-            notes=p.notes,
-            player_relic=relic,
-        ))
-        if len(recs) >= top_n:
-            break
+        # Actionable. Always count it; only display the first top_n.
+        actionable_pending += 1
+        if len(recs) < top_n:
+            recs.append(Recommendation(
+                rank=p.rank,
+                character=entry.character,
+                skill_key=entry.skill_key,
+                notes=p.notes,
+                player_relic=relic,
+            ))
+        # Crucially: no `break`. Keep iterating to get accurate stats.
 
     stats = {
-        "priorities_total": len(priorities),
-        "priorities_matched_catalog": matched,
-        "priorities_unmatched": unmatched_priority,
-        "already_have": already_have,
-        "excluded_not_owned": excluded_not_owned,
-        "excluded_low_relic": excluded_low_relic,
-        "recommended": len(recs),
+        "priorities_total":            len(priorities),
+        "priorities_matched_catalog":  matched,
+        "priorities_unmatched":        unmatched_priority,
+        "already_have":                already_have,
+        "excluded_not_owned":          excluded_not_owned,
+        "excluded_low_relic":          excluded_low_relic,
+        "actionable_pending":          actionable_pending,
+        "recommended":                 len(recs),
     }
     return recs, stats
