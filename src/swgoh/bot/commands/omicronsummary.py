@@ -8,33 +8,35 @@ Flow:
   3. Bot fetches every guild member's roster from Comlink in parallel,
      aggregates omicron counts per mode, and renders a table.
   4. Inline buttons per mode → drill-down showing per-skill applied
-     counts (sorted descending), with no re-fetch (drill-down reads
-     from the cached aggregation).
+     counts (sorted descending), with no re-fetch.
+
+Diagnostic logging:
+  Every outgoing message goes through _send_with_diagnostics(), which:
+    - Logs the message length at INFO before sending.
+    - On Telegram's 'Message_too_long' error, logs the FULL content at
+      WARNING (chunked) so it's visible in default log configs, then
+      replies with a short notice that itself can't be too long.
+  This means you can grep your logs for [summary_table] / [mode_detail]
+  to see exactly how big the renderer's output is in production.
 
 Why officer-only:
-  This is roster-wide intelligence. Different guilds will have different
-  views on whether members should see each other's progress; officer-gate
-  is the conservative default and mirrors /sendassignments and
-  /operacionesjugador.
-
-Performance:
-  ~50 players via semaphore(5) typically completes in 20-30s cold, much
-  faster if comlink_player's 60s player cache has warm entries. Progress
-  is reported every ~10 completed players.
+  Roster-wide intelligence; mirrors /sendassignments and
+  /operacionesjugador conventions.
 
 Security:
   - Officer role required at command entry AND re-validated on each
     button click against the guild_id stored in the cached summary.
-  - Random short token in callback_data: not guessable across summaries.
+  - Random short token in callback_data — not guessable across summaries.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import List
+from typing import Awaitable, Callable, List, Optional
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 
 from ..services.sheets import (
@@ -62,15 +64,105 @@ from ..security import (
 
 log = logging.getLogger(__name__)
 
-# Callback prefixes. Both are distinct from /omicrones' "omi" / "omimode"
-# (the regex anchors + colon boundary prevent any overlap).
-CB_GUILD = "omisumg"   # guild picker selection
-CB_MODE  = "omisum"    # mode drill-down (or 'back')
+# Callback prefixes
+CB_GUILD = "omisumg"
+CB_MODE  = "omisum"
 
-# Tunables. If Comlink starts rate-limiting, drop _CONCURRENCY first.
+# Tunables
 _CONCURRENCY       = 5
 _COMLINK_TIMEOUT_S = 10.0
 _PROGRESS_EVERY_N  = 10
+
+# Telegram's hard limit is 4096 characters. We target 3800 to leave
+# margin for markdown formatting chars and emoji weighting in UTF-16.
+_MAX_MESSAGE_CHARS = 3800
+
+# When logging an oversize message's full content, this is the chunk
+# size we slice it into. Most log backends accept lines of ~2000 chars;
+# 1500 leaves room for prefix/timestamp formatting.
+_LOG_CHUNK_SIZE = 1500
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic send helper
+# ---------------------------------------------------------------------------
+
+# Type alias for any Telegram coroutine that accepts (text, parse_mode, reply_markup).
+SendCallable = Callable[..., Awaitable]
+
+
+async def _send_with_diagnostics(
+    send_callable: SendCallable,
+    text: str,
+    *,
+    kind: str,
+    parse_mode: Optional[str] = "Markdown",
+    reply_markup=None,
+) -> bool:
+    """
+    Send a Telegram message via `send_callable` (e.g. message.edit_text
+    or query.edit_message_text) with diagnostic logging.
+
+    Always logs the rendered length at INFO before the send, so you can
+    grep production logs to see what the renderer is actually producing.
+
+    On Telegram's 'Message_too_long' error:
+      - Logs the full message content at WARNING in 1500-char chunks
+        so it's visible without enabling DEBUG logging.
+      - Sends a short notice via the same callable (with no markdown
+        and no reply_markup) so the user sees that something happened.
+      - Returns False.
+
+    Other exceptions propagate.
+
+    Returns True on success, False if the message had to be replaced
+    with the short notice.
+    """
+    log.info("[%s] sending message: length=%d chars (limit ~4096)", kind, len(text))
+
+    try:
+        await send_callable(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return True
+    except BadRequest as e:
+        msg = str(e).lower()
+        if "too long" not in msg:
+            # Different BadRequest — let the global handler deal with it.
+            raise
+
+    # 'Too long' path. Dump the full content so we can see what overflowed.
+    log.warning(
+        "[%s] Telegram rejected message: length=%d, limit=4096. "
+        "Full content follows in %d chunk(s) of up to %d chars each.",
+        kind, len(text),
+        (len(text) + _LOG_CHUNK_SIZE - 1) // _LOG_CHUNK_SIZE,
+        _LOG_CHUNK_SIZE,
+    )
+    for i in range(0, len(text), _LOG_CHUNK_SIZE):
+        chunk = text[i:i + _LOG_CHUNK_SIZE]
+        # Bracket each chunk with line markers so multi-line content is obvious.
+        log.warning("[%s] chunk[%d:%d]\n%s\n--- end chunk ---",
+                    kind, i, i + len(chunk), chunk)
+
+    # Send a short notice as graceful fallback. No reply_markup so a
+    # follow-up edit can replace it cleanly; no markdown to avoid any
+    # parsing oddities. This message is short enough that it cannot
+    # itself be 'too long', so we don't need a defence in depth here.
+    try:
+        await send_callable(
+            f"⚠️ El mensaje generado es demasiado largo para Telegram "
+            f"({len(text)} caracteres, límite 4096). "
+            f"Revisa los logs del bot — se ha registrado el contenido completo.",
+            parse_mode=None,
+            reply_markup=None,
+        )
+    except Exception:
+        # If even THIS fails, just log and move on. We've already logged
+        # the full original content above, so the operator has what they need.
+        log.exception(
+            "[%s] fallback short notice also failed to send", kind,
+        )
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +174,7 @@ async def cmd_omicronsummary(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ss      = open_ss()
     user_id = update.effective_user.id
 
-    authorized = user_authorized_guilds(ss, user_id)  # [(label, gid), ...]
+    authorized = user_authorized_guilds(ss, user_id)
     if not authorized:
         await update.message.reply_text(
             "❌ Este comando requiere rol Líder u Oficial en algún gremio."
@@ -101,7 +193,6 @@ async def cmd_omicronsummary(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cb_summary_guild(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles guild picker selection."""
     q = update.callback_query
     await q.answer()
     data = q.data or ""
@@ -138,7 +229,6 @@ async def _run_summary(
 ):
     user_id = update.effective_user.id
 
-    # Belt-and-braces: re-check the officer role on the resolved guild.
     if not user_has_role_in_guild(ss, user_id, gid):
         msg = "❌ No tienes permisos en este gremio."
         if via_callback:
@@ -168,7 +258,6 @@ async def _run_summary(
             await update.message.reply_text(msg)
         return
 
-    # Initial progress message — captured as a Message we can edit later.
     if via_callback:
         await update.callback_query.edit_message_text(
             f"⏳ Consultando {len(players)} jugadores en *{label}*…",
@@ -185,9 +274,6 @@ async def _run_summary(
         ss, context.application.bot_data,
     )
 
-    # Throttled progress callback. We update at most every 10 players
-    # (or proportionally for smaller guilds) to avoid Telegram rate
-    # limits on message edits.
     last_reported = [0]
     step = max(_PROGRESS_EVERY_N, len(players) // 10)
 
@@ -200,8 +286,6 @@ async def _run_summary(
                     parse_mode="Markdown",
                 )
             except Exception:
-                # Edit failures (rate limit, message-not-modified) are
-                # not actionable — keep fetching.
                 pass
 
     started = time.monotonic()
@@ -229,14 +313,13 @@ async def _run_summary(
     text  = render_summary_table(summary)
     kb    = build_mode_keyboard(summary, token, include_back=False)
 
-    try:
-        await progress_msg.edit_text(text, parse_mode="Markdown", reply_markup=kb)
-    except Exception:
-        log.exception(
-            "Failed to edit summary message (likely too long); "
-            "falling back to a new reply."
-        )
-        await progress_msg.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+    await _send_with_diagnostics(
+        progress_msg.edit_text,
+        text,
+        kind="summary_table",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -263,19 +346,15 @@ async def cb_summary_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Re-validate authorisation against the guild this summary belongs to.
-    # Prevents a leaked token from being used by someone who isn't an
-    # officer in this specific guild.
     user_id = q.from_user.id
     ss      = open_ss()
     if not user_has_role_in_guild(ss, user_id, summary.guild_id):
-        await q.edit_message_text(
-            "❌ No tienes permisos en este gremio."
-        )
+        await q.edit_message_text("❌ No tienes permisos en este gremio.")
         return
 
     if target == "back":
         text = render_summary_table(summary)
+        kind = "summary_table"
         kb   = build_mode_keyboard(summary, token, include_back=False)
     else:
         try:
@@ -288,26 +367,32 @@ async def cb_summary_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         mode_text = summary.modes[mode_idx]
         text = render_mode_detail(summary, mode_text)
+        kind = f"mode_detail[{mode_short(mode_text)}]"
         kb   = build_mode_keyboard(summary, token, include_back=True)
 
-    await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    await _send_with_diagnostics(
+        q.edit_message_text,
+        text,
+        kind=kind,
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Rendering
+# Rendering — with structured truncation to fit Telegram's char limit
 # ---------------------------------------------------------------------------
 
-def render_summary_table(summary: GuildOmicronSummary) -> str:
+def render_summary_table(
+    summary: GuildOmicronSummary,
+    char_budget: int = _MAX_MESSAGE_CHARS,
+) -> str:
     """
-    Monospace table inside a Markdown code block. Format:
+    Monospace table inside a Markdown code block.
 
-        Jugador        TW (90)  GAC (115)  TB (20)
-        ─────────────  ───────  ─────────  ───────
-        Alice          12       8          3
-        Bob            15       10         5
-        ...
-
-    Players with failed fetches render '—' for every mode cell.
+    If the full table exceeds char_budget, player rows are truncated
+    from the end (alphabetical order is preserved) and a note is
+    appended outside the code block.
     """
     if not summary.players:
         return f"🔮 *Omicrones — {summary.guild_label}*\nSin jugadores."
@@ -316,9 +401,10 @@ def render_summary_table(summary: GuildOmicronSummary) -> str:
         len("Jugador"),
         max(len(p.alias) for p in summary.players),
     )
-
-    mode_headers = {m: f"{mode_short(m)} ({summary.catalog_totals[m]})"
-                    for m in summary.modes}
+    mode_headers = {
+        m: f"{mode_short(m)} ({summary.catalog_totals[m]})"
+        for m in summary.modes
+    }
     mode_widths = {}
     for m in summary.modes:
         max_val_w = max(
@@ -327,77 +413,137 @@ def render_summary_table(summary: GuildOmicronSummary) -> str:
         )
         mode_widths[m] = max(len(mode_headers[m]), max_val_w)
 
-    lines: List[str] = []
     n_ok = sum(1 for p in summary.players if p.fetch_ok)
-    lines.append(
+    title = (
         f"🔮 *Omicrones — {summary.guild_label}*  "
         f"_({n_ok}/{summary.total_players} jugadores)_"
     )
-    lines.append("```")
 
-    # Header
     header_cells = ["Jugador".ljust(alias_w)]
     for m in summary.modes:
         header_cells.append(mode_headers[m].ljust(mode_widths[m]))
-    lines.append("  ".join(header_cells))
+    header_row = "  ".join(header_cells)
 
-    # Separator (use plain ASCII '-' to avoid font issues on some clients)
     sep_cells = ["-" * alias_w]
     for m in summary.modes:
         sep_cells.append("-" * mode_widths[m])
-    lines.append("  ".join(sep_cells))
+    sep_row = "  ".join(sep_cells)
 
-    # Rows
+    player_rows: List[str] = []
     for p in summary.players:
         row = [p.alias.ljust(alias_w)]
         for m in summary.modes:
             cell = "—" if not p.fetch_ok else str(p.counts_by_mode.get(m, 0))
             row.append(cell.ljust(mode_widths[m]))
-        lines.append("  ".join(row))
+        player_rows.append("  ".join(row))
 
-    lines.append("```")
-
-    # Footer
+    footer_lines: List[str] = []
     if summary.failed_player_aliases:
         n = len(summary.failed_player_aliases)
-        lines.append(
+        footer_lines.append(
             f"⚠️ {n} {'jugador sin datos' if n == 1 else 'jugadores sin datos'} "
             f"(Comlink falló)."
         )
-    lines.append(f"_Generado en {summary.elapsed_seconds:.0f}s._")
+    footer_lines.append(f"_Generado en {summary.elapsed_seconds:.0f}s._")
 
-    return "\n".join(lines)
+    full_parts = (
+        [title, "```", header_row, sep_row]
+        + player_rows
+        + ["```"]
+        + footer_lines
+    )
+    full_text = "\n".join(full_parts)
+    if len(full_text) <= char_budget:
+        return full_text
+
+    NOTE_RESERVE = 120
+    base_parts = [title, "```", header_row, sep_row, "```"] + footer_lines
+    base_size = len("\n".join(base_parts)) + 1
+    rows_budget = char_budget - base_size - NOTE_RESERVE
+
+    included: List[str] = []
+    used = 0
+    for row in player_rows:
+        size = len(row) + 1
+        if used + size > rows_budget:
+            break
+        included.append(row)
+        used += size
+
+    hidden = len(player_rows) - len(included)
+    note = (
+        f"_… y {hidden} jugadores más "
+        f"(mensaje truncado por límite de Telegram)._"
+    )
+
+    parts = (
+        [title, "```", header_row, sep_row]
+        + included
+        + ["```", note]
+        + footer_lines
+    )
+    return "\n".join(parts)
 
 
-def render_mode_detail(summary: GuildOmicronSummary, mode_text: str) -> str:
+def render_mode_detail(
+    summary: GuildOmicronSummary,
+    mode_text: str,
+    char_budget: int = _MAX_MESSAGE_CHARS,
+) -> str:
     """
     Per-mode drill-down. Lists every omicron in this mode with the
     count of how many guild members have it applied. Sorted by count
-    descending; ties broken alphabetically for stable output.
+    descending; ties broken alphabetically.
+
+    If the rendered list exceeds char_budget, the lowest-count entries
+    are dropped.
     """
     catalog_for_mode = summary.catalog_by_mode.get(mode_text, [])
     counts = summary.skill_counts_by_mode.get(mode_text, {})
     n_ok = sum(1 for p in summary.players if p.fetch_ok)
 
-    rows: List[tuple] = [
+    rows = [
         (counts.get(entry.skill_key, 0), entry.skill_key)
         for entry in catalog_for_mode
     ]
     rows.sort(key=lambda r: (-r[0], r[1].lower()))
 
-    lines: List[str] = [
+    title_lines = [
         f"🔮 *Omicrones de {mode_short(mode_text)}* — {summary.guild_label}",
         f"_{n_ok} jugadores analizados, "
         f"{summary.catalog_totals.get(mode_text, 0)} omicrones en el catálogo_",
         "",
     ]
-    if not rows:
-        lines.append("_(catálogo vacío para este modo)_")
-    else:
-        for count, skill_key in rows:
-            lines.append(f"• {skill_key}  →  *{count}*")
 
-    return "\n".join(lines)
+    if not rows:
+        return "\n".join(title_lines + ["_(catálogo vacío para este modo)_"])
+
+    formatted_rows = [f"• {sk}  →  *{c}*" for c, sk in rows]
+
+    full_text = "\n".join(title_lines + formatted_rows)
+    if len(full_text) <= char_budget:
+        return full_text
+
+    NOTE_RESERVE = 140
+    base_size = len("\n".join(title_lines)) + 1
+    rows_budget = char_budget - base_size - NOTE_RESERVE
+
+    included: List[str] = []
+    used = 0
+    for row in formatted_rows:
+        size = len(row) + 1
+        if used + size > rows_budget:
+            break
+        included.append(row)
+        used += size
+
+    hidden = len(formatted_rows) - len(included)
+    note = (
+        f"_… y {hidden} omicrones más con menor uso "
+        f"(mensaje truncado por límite de Telegram)._"
+    )
+
+    return "\n".join(title_lines + included + [note])
 
 
 def build_mode_keyboard(
@@ -405,10 +551,7 @@ def build_mode_keyboard(
     token: str,
     include_back: bool,
 ) -> InlineKeyboardMarkup:
-    """
-    Mode buttons packed up to 4 per row. Optional 'back' row for the
-    drill-down view so the user can return to the main table.
-    """
+    """Mode buttons packed up to 4 per row, plus an optional 'back' row."""
     mode_buttons = [
         InlineKeyboardButton(
             text=mode_short(mode),
