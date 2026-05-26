@@ -120,3 +120,10 @@ def install_token_redaction() -> None:
         if any(isinstance(f, TokenRedactingFilter) for f in handler.filters):
             continue
         handler.addFilter(TokenRedactingFilter())
+    
+    # Log how many handlers we attached to, so misconfiguration is
+    # visible at startup rather than after a token leaks.
+    logging.getLogger(__name__).info(
+        "Token redaction filter installed on %d handler(s).",
+        len(root.handlers),
+    )
