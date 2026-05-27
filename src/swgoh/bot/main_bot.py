@@ -28,11 +28,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram.ext import ApplicationBuilder
 
-from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE
+from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE, TICKET_REMINDER_LEAD_MINUTES
 from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary
 from .error_handler import on_error
 from .discord_listener import start_discord_listener, stop_discord_listener
-from .jobs.snapshot_tickets import schedule_snapshot_jobs
+from .jobs.snapshot_tickets import schedule_snapshot_jobs, set_bot_for_snapshot_jobs
+from .jobs.ticket_reminder import schedule_reminder_jobs
 from .jobs.send_assignments_daily import job_send_assignments
 from .services.sync_runner import run_sync_guilds_once, run_sync_data
 
@@ -155,14 +156,26 @@ def main() -> None:
     scheduler = AsyncIOScheduler(timezone=tz)
 
     async def _on_startup(application) -> None:
+      
         # 1. Start APScheduler
         scheduler.start()
         log.info("APScheduler started (timezone=%s).", TIMEZONE)
 
-        # 2. Ticket snapshot jobs (guild-specific times, from spreadsheet)
+        # 2. Share bot with snapshot jobs so they can post auto-messages
+        # when their async wrapper (run_snapshot_and_publish) fires.
+        # Safe to call before schedule_snapshot_jobs — catch-up snapshots
+        # deliberately use the sync helper and never post (see below).
+        set_bot_for_snapshot_jobs(application.bot)
+
+        # 3. Ticket snapshot jobs (guild-specific times, from spreadsheet)
         schedule_snapshot_jobs(scheduler)
 
-        # 3. Weekly sync_guilds
+        # 4. Per-guild ticket reminder jobs (reset_time − N minutes)
+        schedule_reminder_jobs(scheduler, application, TICKET_REMINDER_LEAD_MINUTES)
+
+      
+
+        # 5. Weekly sync_guilds
         scheduler.add_job(
             _job_sync_guilds,
             trigger=CronTrigger.from_crontab(SYNC_GUILDS_CRON, timezone=tz),
@@ -173,7 +186,7 @@ def main() -> None:
         )
         log.info("sync_guilds scheduled: cron='%s' tz=%s", SYNC_GUILDS_CRON, TIMEZONE)
 
-        # 4. Monthly sync_data
+        # 6. Monthly sync_data
         scheduler.add_job(
             _job_sync_data,
             trigger=CronTrigger.from_crontab(SYNC_DATA_CRON, timezone=tz),
@@ -184,7 +197,7 @@ def main() -> None:
         )
         log.info("sync_data scheduled: cron='%s' tz=%s", SYNC_DATA_CRON, TIMEZONE)
 
-        # 5. Daily send_assignments via PTB JobQueue
+        # 7. Daily send_assignments via PTB JobQueue
         # (PTB's run_daily handles timezone-aware time natively)
         application.job_queue.run_daily(
             job_send_assignments,
@@ -212,7 +225,7 @@ def main() -> None:
                 len(cfg.planets), len(cfg.strike_names),
             )
 
-        # 6. Discord listener (optional; skipped if not configured)
+        # 8. Discord listener (optional; skipped if not configured)
         await start_discord_listener(application)
 
     async def _on_shutdown(application) -> None:
