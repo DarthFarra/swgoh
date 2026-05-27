@@ -200,9 +200,10 @@ async def publish_tickets_to_channel(
     bot,
     channel_id: str,
     members: List[MemberTickets],
-    usernames: Dict[str, Optional[str]],  # player_name_lower -> @handle or None
+    usernames: Dict[str, Optional[str]],
     guild_label: str,
     thread_id: Optional[int] = None,
+    header_override: Optional[str] = None,  # NEW — forwarded to renderer
 ) -> None:
     """
     Publishes the missing-tickets report to a Telegram channel.
@@ -210,13 +211,16 @@ async def publish_tickets_to_channel(
     Args:
         thread_id: if provided, posts into that forum topic (message_thread_id).
                    If None, posts to the channel's general topic.
+        header_override: see render_tickets_today_channel docstring.
 
     Raises:
         telegram.error.Forbidden: bot is not an admin of the channel.
         telegram.error.BadRequest: channel_id or thread_id is invalid.
         Any other telegram.error.*: other delivery failure.
     """
-    text = render_tickets_today_channel(members, usernames, guild_label)
+    text = render_tickets_today_channel(
+        members, usernames, guild_label, header_override=header_override,
+    )
     kwargs = {
         "chat_id": channel_id,
         "text": text,
@@ -231,11 +235,21 @@ def render_tickets_today_channel(
     members: List[MemberTickets],
     usernames: Dict[str, Optional[str]],  # player_name_lower -> handle or None
     guild_label: str,
+    header_override: Optional[str] = None,  # NEW — already-escaped MarkdownV2
 ) -> str:
     """
     Renders the channel version of the today report.
     Members with a username get '@handle', others get plain player name.
     Only delinquents are listed.
+
+    `header_override` (NEW): if provided, replaces the default
+    "🎫 *<label>* — Tickets pendientes hoy (..):" header line. Used by the
+    automatic missed-deadline post at reset time to change the framing
+    ("Deadline alcanzado") without forking the rendering logic. The body
+    (the bullet list of players) is identical.
+
+    The override is inserted as-is; callers are responsible for any
+    MarkdownV2 escaping of literal characters they include.
     """
     delinquents = [m for m in members if not m.completed_today]
     label = _escape_md(guild_label)
@@ -249,8 +263,14 @@ def render_tickets_today_channel(
         )
 
     count_str = _escape_md(f"{len(delinquents)}/{len(members)}")
-    lines = [f"🎫 *{label}* — Tickets pendientes hoy \\({count_str}\\):\n"]
+    if header_override is not None:
+        # Caller-provided header. Still prefix the label so the post is
+        # identifiable in a busy channel.
+        header = f"*{label}* — {header_override} \\({count_str}\\):\n"
+    else:
+        header = f"🎫 *{label}* — Tickets pendientes hoy \\({count_str}\\):\n"
 
+    lines = [header]
     for m in sorted(delinquents, key=lambda x: x.current_value):
         handle = usernames.get(m.player_name.lower())
         if handle:
