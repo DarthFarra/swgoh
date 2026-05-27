@@ -164,6 +164,12 @@ SYNC_GUILDS_CRON: str = _optional("SYNC_GUILDS_CRON", "0 3 * * 0")  # Sunday 03:
 # Monthly sync-data: full cron expression (runs in TIMEZONE)
 SYNC_DATA_CRON: str = _optional("SYNC_DATA_CRON", "0 2 1 * *")  # 1st of month 02:00
 
+# How many minutes before each guild's reset time the auto-reminder fires.
+# Default 60. Computed per-guild from the guild's reset_time so guilds with
+# different reset times each get their own correct firing time — no separate
+# cron expression needed. Must be 0 < value < 1440 (24h).
+TICKET_REMINDER_LEAD_MINUTES: int = _int("TICKET_REMINDER_LEAD_MINUTES", 60)
+
 # ---------------------------------------------------------------------------
 # Data filters
 # ---------------------------------------------------------------------------
