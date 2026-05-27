@@ -157,6 +157,56 @@ def get_channel_config_for_guild(
         return channel_id, thread_id
     return None, None
 
+def get_ticket_auto_post_flags(
+    ss, guild_name: str
+) -> tuple[bool, bool]:
+    """
+    Returns (reminder_enabled, missed_post_enabled) for guild_name.
+
+    Reads two optional Guilds-sheet columns:
+      - ticket_reminder_enabled     → controls the 1h-before reminder
+      - ticket_missed_post_enabled  → controls the at-reset missed-deadline post
+
+    Default for both is False (opt-in). Accepts truthy strings:
+      TRUE / true / 1 / yes / y / si / sí
+    Anything else (including blanks, "0", "no", "false") → False.
+
+    Why two columns: officers may want preventive nudges (reminder) without
+    accountability posts at reset, or vice versa. One column would couple
+    them and force an all-or-nothing choice.
+    """
+    ws = ss.worksheet(GUILDS_SHEET)
+    headers, rows = _get_all(ws)
+    hl = [h.strip().lower() for h in headers]
+
+    if "guild name" not in hl:
+        return False, False
+
+    i_name = hl.index("guild name")
+    i_rem  = hl.index("ticket_reminder_enabled")     if "ticket_reminder_enabled"     in hl else None
+    i_miss = hl.index("ticket_missed_post_enabled")  if "ticket_missed_post_enabled"  in hl else None
+
+    if i_rem is None and i_miss is None:
+        # Neither column exists → both features off everywhere. This is the
+        # natural pre-deployment state: features are dormant until at least
+        # one column is added.
+        return False, False
+
+    for r in rows:
+        gn = (r[i_name] if i_name < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        rem_raw  = (r[i_rem]  if i_rem  is not None and i_rem  < len(r) else "").strip()
+        miss_raw = (r[i_miss] if i_miss is not None and i_miss < len(r) else "").strip()
+        return _truthy(rem_raw), _truthy(miss_raw)
+
+    return False, False
+
+
+def _truthy(val: str) -> bool:
+    """Permissive boolean parse for sheet cells. Conservative on no-match."""
+    return val.strip().lower() in {"true", "1", "yes", "y", "si", "sí"}
+
 def get_tb_channel_config_for_guild(
     ss, guild_name: str
 ) -> tuple[Optional[str], Optional[int]]:
