@@ -32,6 +32,7 @@ from ..services.sheets import (
     open_ss,
     resolve_label_name_rote_by_id,
 )
+from ..services.sheets_io import read_values_cached
 from ..services.auth import user_authorized_guilds, user_has_role_in_guild
 from ..keyboards.guild_select import make_keyboard_guilds
 from ..security import (
@@ -324,7 +325,7 @@ def _run_for_guild(guild_id: str, fase: str) -> tuple[int, int]:
     ss = open_spreadsheet()
 
     # Read USUARIOS — filter to this guild only
-    u_headers, u_rows = _read_all_values(ss, SHEET_USERS)
+    u_headers, u_rows = read_values_cached(ss, SHEET_USERS)
     if not u_rows:
         return 0, 0
 
@@ -335,7 +336,7 @@ def _run_for_guild(guild_id: str, fase: str) -> tuple[int, int]:
     idx_alias = _find_col(uhm, HEADERS_USUARIOS["alias"])
 
     # Read GUILDS to resolve guild_id → guild_name and ROTE sheet
-    g_headers, g_rows = _read_all_values(ss, SHEET_GUILDS)
+    g_headers, g_rows = read_values_cached(ss, SHEET_GUILDS)
     ghm            = _hmap(g_headers)
     idx_gid_col    = _find_col(ghm, ["Guild Id", "guild_id", "guild id"])
     idx_guild_name = _find_col(ghm, ["Guild Name", "guild_name", "gremio"])
@@ -370,8 +371,8 @@ def _run_for_guild(guild_id: str, fase: str) -> tuple[int, int]:
         return 0, 0
 
     # Read ROTE assignments
-    try:
-        a_headers, a_rows = _read_all_values(ss, sheet_name)
+try:
+        a_headers, a_rows = read_values_cached(ss, sheet_name)
     except Exception as e:
         log.warning("Cannot open ROTE sheet '%s': %s", sheet_name, e)
         return 0, len(users)
