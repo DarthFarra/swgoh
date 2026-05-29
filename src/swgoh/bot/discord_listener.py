@@ -18,28 +18,9 @@ Lifecycle:
   - Shutdown: main_bot.py calls stop_discord_listener(application) in
     post_shutdown. We close the client cleanly.
 
-Error isolation:
-  - Anything raised inside on_message is caught and logged. We never let
-    a single bad message crash the listener.
-  - Connection failures are handled by discord.py's built-in auto-
-    reconnect (configurable via `reconnect=True`, the default).
-  - If the bot token is missing or invalid, we log and skip startup
-    rather than crashing the whole bot process.
-
-What we deliberately do NOT do:
-  - Persist anything to disk. The Discord channel itself is the audit log.
-  - Send messages back to Discord. The bot has read-only permissions
-    (Send Messages was deliberately not granted).
-  - Trust attachment content blindly. We size-check before download and
-    validate the JSON parse before touching the cache.
-
 Telegram routing:
   - TB_AUTO_FORWARD_CHAT_ID: target chat (required).
   - TB_AUTO_FORWARD_THREAD_ID: optional forum-topic id within that chat.
-    When set, every outbound message includes message_thread_id; the
-    auto-summary lands in that topic. When 0/unset, no thread is
-    specified — Telegram posts to the chat's main topic (works for
-    non-forum chats and for forum chats' "General" topic alike).
 """
 from __future__ import annotations
 
@@ -61,7 +42,7 @@ from ..tb import (
 from ..tb.formatters import auto_summary_undeployed
 
 from . import config as bot_cfg
-from .services import tb_cache, tb_map_config_cache
+from .services import tb_cache, tb_map_config_cache, tb_targets_cache
 from .services.sheets import open_ss, resolve_label_name_by_guild_id
 from .services.tb_undeployed_cache import (
     UndeployedMember,
@@ -73,22 +54,8 @@ from .services.tb_undeployed_cache import (
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Tunables
-# ---------------------------------------------------------------------------
-
-# Hard cap on attachment size we'll download. A typical TB export is
-# under 1 MB. 10 MB is plenty of headroom and protects against pathological
-# attachments (a maliciously-crafted file, a future C3PO export with
-# unexpected expansion, etc.).
 MAX_ATTACHMENT_BYTES: int = 10 * 1024 * 1024
-
-# Filename suffix we treat as a TB export. C3PO may produce other JSON
-# files (e.g. for raids); this filter keeps the listener focused.
 TB_FILENAME_SUFFIX: str = "-tb.json"
-
-# Key under application.bot_data where we stash the listener handle.
-# Lets stop_discord_listener find what start_discord_listener created.
 _LISTENER_KEY = "__discord_listener__"
 
 
@@ -101,21 +68,13 @@ class _TBListenerClient(discord.Client):
     Minimal discord.py client. Holds direct references to PTB's bot_data
     (for cache access) and Bot (for outbound Telegram messages), rather
     than the Application itself.
-
-    Why not store the Application: discord.py's Client has an `application`
-    attribute of its own (auto-populated post-login with the bot's
-    AppInfo). Storing PTB's Application as `self.application` would
-    collide; storing as `self._application` should be safe, but in
-    practice the internals of discord.py have caused this to be
-    overwritten in some setups. Storing bot_data + bot avoids the
-    question entirely.
     """
 
     def __init__(
         self,
         *,
         ptb_bot_data: dict,
-        ptb_bot,                      # telegram.Bot, type-import-free
+        ptb_bot,
         c3po_user_id: int,
         watch_channel_id: int,
         auto_forward_chat_id: int,
@@ -128,16 +87,9 @@ class _TBListenerClient(discord.Client):
         self._c3po_user_id = c3po_user_id
         self._watch_channel_id = watch_channel_id
         self._auto_forward_chat_id = auto_forward_chat_id
-        # 0 means "no thread"; the actual send_message call omits the
-        # message_thread_id kwarg entirely in that case so Telegram
-        # treats it as a normal chat post.
         self._auto_forward_thread_id = auto_forward_thread_id
 
-    # ---- discord.py event handlers ----
-
     async def on_ready(self) -> None:
-        """Logged once after connect / reconnect. Useful for verifying
-        the bot is up and in the right server."""
         thread_note = (
             f" thread={self._auto_forward_thread_id}"
             if self._auto_forward_thread_id else ""
@@ -151,10 +103,6 @@ class _TBListenerClient(discord.Client):
         )
 
     async def on_message(self, message: discord.Message) -> None:
-        """
-        Filter then dispatch. Any exception here is caught at the
-        outermost level so a single bad message can't crash the listener.
-        """
         try:
             await self._handle_message(message)
         except Exception:
@@ -163,18 +111,11 @@ class _TBListenerClient(discord.Client):
                 message.id, message.author.id,
             )
 
-    # ---- internal handling ----
-
     async def _handle_message(self, message: discord.Message) -> None:
-        # Filter 1: must be from C3PO.
         if message.author.id != self._c3po_user_id:
             return
-
-        # Filter 2: must be in the watch channel.
         if message.channel.id != self._watch_channel_id:
             return
-
-        # Filter 3: must have at least one JSON attachment.
         if not message.attachments:
             log.debug(
                 "C3PO message id=%s in watch channel had no attachments; "
@@ -182,8 +123,6 @@ class _TBListenerClient(discord.Client):
             )
             return
 
-        # Process every matching attachment in the message. C3PO
-        # typically posts one, but we don't assume.
         for att in message.attachments:
             if not att.filename.endswith(TB_FILENAME_SUFFIX):
                 log.debug(
@@ -197,17 +136,11 @@ class _TBListenerClient(discord.Client):
         attachment: discord.Attachment,
         message: discord.Message,
     ) -> None:
-        """
-        Download → parse → cache → forward. Each stage logs its own
-        outcome. Any failure aborts this attachment but doesn't affect
-        others or future messages.
-        """
         log.info(
             "Processing TB attachment %r (size=%d bytes) from message %s",
             attachment.filename, attachment.size, message.id,
         )
 
-        # Size guard before download.
         if attachment.size > MAX_ATTACHMENT_BYTES:
             log.warning(
                 "Refusing oversized attachment %r: %d > %d bytes",
@@ -215,15 +148,12 @@ class _TBListenerClient(discord.Client):
             )
             return
 
-        # Download in memory. discord.py exposes attachment.read()
-        # which returns bytes; no temp file involved.
         try:
             raw_bytes = await attachment.read()
         except discord.HTTPException as e:
             log.warning("Failed to download attachment %r: %s", attachment.filename, e)
             return
 
-        # Decode + JSON-parse.
         try:
             text = raw_bytes.decode("utf-8")
             raw = json.loads(text)
@@ -238,7 +168,6 @@ class _TBListenerClient(discord.Client):
             )
             return
 
-        # Parse into our domain model.
         try:
             snapshot = parse_tb_snapshot(raw)
         except ParseError as e:
@@ -252,32 +181,26 @@ class _TBListenerClient(discord.Client):
             )
             return
 
-        # Update the in-memory cache so /tb_status and friends see it.
         tb_cache.set_latest(
             self._ptb_bot_data,
             snapshot,
             source_filename=attachment.filename,
         )
 
-        # Auto-forward the summary to the officers' chat.
         try:
             map_config = tb_map_config_cache.get(self._ptb_bot_data)
-            messages = format_auto_summary(snapshot, map_config)
+            # NEW: fetch the cached TB targets too (loaded at startup,
+            # refreshable via /tb_reload_targets).
+            tb_targets = tb_targets_cache.get(self._ptb_bot_data)
+            messages = format_auto_summary(snapshot, map_config, tb_targets)
 
-            # Capture the undeployed list at THIS exact moment, so the
-            # auto-summary's inline buttons act on the same members the
-            # message displays — not a recomputed list.
             undeployed_rows = auto_summary_undeployed(snapshot)
 
-            # Resolve sheet-side guild label (None if guild not in sheet —
-            # in which case we still post the message, just without buttons).
             label, _gname = (None, None)
             try:
                 ss = open_ss()
                 label, _gname = resolve_label_name_by_guild_id(ss, snapshot.guild_id)
             except Exception:
-                # Sheets unreachable. Send the message text-only — better
-                # than failing the whole notification.
                 log.exception("Sheets lookup failed; sending auto-summary without buttons.")
 
             await self._notify_officers(
@@ -299,8 +222,6 @@ class _TBListenerClient(discord.Client):
                 "updated successfully."
             )
 
-    # ---- outbound Telegram ----
-
     async def _notify_officers(
         self,
         messages,
@@ -309,36 +230,7 @@ class _TBListenerClient(discord.Client):
         undeployed_rows: tuple = (),
         guild_name_for_cache: str = "",
     ) -> None:
-        """
-        Send one or more messages to the officers' chat via the PTB Bot.
-
-        If `guild_id` is provided AND `undeployed_rows` is non-empty, we
-        attach inline buttons to the LAST message ("Send DMs", "Publish
-        to channel") and cache the undeployed list keyed by the resulting
-        Telegram message_id so the callback handlers can act on it.
-
-        Buttons are attached only to the last message of a multi-message
-        response because:
-          - Officers see the buttons in context with the displayed list.
-          - Adding buttons to each part would duplicate the action targets.
-          - The current minimal format always produces one message, but
-            the API contract handles future multi-message cases cleanly.
-
-        Thread routing:
-          When self._auto_forward_thread_id is non-zero, message_thread_id
-          is included in the send call so the message lands in that
-          forum topic. When zero, the kwarg is omitted entirely — this
-          is the correct way to "post to no specific thread" on Telegram
-          (passing message_thread_id=0 is NOT the same as omitting it).
-
-        Args:
-          messages: str or list[str] from format_auto_summary.
-          guild_id: snap.guild_id (C3PO/CG id). When None, no buttons attached.
-          undeployed_rows: tuple of _UndeployedRow from auto_summary_undeployed.
-            Empty means no buttons (and no cache write).
-          guild_name_for_cache: snap.guild_name, denormalized into the cache
-            so callbacks don't need to re-read the snapshot.
-        """
+        """Send one or more messages to the officers' chat via the PTB Bot."""
         if isinstance(messages, str):
             messages = [messages]
 
@@ -353,10 +245,6 @@ class _TBListenerClient(discord.Client):
             if attach_buttons and is_last:
                 reply_markup = _build_undeployed_keyboard(guild_id)
 
-            # Build kwargs incrementally so message_thread_id is OMITTED
-            # (not set to 0) when no thread is configured. Telegram
-            # treats absent vs 0 differently, and 0 is rejected on
-            # non-forum chats.
             send_kwargs: dict[str, Any] = {
                 "chat_id": self._auto_forward_chat_id,
                 "text": text,
@@ -378,9 +266,6 @@ class _TBListenerClient(discord.Client):
                 )
                 continue
 
-            # If this is the last message AND we attached buttons, cache
-            # the undeployed list keyed by the sent message_id so the
-            # callbacks can act on it later.
             if attach_buttons and is_last and sent is not None:
                 cache_members = tuple(
                     UndeployedMember(
@@ -409,16 +294,6 @@ class _TBListenerClient(discord.Client):
 # ---------------------------------------------------------------------------
 
 def _build_undeployed_keyboard(guild_id: str) -> InlineKeyboardMarkup:
-    """
-    Two buttons: send DMs, publish to channel. Same row.
-
-    callback_data encodes the guild_id so the handler doesn't need
-    user_data session state (which would tie buttons to whoever sent
-    the auto-summary, but the bot — not a user — sent it).
-
-    Callback prefixes are namespaced with `tbu` (TB undeployed) to
-    avoid collision with the existing `tickets*` callbacks.
-    """
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
@@ -434,12 +309,6 @@ def _build_undeployed_keyboard(guild_id: str) -> InlineKeyboardMarkup:
 
 
 def _md_safe(text: str) -> str:
-    """
-    Light Markdown escape for legacy-Markdown dialect. Used only for
-    bot-generated notification text where we embed external strings
-    (filenames, error messages). The main `format_auto_summary` and
-    friends already handle their own escaping.
-    """
     if not text:
         return ""
     out = text
@@ -449,23 +318,6 @@ def _md_safe(text: str) -> str:
 
 
 def _build_intents() -> discord.Intents:
-    """
-    Minimal intents for a read-only listener.
-
-    Enabled:
-      - Guilds          (default; lets us see servers we're in)
-      - Guild messages  (so on_message fires for our watch channel)
-      - Message content (so we can read attachments; this is the
-                         "Message Content Intent" toggle in the
-                         Discord developer portal — must also be
-                         enabled there or attachments come through
-                         as empty).
-
-    Disabled (explicit default):
-      - Members, presences, typing, reactions, voice — none of these
-        are needed for our use case, and disabling them avoids
-        Discord's verification requirements at 100+ guilds.
-    """
     intents = discord.Intents.none()
     intents.guilds = True
     intents.guild_messages = True
@@ -474,36 +326,14 @@ def _build_intents() -> discord.Intents:
 
 
 # ---------------------------------------------------------------------------
-# Public API — called from main_bot.py
+# Public API
 # ---------------------------------------------------------------------------
 
 async def start_discord_listener(application: Application) -> None:
-    """
-    Spawn the Discord listener as a background task on PTB's event loop.
-
-    Called from main_bot.py's post_init hook. Returns immediately; the
-    actual Discord connection happens asynchronously.
-
-    Behavior on misconfiguration:
-      - Missing token → log warning and skip startup. The rest of the
-        bot continues working without Discord integration.
-      - Invalid IDs (zero) → log warning and skip.
-
-    Why warning-and-skip rather than fail-fast: the project's other
-    integrations (Comlink, Sheets) all crash on startup if their
-    credentials are missing — they're load-bearing. The Discord listener
-    is an optional enhancement; running the bot without it should be
-    possible while officers configure or troubleshoot Discord.
-    """
     token = getattr(bot_cfg, "DISCORD_BOT_TOKEN", "") or ""
     c3po_id = getattr(bot_cfg, "DISCORD_C3PO_USER_ID", 0) or 0
     channel_id = getattr(bot_cfg, "DISCORD_WATCH_CHANNEL_ID", 0) or 0
     forward_chat = getattr(bot_cfg, "TB_AUTO_FORWARD_CHAT_ID", 0) or 0
-    # Optional — defaults to 0 (no thread). Negative values are never
-    # valid (Telegram topic ids are positive integers), but we don't
-    # reject them here; the validation happens at send time via the
-    # 'if self._auto_forward_thread_id:' guard, which treats 0 and
-    # negatives equivalently as "do not include the kwarg".
     forward_thread = getattr(bot_cfg, "TB_AUTO_FORWARD_THREAD_ID", 0) or 0
 
     if not token:
@@ -528,8 +358,6 @@ async def start_discord_listener(application: Application) -> None:
         return
 
     if forward_thread < 0:
-        # Defensive — a negative thread id is never valid. Log and
-        # treat as 0 (= no thread) rather than failing startup.
         log.warning(
             "TB_AUTO_FORWARD_THREAD_ID=%d is negative; treating as 0.",
             forward_thread,
@@ -546,28 +374,16 @@ async def start_discord_listener(application: Application) -> None:
         intents=_build_intents(),
     )
 
-    # Spawn client.start() as a background task. start() blocks until
-    # the connection drops, so we never await it here — we let it run
-    # alongside PTB's polling loop.
     task = asyncio.create_task(
         _run_client(client, token),
         name="discord_listener",
     )
 
-    # Stash for shutdown. We keep both the client (so we can .close())
-    # and the task (so we can cancel and await it cleanly).
     application.bot_data[_LISTENER_KEY] = (client, task)
     log.info("Discord listener task spawned.")
 
 
 async def _run_client(client: _TBListenerClient, token: str) -> None:
-    """
-    Inner runner that handles the discord.py login errors we care about.
-
-    discord.py raises LoginFailure for a bad token. We log and exit
-    rather than letting the exception bubble up and crash PTB's loop.
-    Any other unexpected exception is logged with a stack trace.
-    """
     try:
         await client.start(token, reconnect=True)
     except discord.LoginFailure:
@@ -576,19 +392,12 @@ async def _run_client(client: _TBListenerClient, token: str) -> None:
             "Reset DISCORD_BOT_TOKEN and restart."
         )
     except asyncio.CancelledError:
-        # Shutdown path — propagate so the task cleans up.
         raise
     except Exception:
         log.exception("Unexpected error in Discord listener task.")
 
 
 async def stop_discord_listener(application: Application) -> None:
-    """
-    Close the Discord client cleanly. Called from main_bot.py's
-    post_shutdown hook.
-
-    Idempotent: safe to call even if start_discord_listener was a no-op.
-    """
     entry: Optional[tuple] = application.bot_data.pop(_LISTENER_KEY, None)
     if entry is None:
         return
@@ -600,8 +409,6 @@ async def stop_discord_listener(application: Application) -> None:
     except Exception:
         log.exception("Error closing Discord client.")
 
-    # Wait for the task to actually finish, with a short timeout so
-    # we don't hang the shutdown.
     try:
         await asyncio.wait_for(task, timeout=5.0)
     except asyncio.TimeoutError:
