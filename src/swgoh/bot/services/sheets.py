@@ -343,7 +343,7 @@ def usuarios_already_registered(ss, user_id: int, guild_name: str) -> bool:
 
 def usuarios_guilds_for_user(ss, user_id: int) -> List[Tuple[str, str, str]]:
     """Returns [(label, guild_id, guild_name)] for all guilds the user belongs to."""
-    uh, ur = read_values_cached(ss, USERS_SHEET)T)    
+    uh, ur = read_values_cached(ss, USERS_SHEET) 
     ul    = [h.lower() for h in uh]
     i_uid = ul.index("user_id")    if "user_id"    in ul else None
     i_gn  = ul.index("guild_name") if "guild_name" in ul else None
