@@ -31,12 +31,20 @@ from collections import defaultdict
 from typing import DefaultDict, Dict, List, Optional, Tuple
 
 import pytz
-from gspread.exceptions import APIError
 from telegram.ext import ContextTypes
 
 # ── shared infrastructure ────────────────────────────────────────────────────
 from ...sheets import spreadsheet as open_spreadsheet
 from ... import config as cfg
+
+# Sheet IO primitives now live in services/sheets_io.py for proper layering.
+# Re-exported here so existing callers (commands/sendassignments.py, etc.)
+# don't break. New code should import from sheets_io directly.
+from ..services.sheets_io import (
+    read_values_cached,
+    _read_all_values,
+    _with_backoff,
+)
 # ─────────────────────────────────────────────────────────────────────────────
 
 log = logging.getLogger(__name__)
@@ -299,7 +307,7 @@ def run() -> int:
     log.info("[send_assignments] Phase: %s", fase)
 
     # --- Read USUARIOS once ---
-    u_headers, u_rows = _read_all_values(ss, SHEET_USERS)
+    u_headers, u_rows = read_values_cached(ss, SHEET_USERS)
     if not u_rows:
         log.info("[send_assignments] No registered users found.")
         return 0
@@ -321,7 +329,7 @@ def run() -> int:
     log.debug("Valid users: %d", len(users))
 
     # --- Read GUILDS once, map Guild Name → ROTE sheet ---
-    g_headers, g_rows = _read_all_values(ss, SHEET_GUILDS)
+    g_headers, g_rows = read_values_cached(ss, SHEET_GUILDS)
     ghm            = _hmap(g_headers)
     idx_guild_name = _find_col(ghm, ["Guild Name", "guild_name", "gremio"])
     idx_rote       = _find_col(ghm, ["ROTE"])
@@ -345,8 +353,8 @@ def run() -> int:
     for guild_name, lst in per_guild.items():
         sheet_name = guild_to_rote.get(guild_name) or cfg.SHEET_ASSIGNMENTS
 
-        try:
-            a_headers, a_rows = _read_all_values(ss, sheet_name)
+       try:
+            a_headers, a_rows = read_values_cached(ss, sheet_name)
         except Exception as e:
             log.warning(
                 "Cannot open sheet '%s' for guild '%s': %s",
@@ -354,7 +362,7 @@ def run() -> int:
             )
             skipped += len(lst)
             continue
-
+          
         if not a_rows:
             log.debug(
                 "Sheet '%s' is empty for guild '%s'.", sheet_name, guild_name
