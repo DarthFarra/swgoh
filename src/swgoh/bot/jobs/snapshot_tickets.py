@@ -11,29 +11,32 @@ Scheduling logic:
 
 Missed-deadline auto-post (opt-in via `ticket_missed_post_enabled` column):
   After the snapshot is persisted, if the column is enabled for the guild and
-  an announcements channel is configured, post the final "who missed tickets
-  today" list to the channel. The list is computed from the SAME members
-  fetched for the snapshot, so it represents the exact pre-reset state.
+  an announcements channel is configured, post the "who missed yesterday's
+  600-ticket goal" list to the channel.
 
-Ordering matters here: the snapshot must persist BEFORE we post, so that a
-post-failure can never roll back snapshot data. The reverse order would risk
-posting accurate info but losing the snapshot if the sheet write failed.
+  The data shown is computed from the TWO SNAPSHOTS (today's lifetime_d vs
+  the previous lifetime_d which becomes today's lifetime_d1). This avoids
+  the post-reset race where reading currentValue after reset returns 0 for
+  every member — because the CG game server resets currentValue atomically
+  at reset time, by the time our cron fires the live data is already wiped.
+  The snapshot deltas are immune to this: they compare two monotonically-
+  increasing lifetime totals captured 24h apart.
 
 Async vs sync split:
   - `run_snapshot_for_guild(guild_id, guild_name)` stays synchronous — it's
-    callable from any context (scripts, tests, ad-hoc invocations) and never
-    touches Telegram. Same contract as before.
+    callable from any context (scripts, tests, catch-up) and never touches
+    Telegram. Same contract as before. Returns the members list.
   - `run_snapshot_and_publish(...)` is the async coroutine the scheduler uses
-    at runtime. It calls the sync snapshot, then awaits the channel post.
-    This is what's registered with AsyncIOScheduler so the publish runs on
-    the bot's event loop (where PTB's httpx client lives).
+    at runtime. It runs the snapshot AND captures the pre-upsert lifetime_d
+    so the publish path has both halves of the delta in memory, without a
+    read-after-write of the sheet.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime, time
-from typing import Optional
+from typing import Dict, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from telegram.error import Forbidden, BadRequest, TelegramError
@@ -44,6 +47,7 @@ from ..services.sheets import (
     list_guilds_with_reset_time,
     upsert_ticket_snapshots,
     snapshot_taken_today,
+    read_ticket_snapshot,
     get_ticket_auto_post_flags,
     get_channel_config_for_guild,
     get_usernames_for_members,
@@ -51,7 +55,8 @@ from ..services.sheets import (
 )
 from ..services.tickets import (
     fetch_guild_tickets,
-    publish_tickets_to_channel,
+    render_tickets_yesterday_channel,
+    DAILY_TICKET_GOAL,
     MemberTickets,
 )
 
@@ -83,16 +88,15 @@ def set_bot_for_snapshot_jobs(bot) -> None:
 def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets]:
     """
     Fetches lifetimeValue + currentValue for all guild members and writes the
-    snapshot to the sheet. Returns the fetched members list so a caller that
-    also wants to do something with the same data (e.g. publish a message)
-    doesn't have to hit the comlink API a second time.
+    snapshot to the sheet. Returns the fetched members list.
 
-    Designed to be called by APScheduler OR ad-hoc from a script/test.
-    Exceptions are caught and logged so a single guild failure never crashes
-    the caller; returns an empty list on failure.
+    Designed to be called by APScheduler (catch-up path) OR ad-hoc from a
+    script/test. Exceptions are caught and logged so a single guild failure
+    never crashes the caller; returns an empty list on failure.
 
-    Contract change vs the original: previously returned None. New return type
-    is additive — existing callers that ignore the return value still work.
+    Does NOT publish to any channel. The publish path lives in
+    `run_snapshot_and_publish` which has access to the pre-upsert state
+    needed for the delta-based missed-deadline message.
     """
     log.info("Starting ticket snapshot for guild '%s' (id=%s)", guild_name, guild_id)
     try:
@@ -130,34 +134,113 @@ def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets
 
 async def run_snapshot_and_publish(guild_id: str, guild_name: str) -> None:
     """
-    Scheduler entry point. Runs the (sync) snapshot in the default thread pool
-    so a slow comlink fetch can't block the event loop, then — if auto-post is
-    enabled — awaits the channel publish on the loop.
+    Scheduler entry point. Runs the (sync) snapshot work in the default
+    thread pool so a slow comlink fetch can't block the event loop, then
+    — if auto-post is enabled — awaits the channel publish on the loop.
 
-    This is the function registered with AsyncIOScheduler. Keeping the heavy
-    sync work off the loop matters when there are many guilds: a 5s comlink
-    response time × N guilds firing in the same minute would otherwise stall
-    every other scheduled task on the loop.
+    Captures the PREVIOUS lifetime_d BEFORE the upsert so we don't need to
+    re-read the sheet after the write. The previous lifetime_d is what
+    becomes today's lifetime_d1, which is half of the data the renderer
+    needs (the other half — today's lifetime_d — is in the `members` list
+    we just fetched).
     """
     loop = asyncio.get_running_loop()
-    members = await loop.run_in_executor(
-        None, run_snapshot_for_guild, guild_id, guild_name,
+
+    captured = await loop.run_in_executor(
+        None, _snapshot_for_guild_with_capture, guild_id, guild_name,
     )
-    if not members:
-        return  # snapshot failed or guild empty — nothing to publish
+    if captured is None:
+        return
 
-    await _maybe_publish_missed_post(guild_id, guild_name, members)
+    members, snapshot_d, snapshot_d1 = captured
+    await _maybe_publish_missed_post(
+        guild_id, guild_name, members, snapshot_d, snapshot_d1,
+    )
 
+
+# ---------------------------------------------------------------------------
+# Snapshot with pre-upsert state capture
+# ---------------------------------------------------------------------------
+
+def _snapshot_for_guild_with_capture(
+    guild_id: str, guild_name: str,
+) -> Optional[Tuple[list[MemberTickets], Dict[str, int], Dict[str, int]]]:
+    """
+    Like run_snapshot_for_guild, but also captures the previous lifetime_d
+    state so callers can render the missed-deadline message without a
+    read-after-write of the sheet.
+
+    Returns (members, snapshot_d, snapshot_d1) on success, None on failure:
+      - members:     the fetched MemberTickets (same as run_snapshot_for_guild)
+      - snapshot_d:  name_lower → lifetime_value just written (= new lifetime_d)
+      - snapshot_d1: name_lower → previous lifetime_d (= new lifetime_d1)
+
+    Why we read BEFORE upsert (rather than after): the upsert calls
+    ws.clear() + ws.update(), which would render any cached read stale.
+    The read-then-write order also matches how the data semantically
+    flows — "promote the previous value to d1, then write the new d".
+    """
+    log.info(
+        "Starting ticket snapshot+capture for guild '%s' (id=%s)",
+        guild_name, guild_id,
+    )
+    try:
+        ss      = open_ss()
+        members = fetch_guild_tickets(guild_id)
+
+        if not members:
+            log.warning(
+                "No members returned for guild '%s'; skipping snapshot.",
+                guild_name,
+            )
+            return None
+
+        # Capture previous snapshot's lifetime_d (= soon-to-be lifetime_d1).
+        # Empty dict on a guild's first-ever snapshot — that's fine, the
+        # renderer will put every member in the "new members, no judgement"
+        # bucket which is the honest interpretation.
+        previous_lifetime_d: Dict[str, int] = {}
+        previous_snapshot = read_ticket_snapshot(ss, guild_name)
+        if previous_snapshot is not None:
+            _, prev_d, _ = previous_snapshot   # (date, lifetime_d, lifetime_d1)
+            previous_lifetime_d = prev_d
+
+        snapshots = {m.player_name: m.lifetime_value for m in members}
+        upsert_ticket_snapshots(ss, guild_name, snapshots)
+
+        log.info(
+            "Snapshot saved for guild '%s': %d members, date=%s",
+            guild_name,
+            len(snapshots),
+            datetime.now(MADRID_TZ).date().isoformat(),
+        )
+
+        snapshot_d  = {m.player_name.lower(): m.lifetime_value for m in members}
+        snapshot_d1 = previous_lifetime_d   # already keyed by name_lower
+
+        return members, snapshot_d, snapshot_d1
+    except Exception:
+        log.exception(
+            "Unexpected error during ticket snapshot for guild '%s' (id=%s)",
+            guild_name, guild_id,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Missed-deadline publish — async, runs on the bot's event loop
+# ---------------------------------------------------------------------------
 
 async def _maybe_publish_missed_post(
     guild_id: str,
     guild_name: str,
     members: list[MemberTickets],
+    snapshot_d: Dict[str, int],
+    snapshot_d1: Dict[str, int],
 ) -> None:
     """
-    Conditionally publish the missed-deadline summary using the `members`
-    list already fetched for the snapshot. Avoids a second comlink call AND
-    ensures published numbers match the just-written snapshot exactly.
+    Conditionally publish the missed-deadline summary using the snapshot
+    delta (lifetime_d − lifetime_d1 < 600 → member missed yesterday).
 
     Gated by:
       - ticket_missed_post_enabled = TRUE in Guilds sheet
@@ -170,7 +253,7 @@ async def _maybe_publish_missed_post(
     """
     if _BOT is None:
         log.debug(
-            "Snapshot auto-post skipped for '%s': bot reference not set "
+            "Missed-post skipped for '%s': bot reference not set "
             "(running outside the main bot process?).",
             guild_name,
         )
@@ -178,10 +261,9 @@ async def _maybe_publish_missed_post(
 
     loop = asyncio.get_running_loop()
 
-    # Sheet reads are blocking I/O — punt them to the executor too.
     try:
         ss = await loop.run_in_executor(None, open_ss)
-        flags = await loop.run_in_executor(
+        _, missed_post_enabled = await loop.run_in_executor(
             None, get_ticket_auto_post_flags, ss, guild_name,
         )
     except Exception:
@@ -191,7 +273,6 @@ async def _maybe_publish_missed_post(
         )
         return
 
-    _, missed_post_enabled = flags
     if not missed_post_enabled:
         log.info(
             "[missed_post] guild '%s' has missed-post disabled; skipping.",
@@ -230,48 +311,61 @@ async def _maybe_publish_missed_post(
         )
         label = guild_name
 
-    delinquents = [m for m in members if not m.completed_today]
+    # Build the casing map. Renderer needs to display original-cased player
+    # names when there's no @username to mention; snapshot dicts are keyed
+    # by lowered names. This map is the bridge.
+    name_map: Dict[str, str] = {
+        m.player_name.lower(): m.player_name for m in members
+    }
 
-    usernames: dict[str, Optional[str]] = {}
-    if delinquents:
+    # Compute who will be mentioned (delinquents + new members) so we only
+    # look up usernames for them — no point fetching usernames for the
+    # compliant majority that won't appear in the message.
+    will_be_mentioned: list[str] = []
+    for name_lower, ld in snapshot_d.items():
+        if name_lower not in snapshot_d1:
+            will_be_mentioned.append(name_lower)
+            continue
+        if ld - snapshot_d1[name_lower] < DAILY_TICKET_GOAL:
+            will_be_mentioned.append(name_lower)
+
+    usernames: Dict[str, Optional[str]] = {}
+    if will_be_mentioned:
         try:
+            mentioned_original = [
+                name_map.get(n, n) for n in will_be_mentioned
+            ]
             usernames = await loop.run_in_executor(
                 None,
                 get_usernames_for_members,
                 ss,
                 guild_name,
-                [m.player_name for m in delinquents],
+                mentioned_original,
             )
         except Exception:
             log.exception(
                 "[missed_post] username lookup failed for '%s'; using plain names.",
                 guild_name,
             )
+            usernames = {}
 
-    # publish_tickets_to_channel uses render_tickets_today_channel internally.
-    # That renderer filters to delinquents AND emits the celebratory ✅ when
-    # the filtered list is empty. So:
-    #   - delinquents non-empty → pass the full `members` (or just delinquents,
-    #     it doesn't matter — the filter does the same job) + a header_override
-    #     framing this as the deadline post.
-    #   - delinquents empty → pass `members`, header_override=None → renderer
-    #     emits the standard ✅ message.
-    header_override = (
-        "Deadline alcanzado — Tickets no completados hoy"
-        if delinquents
-        else None
+    text = render_tickets_yesterday_channel(
+        snapshot_d=snapshot_d,
+        snapshot_d1=snapshot_d1,
+        name_map=name_map,
+        usernames=usernames,
+        guild_label=label,
     )
 
     try:
-        await publish_tickets_to_channel(
-            bot=_BOT,
-            channel_id=channel_id,
-            members=members,
-            usernames=usernames,
-            guild_label=label,
-            thread_id=thread_id,
-            header_override=header_override,
-        )
+        kwargs = {
+            "chat_id":    channel_id,
+            "text":       text,
+            "parse_mode": "MarkdownV2",
+        }
+        if thread_id is not None:
+            kwargs["message_thread_id"] = thread_id
+        await _BOT.send_message(**kwargs)
     except Forbidden:
         log.error(
             "[missed_post] bot is not admin of channel %s (guild '%s').",
@@ -289,8 +383,8 @@ async def _maybe_publish_missed_post(
         return
 
     log.info(
-        "[missed_post] posted for guild '%s' (delinquents=%d).",
-        guild_name, len(delinquents),
+        "[missed_post] posted for guild '%s' (mentioned=%d, total=%d).",
+        guild_name, len(will_be_mentioned), len(members),
     )
 
 
@@ -304,7 +398,9 @@ def schedule_snapshot_jobs(scheduler) -> None:
     CronTrigger for each, firing at exactly the reset time (Madrid TZ).
 
     Also performs a catch-up check: if today's snapshot is missing and the
-    current time is past the reset, runs the snapshot immediately.
+    current time is past the reset, runs the snapshot immediately. Catch-up
+    uses the sync helper and does NOT post — a "deadline reached" message
+    hours after the actual reset would be confusing.
 
     Call once during bot startup after the scheduler has started.
     """
@@ -318,7 +414,9 @@ def schedule_snapshot_jobs(scheduler) -> None:
         return
 
     if not guilds:
-        log.warning("No guilds with reset_time configured; snapshot jobs not scheduled.")
+        log.warning(
+            "No guilds with reset_time configured; snapshot jobs not scheduled."
+        )
         return
 
     now_madrid = datetime.now(MADRID_TZ)
@@ -328,7 +426,6 @@ def schedule_snapshot_jobs(scheduler) -> None:
         if hour is None:
             continue
 
-        # Register the daily cron job at exactly reset time.
         # We register the ASYNC wrapper so AsyncIOScheduler runs it on the
         # bot's event loop, where the publish coroutine can talk to Telegram.
         job_id = f"snapshot_tickets_{guild_id}"
@@ -355,12 +452,9 @@ def schedule_snapshot_jobs(scheduler) -> None:
             guild_name, hour, minute,
         )
 
-        # Catch-up: if past reset time today and snapshot not yet taken, run now.
-        # We deliberately call the SYNC helper here — catch-up snapshots should
-        # NOT trigger the auto-post (a "deadline reached" message hours late is
-        # noise, not signal). The next real cron fire will post normally.
+        # Catch-up via SYNC helper — does not post (silent by design).
         reset_today = now_madrid.replace(
-            hour=hour, minute=minute, second=0, microsecond=0
+            hour=hour, minute=minute, second=0, microsecond=0,
         )
         past_reset      = now_madrid >= reset_today
         before_midnight = now_madrid.time() < time(23, 59)
@@ -390,9 +484,7 @@ def schedule_snapshot_jobs(scheduler) -> None:
 # ---------------------------------------------------------------------------
 
 def _parse_reset_time(reset_time_str: str, guild_name: str):
-    """
-    Parses 'HH:MM'. Returns (hour, minute) as ints or (None, None) on failure.
-    """
+    """Parses 'HH:MM'. Returns (hour, minute) or (None, None) on failure."""
     try:
         parts = reset_time_str.strip().split(":")
         if len(parts) != 2:
