@@ -901,9 +901,14 @@ def _undeployed_section_lines(
     threshold_pct: float,
 ) -> List[str]:
     """
-    Render the "Undeployed (N):" section as a bulleted list with
-    missing-GP per member. Sorted by missing_gp descending — biggest
-    gaps first, matches officers' priority order.
+    Render the "Undeployed (N) — TotalMissing" section as a bulleted
+    list with missing-GP per member. Sorted by missing_gp descending —
+    biggest gaps first, matches officers' priority order.
+
+    Header line includes the SUM of missing GP across all undeployed
+    members. The sum is computed across ALL rows (not just the visible
+    ones above MAX_LIST_ITEMS), so officers always see the true total
+    even when the list itself is truncated with "and N more".
 
     Per-member rendering decision:
       Shows "missing GP" (e.g. "13.7M") rather than percentage. Missing
@@ -921,7 +926,13 @@ def _undeployed_section_lines(
     if not rows:
         return []
 
-    lines: List[str] = [f"Undeployed ({len(rows)}):"]
+    # Sum across ALL rows, not just the visible slice — officers need
+    # the true total even when the list is truncated.
+    total_missing = sum(row.missing_gp for row in rows)
+
+    lines: List[str] = [
+        f"Undeployed ({len(rows)}) — {_fmt_gp(total_missing)}:"
+    ]
     visible_rows = rows[:MAX_LIST_ITEMS]
     for row in visible_rows:
         name = _escape_md(row.player_name)
