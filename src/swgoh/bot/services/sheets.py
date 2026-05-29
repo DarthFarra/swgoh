@@ -133,8 +133,8 @@ def get_channel_config_for_guild(
     Returns (channel_id, thread_id) for guild_name in a single sheet read.
     thread_id is None if the column is missing, empty, or not a valid integer.
     """
-    ws = ss.worksheet(GUILDS_SHEET)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, GUILDS_SHEET)
+    
     hl = [h.strip().lower() for h in headers]
     if "guild name" not in hl or "announcements_channel" not in hl:
         return None, None
@@ -410,8 +410,7 @@ def upsert_usuario(ss, info: dict, tg_username: str, user_id: int, chat_id: int)
 
 
 def user_has_leadership_role(ss, user_id: int, guild_name: str) -> bool:
-    ws = ss.worksheet(USERS_SHEET)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, USERS_SHEET)
     hl = [h.lower() for h in headers]
     try:
         i_uid = hl.index("user_id")
@@ -457,8 +456,9 @@ def get_chat_ids_for_members(
     whose name (case-insensitive) is in player_names.
     Only includes rows where chat_id is a valid integer.
     """
-    ws = ss.worksheet(USERS_SHEET)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, USERS_SHEET)
+
+    
     hl = [h.strip().lower() for h in headers]
     required = ["alias", "guild_name", "chat_id"]
     if any(col not in hl for col in required):
@@ -490,8 +490,8 @@ def get_usernames_for_members(
     Returns {player_name_lower: username_or_None} for members of guild_name.
     username is the bare @handle without '@', or None if not set.
     """
-    ws = ss.worksheet(USERS_SHEET)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, USERS_SHEET)
+    
     hl = [h.strip().lower() for h in headers]
     required = ["alias", "guild_name"]
     if any(col not in hl for col in required):
@@ -867,12 +867,11 @@ def read_ticket_snapshot(
     Returns (last_snapshot_date, lifetime_d, lifetime_d1) for guild_name,
     or None if no snapshot exists.
     """
+    
     try:
-        ws = ss.worksheet(TICKET_SNAPSHOTS_SHEET)
+        headers, rows = read_values_cached(ss, TICKET_SNAPSHOTS_SHEET)
     except Exception:
         return None
-
-    headers, rows = _get_all(ws)
     if not rows:
         return None
 
