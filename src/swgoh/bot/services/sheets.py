@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
+from .sheets_io import read_values_cached
 
 from .. import config as bot_cfg
 from ... import sheets as core_sheets
@@ -33,8 +34,7 @@ def _get_all(ws):
 
 def map_guild_name_to_label_id_rote(ss) -> Dict[str, Tuple[str, str, str]]:
     """Guild Name -> (label, guild_id, rote_sheet_name)"""
-    ws = ss.worksheet(GUILDS_SHEET)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, GUILDS_SHEET)
     hl = [h.lower() for h in headers]
     try:
         i_name = hl.index("guild name")
@@ -343,8 +343,7 @@ def usuarios_already_registered(ss, user_id: int, guild_name: str) -> bool:
 
 def usuarios_guilds_for_user(ss, user_id: int) -> List[Tuple[str, str, str]]:
     """Returns [(label, guild_id, guild_name)] for all guilds the user belongs to."""
-    ws = ss.worksheet(USERS_SHEET)
-    uh, ur = _get_all(ws)
+    uh, ur = read_values_cached(ss, USERS_SHEET)T)    
     ul    = [h.lower() for h in uh]
     i_uid = ul.index("user_id")    if "user_id"    in ul else None
     i_gn  = ul.index("guild_name") if "guild_name" in ul else None
@@ -430,8 +429,7 @@ def user_has_leadership_role(ss, user_id: int, guild_name: str) -> bool:
 
 
 def user_alias_for_guild(ss, user_id: int, guild_name: str) -> Optional[str]:
-    ws = ss.worksheet(USERS_SHEET)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, USERS_SHEET)
     hl = [h.lower() for h in headers]
     try:
         i_uid   = hl.index("user_id")
@@ -706,8 +704,7 @@ def render_assignments_for_alias(ss, rote_sheet: str, alias: str) -> str:
 
 
 def list_phases_in_rote(ss, rote_sheet: str):
-    ws = ss.worksheet(rote_sheet)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, rote_sheet)
     if not rows:
         return []
     hl = [h.lower() for h in headers]
@@ -728,8 +725,7 @@ def list_phases_in_rote(ss, rote_sheet: str):
 
 
 def render_ops_for_alias_phase_grouped(ss, rote_sheet: str, alias: str, phase: str) -> str:
-    ws = ss.worksheet(rote_sheet)
-    headers, rows = _get_all(ws)
+    headers, rows = read_values_cached(ss, rote_sheet)
     if not rows:
         return "No tienes asignaciones en esta fase."
     hl   = [h.lower() for h in headers]
