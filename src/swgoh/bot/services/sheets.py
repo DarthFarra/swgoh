@@ -548,6 +548,100 @@ def players_find_by_alias(ss, guild_name: str, alias: str) -> Optional[dict]:
             }
     return None
 
+# ============================================================================
+# ADDITION to src/swgoh/bot/services/sheets.py
+#
+# Place this near the existing player-related functions like
+# players_find_by_alias / list_players_for_guild.
+# ============================================================================
+
+
+def get_officer_player_names(ss, guild_name: str) -> set[str]:
+    """
+    Return the lowercased set of player_names for officers in `guild_name`.
+
+    "Officer" means a Players-sheet row where:
+      * `guild name`        equals guild_name (exact match)
+      * `role` (or `rol`)   is one of {Oficial, Lider, Líder} (case-insensitive)
+
+    Lowercase normalization happens here so callers can do
+    `if name.lower() in officer_names` without re-normalizing.
+
+    Returns an EMPTY SET on any of:
+      * sheet not readable
+      * required columns missing
+      * no matching rows
+
+    Empty-set return is the natural "no exclusion" behavior — callers
+    pass the result straight into a filter, and an empty set means
+    "no one is excluded." This keeps the call site simple:
+
+        excluded = get_officer_player_names(ss, gname)
+        kept = [m for m in members if m.player_name.lower() not in excluded]
+
+    Why query the Players sheet rather than the Users sheet:
+      The Players sheet's `role` is populated from CG's game data via
+      sync_guilds (CG reports member level: 1=Member, 2=Officer, 3=Leader).
+      That's reliable and doesn't depend on whether the officer has
+      registered with the bot via Telegram. The Users sheet only has
+      officers who explicitly /register'd, which would let unregistered
+      officers slip through the exclusion.
+    """
+    try:
+        ws = ss.worksheet(PLAYERS_SHEET)
+    except Exception:
+        log.warning(
+            "Could not open %s; treating as no officers.",
+            PLAYERS_SHEET,
+        )
+        return set()
+
+    try:
+        headers, rows = _get_all(ws)
+    except Exception as exc:
+        log.warning("Could not read %s: %s", PLAYERS_SHEET, exc)
+        return set()
+
+    hl = [h.lower() for h in headers]
+
+    # Required columns. We tolerate either "role" or "rol" because the
+    # codebase has historically used both.
+    try:
+        i_name = hl.index("player name")
+        i_gn = hl.index("guild name")
+    except ValueError:
+        log.warning(
+            "%s missing required columns (need 'player name' and 'guild name').",
+            PLAYERS_SHEET,
+        )
+        return set()
+
+    i_role = (
+        hl.index("role") if "role" in hl
+        else (hl.index("rol") if "rol" in hl else None)
+    )
+    if i_role is None:
+        log.warning(
+            "%s has no 'role' or 'rol' column; cannot identify officers.",
+            PLAYERS_SHEET,
+        )
+        return set()
+
+    leadership_roles = {"oficial", "lider", "líder"}
+    officers: set[str] = set()
+
+    for r in rows:
+        gn = (r[i_gn] if i_gn < len(r) else "").strip()
+        if gn != guild_name:
+            continue
+        role = (r[i_role] if i_role < len(r) else "").strip().lower()
+        if role not in leadership_roles:
+            continue
+        name = (r[i_name] if i_name < len(r) else "").strip()
+        if name:
+            officers.add(name.lower())
+
+    return officers
 
 def players_find_by_ally(ss, guild_name: str, allycode: str) -> Optional[dict]:
     ws = ss.worksheet(PLAYERS_SHEET)
