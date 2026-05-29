@@ -29,6 +29,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
+from enum import Enum
 
 from .models import (
     CategoryCounts,
@@ -190,6 +191,57 @@ class ThresholdGap:
     value: int
     stars: int
     points_short: int
+
+class EstimationState(str, Enum):
+    """
+    Discriminator for which message variant the formatter should render.
+ 
+    Using str-Enum (rather than plain Enum) so it serializes naturally
+    in logs and tests. The string values match what officers might grep
+    for in logs.
+    """
+    NO_TARGET           = "no_target"            # planet has no target configured
+    TARGET_MET          = "target_met"           # current score >= target threshold
+    PLATOONS_PLUS_RESIDUAL = "platoons+residual" # gap can be filled partly by remaining platoons
+    RESIDUAL_ONLY       = "residual_only"        # no platoon help available; pure GP+combat gap
+ 
+ 
+@dataclass(frozen=True, slots=True)
+class EstimationResult:
+    """
+    Per-planet "Est:" line breakdown.
+ 
+    The formatter dispatches on `state` to pick wording. The numeric
+    fields are filled per-state:
+ 
+      NO_TARGET:           all numeric fields = 0; just informational.
+      TARGET_MET:          target_threshold and target_stars meaningful;
+                           gap_total = 0.
+      PLATOONS_PLUS_RESIDUAL: all fields meaningful;
+                           platoon_part > 0; residual = gap_total - platoon_part.
+      RESIDUAL_ONLY:       platoon_part = 0; residual = gap_total.
+ 
+    Fields:
+      state               - which variant to render (see above)
+      target_stars        - the configured target (0 if no target)
+      target_threshold    - score needed to hit target_stars (0 if no target
+                            or if all stars achieved with no threshold above)
+      current_score       - planet's current score (echoed for convenience)
+      gap_total           - max(0, target_threshold - current_score)
+      platoon_part        - how much of gap_total can come from incomplete
+                            platoons (capped at gap_total — never overshoots)
+      residual            - gap_total - platoon_part; what still needs to
+                            come from member deployment + combat + specials
+    """
+    state: EstimationState
+    target_stars: int
+    target_threshold: int
+    current_score: int
+    gap_total: int
+    platoon_part: int
+    residual: int
+ 
+ 
 
 
 @dataclass(frozen=True, slots=True)
@@ -855,7 +907,124 @@ def planet_report(
         non_participants=non_participants,
     )
 
-
+def estimate_to_target(
+    report: "PlanetReport",
+    target_stars: Optional[int],
+    thresholds: Sequence[Tuple[int, int]],
+) -> EstimationResult:
+    """
+    Compute the "Est:" breakdown for one planet given a target star count.
+ 
+    Pure function; no I/O. Inputs:
+      report:        the PlanetReport already built for this planet.
+      target_stars:  the configured target (1..3), or None if no target.
+      thresholds:    list of (score_value, stars_granted) pairs from
+                     MapConfig, in any order. Same data the report was
+                     built from — passed explicitly to keep this function
+                     decoupled from PlanetConfig.
+ 
+    Returns:
+      EstimationResult — see the dataclass docstring for state semantics.
+ 
+    Threshold resolution:
+      target_stars maps to "the threshold whose CUMULATIVE star count
+      first reaches target_stars." This handles bonus-territory layouts
+      where the first thresholds are reward-only (stars=0) and only the
+      final threshold grants a star. Setting target_stars=1 on such a
+      planet correctly resolves to the star-granting threshold.
+ 
+      If target_stars exceeds the max stars on this planet, we clamp to
+      the highest reachable cumulative — silently. Officers typing 4 on
+      a 3-star planet get treated as "target = all 3 stars" rather than
+      seeing an error.
+ 
+    Platoon math:
+      platoon_part = min(report.platoons.points_remaining, gap_total).
+      Cap at gap_total because if remaining platoons exceed the gap,
+      finishing all of them still only "uses up" the gap — anything
+      beyond is overshoot. Showing "120M en platoons + 0M" when the
+      gap is only 80M would mislead.
+ 
+      When report.platoons is None (no platoon config) or 0 platoons
+      remain, platoon_part = 0 and we drop to RESIDUAL_ONLY.
+    """
+    # No-target path is the first branch — short-circuit before any math.
+    if target_stars is None:
+        return EstimationResult(
+            state=EstimationState.NO_TARGET,
+            target_stars=0,
+            target_threshold=0,
+            current_score=report.score,
+            gap_total=0,
+            platoon_part=0,
+            residual=0,
+        )
+ 
+    if not thresholds:
+        # Shouldn't happen — target is set but planet has no threshold
+        # config. Treat as NO_TARGET for sane fallback.
+        return EstimationResult(
+            state=EstimationState.NO_TARGET,
+            target_stars=target_stars,
+            target_threshold=0,
+            current_score=report.score,
+            gap_total=0,
+            platoon_part=0,
+            residual=0,
+        )
+ 
+    # Find the threshold at which cumulative stars reaches target_stars.
+    # Sort ascending by value so we walk thresholds in score order.
+    sorted_t = sorted(thresholds, key=lambda t: t[0])
+    cumulative = 0
+    target_threshold = 0
+    for value, stars in sorted_t:
+        cumulative += stars
+        if cumulative >= target_stars:
+            target_threshold = value
+            break
+    else:
+        # target_stars exceeds max — clamp to last threshold's value.
+        # cumulative now equals max_stars. Treat as "target the highest
+        # achievable star count" — friendlier than an error.
+        target_threshold = sorted_t[-1][0]
+ 
+    # Target met?
+    if report.score >= target_threshold:
+        return EstimationResult(
+            state=EstimationState.TARGET_MET,
+            target_stars=target_stars,
+            target_threshold=target_threshold,
+            current_score=report.score,
+            gap_total=0,
+            platoon_part=0,
+            residual=0,
+        )
+ 
+    gap_total = target_threshold - report.score
+ 
+    # Platoon contribution — cap at gap to avoid overshoot in the display.
+    platoon_remaining = 0
+    if report.platoons is not None:
+        platoon_remaining = report.platoons.points_remaining
+ 
+    platoon_part = min(platoon_remaining, gap_total)
+    residual = gap_total - platoon_part
+ 
+    if platoon_part > 0:
+        state = EstimationState.PLATOONS_PLUS_RESIDUAL
+    else:
+        state = EstimationState.RESIDUAL_ONLY
+ 
+    return EstimationResult(
+        state=state,
+        target_stars=target_stars,
+        target_threshold=target_threshold,
+        current_score=report.score,
+        gap_total=gap_total,
+        platoon_part=platoon_part,
+        residual=residual,
+    )
 def active_planet_zones(snap: TBSnapshot) -> List[str]:
     """
     All zone IDs that are currently active (state 2 ACTIVE or 3 OPEN).
