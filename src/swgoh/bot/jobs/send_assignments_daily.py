@@ -353,15 +353,15 @@ def run() -> int:
     for guild_name, lst in per_guild.items():
         sheet_name = guild_to_rote.get(guild_name) or cfg.SHEET_ASSIGNMENTS
 
-       try:
-            a_headers, a_rows = read_values_cached(ss, sheet_name)
-        except Exception as e:
-            log.warning(
-                "Cannot open sheet '%s' for guild '%s': %s",
-                sheet_name, guild_name, e,
-            )
-            skipped += len(lst)
-            continue
+      try:
+        a_headers, a_rows = read_values_cached(ss, sheet_name)
+      except Exception as e:
+        log.warning(
+          "Cannot open sheet '%s' for guild '%s': %s",
+          sheet_name, guild_name, e,
+        )
+        skipped += len(lst)
+        continue
           
         if not a_rows:
             log.debug(
