@@ -72,6 +72,7 @@ from ..services.sheets import (
     get_usernames_for_members,
     get_tb_channel_config_for_guild,
     resolve_label_name_by_guild_id,
+    get_officer_player_names,
 )
 from ..services.tb_undeployed_cache import (
     UndeployedSnapshot,
@@ -527,6 +528,11 @@ async def cb_tbu_publish_execute(
         usernames = get_usernames_for_members(
             ss, gname, [m.player_name for m in snapshot.members]
         )
+        # Officer exclusion is a publish-only behavior — DMs include
+        # everyone, but the public channel post strips officer names.
+        # See get_officer_player_names docstring for why we query the
+        # Players sheet rather than the Users sheet.
+        officer_names = get_officer_player_names(ss, gname)
     except Exception:
         log.exception("Sheet read failed in publish_execute")
         await q.edit_message_text(
@@ -543,13 +549,14 @@ async def cb_tbu_publish_execute(
         return
 
     try:
-        await publish_deployment_to_channel(
+        published_count = await publish_deployment_to_channel(
             bot=context.bot,
             channel_id=channel_id,
             members=snapshot.members,
             usernames=usernames,
             guild_label=label,
             thread_id=thread_id,
+            excluded_player_names=officer_names,
         )
     except Forbidden:
         log.error("Bot lacks admin on channel %s", channel_id)
@@ -573,11 +580,25 @@ async def cb_tbu_publish_execute(
         )
         return
 
-    await q.edit_message_text(
-        f"*{_md2(label)}* \u2014 Publicado en el canal \u2705",
-        reply_markup=_disable_buttons_kb(),
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+    # The "published_count" may be less than len(snapshot.members) when
+    # officers were excluded. Showing both gives officers visibility
+    # into what got published.
+    total_undep = len(snapshot.members)
+    if published_count < total_undep:
+        excluded = total_undep - published_count
+        await q.edit_message_text(
+            f"*{_md2(label)}* \u2014 Publicado en el canal \u2705\n\n"
+            f"_{_md2(str(published_count))} miembros publicados "
+            f"\\({_md2(str(excluded))} oficiales excluidos\\)\\._",
+            reply_markup=_disable_buttons_kb(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    else:
+        await q.edit_message_text(
+            f"*{_md2(label)}* \u2014 Publicado en el canal \u2705",
+            reply_markup=_disable_buttons_kb(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
 
 
 # ---------------------------------------------------------------------------
