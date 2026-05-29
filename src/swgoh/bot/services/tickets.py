@@ -194,7 +194,93 @@ def render_tickets_yesterday(
 
     return "\n".join(lines)
 
+def render_tickets_yesterday_channel(
+    snapshot_d:  Dict[str, int],          # player_name_lower -> lifetimeValue today (just written)
+    snapshot_d1: Dict[str, int],          # player_name_lower -> lifetimeValue yesterday
+    name_map:    Dict[str, str],          # player_name_lower -> player_name (original casing)
+    usernames:   Dict[str, Optional[str]],# player_name_lower -> @handle without '@', or None
+    guild_label: str,
+    header_override: Optional[str] = None,
+) -> str:
+    """
+    Channel-rendered version of render_tickets_yesterday with @mentions.
 
+    Uses the same delta-based logic as the manual /tickets Ayer view, so it's
+    immune to the post-reset race that affects live currentValue. Sections:
+      • Missed deadline: members where lifetime_d − lifetime_d1 < 600
+      • New members:     members in snapshot_d but absent from snapshot_d1
+                         (joined after the previous reset; no judgement yet)
+
+    Mentions:
+      • If usernames has a non-None @handle for a player → render as @handle
+      • Otherwise → render the original-cased player name
+
+    If both sections are empty (everyone hit the goal), emits the celebratory
+    ✅ message.
+
+    Args:
+      header_override: replaces the default "Deadline alcanzado" header.
+                       Provide plain text; caller is responsible for any
+                       MarkdownV2 escapes of literal special chars.
+    """
+    missed: List[Tuple[str, int]] = []   # (name_lower, contributed)
+    new_members: List[str] = []          # name_lower
+
+    for name_lower, ld in snapshot_d.items():
+        if name_lower not in snapshot_d1:
+            new_members.append(name_lower)
+            continue
+        delta = ld - snapshot_d1[name_lower]
+        if delta < DAILY_TICKET_GOAL:
+            missed.append((name_lower, max(0, delta)))
+
+    label = _escape_md(guild_label)
+    total_members = len(snapshot_d)
+
+    if not missed and not new_members:
+        total = _escape_md(str(total_members))
+        goal  = _escape_md(str(DAILY_TICKET_GOAL))
+        return (
+            f"✅ *{label}* — Todos los {total} miembros contribuyeron "
+            f"sus {goal} tickets ayer\\!"
+        )
+
+    # Header
+    if header_override is not None:
+        header = f"*{label}* — {header_override}"
+    else:
+        count_str = _escape_md(f"{len(missed)}/{total_members}")
+        header = (
+            f"❌ *{label}* — Deadline alcanzado, tickets no completados ayer "
+            f"\\({count_str}\\):"
+        )
+
+    lines = [header, ""]   # blank line after header for readability
+
+    def _mention_or_name(name_lower: str) -> str:
+        handle = usernames.get(name_lower)
+        if handle:
+            return f"@{_escape_md(handle)}"
+        original = name_map.get(name_lower, name_lower)
+        return _escape_md(original)
+
+    if missed:
+        missed.sort(key=lambda x: x[1])   # least contribution first
+        goal = _escape_md(str(DAILY_TICKET_GOAL))
+        for name_lower, contributed in missed:
+            mention      = _mention_or_name(name_lower)
+            contrib_esc  = _escape_md(str(contributed))
+            lines.append(f"• {mention} \\({contrib_esc}/{goal}\\)")
+
+    if new_members:
+        if missed:
+            lines.append("")   # spacer between sections
+        lines.append("⚠️ *Nuevos miembros \\(sin datos de ayer\\):*")
+        for name_lower in sorted(new_members):
+            mention = _mention_or_name(name_lower)
+            lines.append(f"• {mention}")
+
+    return "\n".join(lines)
 
 async def publish_tickets_to_channel(
     bot,
