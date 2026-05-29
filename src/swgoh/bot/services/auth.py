@@ -1,14 +1,14 @@
 from __future__ import annotations
 from typing import List, Tuple
 from .sheets import _get_all, map_guild_name_to_label_id_rote
+from .sheets_io import read_values_cached
 from ..config import USERS_SHEET, GUILDS_SHEET
 
 def user_authorized_guilds(ss, user_id: int) -> List[Tuple[str, str]]:
     """
     Retorna (label, guild_id) donde el user_id tiene Rol {Lider,Oficial}.
     """
-    ws_u = ss.worksheet(USERS_SHEET)
-    uh, ur = _get_all(ws_u)
+    uh, ur = read_values_cached(ss, USERS_SHEET)
     ul = [h.lower() for h in uh]
     i_uid = ul.index("user_id") if "user_id" in ul else None
     i_gn  = ul.index("guild_name") if "guild_name" in ul else None
@@ -43,8 +43,8 @@ def user_has_role_in_guild(ss, user_id: int, guild_id: str) -> bool:
     """
     Comprueba que el user tenga Rol {Lider,Oficial} en el guild_id dado.
     """
-    ws_g = ss.worksheet(GUILDS_SHEET)
-    gh, gr = _get_all(ws_g)
+    gh, gr = read_values_cached(ss, GUILDS_SHEET)
+    
     gl = [h.lower() for h in gh]
     try:
         ig_id = gl.index("guild id"); ig_name = gl.index("guild name")
@@ -62,15 +62,13 @@ def user_has_role_in_guild(ss, user_id: int, guild_id: str) -> bool:
     if not gname:
         return False
 
-    ws_u = ss.worksheet(USERS_SHEET)
-    uh, ur = _get_all(ws_u)
+    uh, ur = read_values_cached(ss, USERS_SHEET)
     ul = [h.lower() for h in uh]
     i_uid = ul.index("user_id") if "user_id" in ul else None
     i_gn  = ul.index("guild_name") if "guild_name" in ul else None
     i_role = ul.index("rol") if "rol" in ul else (ul.index("role") if "role" in ul else None)
     if i_uid is None or i_gn is None or i_role is None:
         return False
-
     allowed = {"lider","oficial"}
     for r in ur:
         try:
