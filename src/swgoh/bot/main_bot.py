@@ -29,7 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram.ext import ApplicationBuilder
 
 from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE, TICKET_REMINDER_LEAD_MINUTES
-from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache
+from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache, tb_reload_targets
 from .error_handler import on_error
 from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs, set_bot_for_snapshot_jobs
@@ -138,6 +138,7 @@ def main() -> None:
         + omicrones.get_handlers()
         + tb.get_handlers()
         + tb_notifications.get_handlers()
+        + tb_reload_targets.get_handlers()
         + omicronsummary.get_handlers()
         + refreshcache.get_handlers()
     ):
@@ -225,6 +226,23 @@ def main() -> None:
                 len(cfg.planets), len(cfg.strike_names),
             )
 
+         # Load TB targets from Sheets into bot_data. Fail-soft: missing
+         # sheet just means estimation lines are silently skipped.
+         # Officers can refresh without a bot restart via /tb_reload_targets.
+         from .services import tb_targets_cache  # local import
+         targets = tb_targets_cache.load_into_bot_data(application.bot_data)
+         if targets.is_empty:
+             log.info(
+                 "TB targets sheet is empty or missing — auto-summary will "
+                 "skip estimation lines until populated. Use /tb_reload_targets "
+                 "after editing the TBTargets sheet."
+             )
+         else:
+             log.info(
+                 "TB targets loaded: %d entries.",
+                 len(targets.targets),
+             )
+      
         # 8. Discord listener (optional; skipped if not configured)
         await start_discord_listener(application)
 
