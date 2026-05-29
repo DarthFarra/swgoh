@@ -226,22 +226,22 @@ def main() -> None:
                 len(cfg.planets), len(cfg.strike_names),
             )
 
-         # Load TB targets from Sheets into bot_data. Fail-soft: missing
-         # sheet just means estimation lines are silently skipped.
-         # Officers can refresh without a bot restart via /tb_reload_targets.
-         from .services import tb_targets_cache  # local import
-         targets = tb_targets_cache.load_into_bot_data(application.bot_data)
-         if targets.is_empty:
-             log.info(
+        # Load TB targets from Sheets into bot_data. Fail-soft: missing
+          # sheet just means estimation lines are silently skipped.
+          # Officers can refresh without a bot restart via /tb_reload_targets.
+          from .services import tb_targets_cache  # local import
+          targets = tb_targets_cache.load_into_bot_data(application.bot_data)
+          if targets.is_empty:
+            log.info(
                  "TB targets sheet is empty or missing — auto-summary will "
                  "skip estimation lines until populated. Use /tb_reload_targets "
                  "after editing the TBTargets sheet."
-             )
-         else:
-             log.info(
-                 "TB targets loaded: %d entries.",
-                 len(targets.targets),
-             )
+            )
+          else:
+            log.info(
+              "TB targets loaded: %d entries.",
+              len(targets.targets),
+            )
       
         # 8. Discord listener (optional; skipped if not configured)
         await start_discord_listener(application)
