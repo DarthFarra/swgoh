@@ -29,7 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram.ext import ApplicationBuilder
 
 from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE, TICKET_REMINDER_LEAD_MINUTES
-from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary
+from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache
 from .error_handler import on_error
 from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs, set_bot_for_snapshot_jobs
@@ -139,7 +139,7 @@ def main() -> None:
         + tb.get_handlers()
         + tb_notifications.get_handlers()
         + omicronsummary.get_handlers()
-
+        + refreshcache.get_handlers()
     ):
         app.add_handler(handler)
 
