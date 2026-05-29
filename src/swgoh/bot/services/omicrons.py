@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .. import config as bot_cfg
 from . import sheets as svc_sheets
+from .sheets_io import read_values_cached
 
 log = logging.getLogger(__name__)
 
@@ -121,12 +122,11 @@ def read_omicron_catalog(ss) -> List[OmicronEntry]:
     the operator can spot the issue without the bot dying.
     """
     try:
-        ws = ss.worksheet(SHEET_OMICRONS_CATALOG)
+        headers, rows = read_values_cached(ss, SHEET_OMICRONS_CATALOG)
     except Exception as e:
         log.warning("Cannot open omicron catalog sheet %r: %s", SHEET_OMICRONS_CATALOG, e)
         return []
 
-    headers, rows = svc_sheets._get_all(ws)
     hl = [h.strip().lower() for h in headers]
 
     required = [COL_SKILL_ID, COL_OMI_MODE_TEXT, COL_CHAR_NAME, COL_CHAR_SKILL, COL_TIER]
@@ -197,8 +197,12 @@ def read_omicron_priorities(ss, guild_name: str, mode_text: str) -> List[Priorit
     Auto-creates the sheet (with headers only) if missing — never writes
     data, so manual edits are always safe.
     """
-    ws = _ensure_priorities_sheet(ss)
-    headers, rows = svc_sheets._get_all(ws)
+    # Side effect: creates the sheet (with headers only) if missing.
+    # We discard the returned worksheet and use the cached read below,
+    # which goes through the same gspread API but with backoff + TTL.
+    _ensure_priorities_sheet(ss)
+    headers, rows = read_values_cached(ss, SHEET_OMICRON_PRIORITIES)
+  
     hl = [h.strip().lower() for h in headers]
 
     required = ["guild name", "mode", "skill", "priority"]
