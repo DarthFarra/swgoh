@@ -371,7 +371,7 @@ def _run_for_guild(guild_id: str, fase: str) -> tuple[int, int]:
         return 0, 0
 
     # Read ROTE assignments
-try:
+    try:
         a_headers, a_rows = read_values_cached(ss, sheet_name)
     except Exception as e:
         log.warning("Cannot open ROTE sheet '%s': %s", sheet_name, e)
