@@ -22,11 +22,71 @@ from __future__ import annotations
 import logging
 from typing import List, Tuple
 
+import random
+import time
+from typing import Any, Callable
+
+from gspread.exceptions import APIError
+
 from ... import config as cfg
-from ...bot.jobs.send_assignments_daily import _read_all_values
 from . import sheets_cache
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Low-level sheet primitives
+#
+# These live here (rather than in bot/jobs/send_assignments_daily.py where
+# they were originally defined) so that sheets_io can be self-contained.
+# send_assignments_daily.py re-exports them for backward compatibility with
+# existing callers.
+# ---------------------------------------------------------------------------
+
+def _with_backoff(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """
+    Execute a gspread call with exponential-backoff retry on 429/5xx.
+
+    Underscore prefix marks this as an internal helper; callers should
+    prefer read_values_cached() which already wraps reads in backoff.
+    """
+    max_attempts = kwargs.pop("_attempts",   6)
+    base_sleep   = kwargs.pop("_base_sleep", 0.6)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            msg    = str(e)
+            transient = (
+                status in (429, 500, 502, 503, 504)
+                or "429" in msg
+                or "Rate Limit" in msg
+            )
+            if transient and attempt < max_attempts:
+                sleep = base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.25)
+                log.debug(
+                    "gspread retry %d/%d after status=%s; sleeping %.2fs",
+                    attempt, max_attempts, status or "??", sleep,
+                )
+                time.sleep(sleep)
+                continue
+            raise
+
+
+def _read_all_values(ss, sheet_name: str):
+    """
+    Single-shot uncached read of a sheet. Returns (headers, rows).
+
+    Prefer read_values_cached() for application code. This is the
+    primitive that read_values_cached() falls through to on a cache
+    miss, exposed at module level so existing call sites and tests
+    can use it directly.
+    """
+    ws      = _with_backoff(ss.worksheet, sheet_name)
+    vals    = _with_backoff(ws.get_all_values)
+    headers = [h.strip() for h in (vals[0] if vals else [])]
+    rows    = vals[1:] if len(vals) > 1 else []
+    return headers, rows
 
 
 # Per-sheet TTLs in seconds. Centralised so they're easy to tune.
