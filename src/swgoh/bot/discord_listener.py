@@ -39,7 +39,7 @@ from ..tb import (
     format_auto_summary,
     parse_tb_snapshot,
 )
-from ..tb.formatters import auto_summary_undeployed
+from ..tb.formatters import auto_summary_undeployed, format_auto_summary_split
 
 from . import config as bot_cfg
 from .services import tb_cache, tb_map_config_cache, tb_targets_cache
@@ -189,11 +189,20 @@ class _TBListenerClient(discord.Client):
 
         try:
             map_config = tb_map_config_cache.get(self._ptb_bot_data)
-            # NEW: fetch the cached TB targets too (loaded at startup,
-            # refreshable via /tb_reload_targets).
             tb_targets = tb_targets_cache.get(self._ptb_bot_data)
-            messages = format_auto_summary(snapshot, map_config, tb_targets)
 
+            # Build the two pieces independently. planet_messages has no
+            # buttons; undeployed_message gets the buttons attached (and
+            # is what we key the cache by).
+            planet_messages, undeployed_message = format_auto_summary_split(
+                snap=snapshot,
+                map_config=map_config,
+                tb_targets=tb_targets,
+            )
+
+            # Capture the undeployed list at THIS exact moment, so the
+            # buttons act on what the message displays — not a
+            # recomputed list. (Empty list = no buttons; still send.)
             undeployed_rows = auto_summary_undeployed(snapshot)
 
             label, _gname = (None, None)
@@ -203,18 +212,19 @@ class _TBListenerClient(discord.Client):
             except Exception:
                 log.exception("Sheets lookup failed; sending auto-summary without buttons.")
 
-            await self._notify_officers(
-                messages,
+            await self._send_auto_summary_split(
+                planet_messages=planet_messages,
+                undeployed_message=undeployed_message,
                 guild_id=snapshot.guild_id if undeployed_rows and label else None,
                 undeployed_rows=undeployed_rows if label else (),
                 guild_name_for_cache=snapshot.guild_name,
             )
             log.info(
                 "Auto-forwarded TB summary for instance=%s round=%d "
-                "guild=%s undeployed=%d (%d messages) to chat_id=%d",
+                "guild=%s undeployed=%d (planet=%d msg, undep=1 msg) to chat_id=%d",
                 snapshot.instance_id, snapshot.current_round,
                 snapshot.guild_id, len(undeployed_rows),
-                len(messages), self._auto_forward_chat_id,
+                len(planet_messages), self._auto_forward_chat_id,
             )
         except Exception:
             log.exception(
@@ -225,38 +235,36 @@ class _TBListenerClient(discord.Client):
     async def _notify_officers(
         self,
         messages,
-        *,
-        guild_id: Optional[str] = None,
-        undeployed_rows: tuple = (),
-        guild_name_for_cache: str = "",
     ) -> None:
-        """Send one or more messages to the officers' chat via the PTB Bot."""
+        """
+        Send a simple text-only notification (used for error paths only:
+        bad JSON, parse error).
+
+        For the auto-summary itself, use _send_auto_summary_split — it
+        handles the planet/undeployed message split and button caching.
+
+        Args:
+          messages: str or list[str]. Each non-empty string is sent as
+            a separate Telegram message. No buttons, no cache writes.
+        """
         if isinstance(messages, str):
             messages = [messages]
-
-        attach_buttons = bool(guild_id) and bool(undeployed_rows)
 
         for i, text in enumerate(messages):
             if not text.strip():
                 continue
-
-            is_last = (i == len(messages) - 1)
-            reply_markup = None
-            if attach_buttons and is_last:
-                reply_markup = _build_undeployed_keyboard(guild_id)
 
             send_kwargs: dict[str, Any] = {
                 "chat_id": self._auto_forward_chat_id,
                 "text": text,
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": True,
-                "reply_markup": reply_markup,
             }
             if self._auto_forward_thread_id:
                 send_kwargs["message_thread_id"] = self._auto_forward_thread_id
 
             try:
-                sent = await self._ptb_bot.send_message(**send_kwargs)
+                await self._ptb_bot.send_message(**send_kwargs)
             except TelegramError as e:
                 log.warning(
                     "Telegram send_message failed (chat_id=%d thread_id=%d, msg %d/%d): %s",
@@ -266,27 +274,115 @@ class _TBListenerClient(discord.Client):
                 )
                 continue
 
-            if attach_buttons and is_last and sent is not None:
-                cache_members = tuple(
-                    UndeployedMember(
-                        player_id=r.player_id,
-                        player_name=r.player_name,
-                        deployed_gp=r.deployed_gp,
-                        roster_gp=r.roster_gp,
-                        missing_gp=r.missing_gp,
-                        pct_deployed=r.pct_deployed,
-                    )
-                    for r in undeployed_rows
+    async def _send_auto_summary_split(
+        self,
+        *,
+        planet_messages,
+        undeployed_message: str,
+        guild_id: Optional[str] = None,
+        undeployed_rows: tuple = (),
+        guild_name_for_cache: str = "",
+    ) -> None:
+        """
+        Send the auto-summary as TWO separate Telegram messages.
+
+        First: each planet_messages string in order. No buttons.
+        Second (and ALWAYS sent — even at 0 undeployed): the undeployed
+        message. Buttons attached IF guild_id is non-None AND
+        undeployed_rows is non-empty.
+
+        The cache (tb_undeployed_cache) is keyed by the UNDEPLOYED
+        message's id, because that's where the buttons live and that's
+        what the callback handlers will look up.
+
+        Args:
+          planet_messages: list of strings from format_auto_summary_split.
+          undeployed_message: single string from format_auto_summary_split.
+          guild_id: snap.guild_id (CG id). None = no buttons regardless
+            of undeployed_rows.
+          undeployed_rows: tuple of _UndeployedRow from auto_summary_undeployed.
+            Empty = no buttons even if guild_id set.
+          guild_name_for_cache: snap.guild_name, denormalized into the
+            cache so callbacks don't need to re-read the snapshot.
+        """
+        # ---- Step 1: planet messages, no buttons ----
+        for i, text in enumerate(planet_messages):
+            if not text.strip():
+                continue
+            send_kwargs: dict[str, Any] = {
+                "chat_id": self._auto_forward_chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            }
+            if self._auto_forward_thread_id:
+                send_kwargs["message_thread_id"] = self._auto_forward_thread_id
+
+            try:
+                await self._ptb_bot.send_message(**send_kwargs)
+            except TelegramError as e:
+                log.warning(
+                    "Telegram send_message failed for planet msg %d/%d "
+                    "(chat_id=%d thread_id=%d): %s",
+                    i + 1, len(planet_messages),
+                    self._auto_forward_chat_id,
+                    self._auto_forward_thread_id, e,
                 )
-                set_undeployed_snapshot(
-                    self._ptb_bot_data,
-                    message_id=sent.message_id,
-                    snapshot=UndeployedSnapshot(
-                        guild_id=guild_id,
-                        guild_name=guild_name_for_cache,
-                        members=cache_members,
-                    ),
+                # Continue — we still want to attempt the undeployed
+                # message even if a planet message failed.
+                continue
+
+        # ---- Step 2: undeployed message, buttons IF appropriate ----
+        attach_buttons = (
+            bool(guild_id) and bool(undeployed_rows)
+        )
+        reply_markup = (
+            _build_undeployed_keyboard(guild_id) if attach_buttons else None
+        )
+
+        send_kwargs = {
+            "chat_id": self._auto_forward_chat_id,
+            "text": undeployed_message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+            "reply_markup": reply_markup,
+        }
+        if self._auto_forward_thread_id:
+            send_kwargs["message_thread_id"] = self._auto_forward_thread_id
+
+        try:
+            sent = await self._ptb_bot.send_message(**send_kwargs)
+        except TelegramError as e:
+            log.warning(
+                "Telegram send_message failed for undeployed msg "
+                "(chat_id=%d thread_id=%d): %s",
+                self._auto_forward_chat_id,
+                self._auto_forward_thread_id, e,
+            )
+            return
+
+        # ---- Step 3: cache the undeployed list, keyed by THIS message_id ----
+        if attach_buttons and sent is not None:
+            cache_members = tuple(
+                UndeployedMember(
+                    player_id=r.player_id,
+                    player_name=r.player_name,
+                    deployed_gp=r.deployed_gp,
+                    roster_gp=r.roster_gp,
+                    missing_gp=r.missing_gp,
+                    pct_deployed=r.pct_deployed,
                 )
+                for r in undeployed_rows
+            )
+            set_undeployed_snapshot(
+                self._ptb_bot_data,
+                message_id=sent.message_id,
+                snapshot=UndeployedSnapshot(
+                    guild_id=guild_id,
+                    guild_name=guild_name_for_cache,
+                    members=cache_members,
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
