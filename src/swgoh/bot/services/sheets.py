@@ -839,13 +839,17 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
 
         existing_row = this_guild.get(player_name.lower())
         if existing_row is not None:
-            old_d      = (existing_row[i_ld] if i_ld < len(existing_row) else "").strip()
-            row[i_ld1] = old_d if old_d else str(fresh_lifetime)
+            old_d = (existing_row[i_ld] if i_ld < len(existing_row) else "").strip()
+            # If we have a valid old lifetime_d, promote it. If not (corrupt row),
+            # leave empty — same treatment as a brand-new member.
+            row[i_ld1] = old_d if old_d else ""
         else:
-            row[i_ld1] = str(fresh_lifetime)
-
-        row[i_ld] = str(fresh_lifetime)
-        new_rows.append(row)
+            # First-ever snapshot for this member. We have NO previous data to
+            # compare against, so writing lifetime_d1 = lifetime_d would falsely
+            # register zero contribution on the next day's render. Leave empty;
+            # readers treat empty as "no data yet" and place this member in the
+            # 'new members' bucket (no judgement) — which is the honest answer.
+            row[i_ld1] = ""
 
     new_rows.sort(key=lambda r: r[i_pn].lower())
 
@@ -899,8 +903,14 @@ def read_ticket_snapshot(
         ld1 = (r[i_ld1]  if i_ld1  < len(r) else "").strip()
         if not pn:
             continue
-        d[pn.lower()]  = _safe_int(ld)
-        d1[pn.lower()] = _safe_int(ld1)
+        d[pn.lower()] = _safe_int(ld)
+        # CHANGED: empty ld1 means "no previous data" — omit from d1 dict
+        # entirely so the member naturally falls into the 'new members' bucket
+        # in render_tickets_yesterday[_channel]. Writing _safe_int('') would
+        # give 0, which collides with a real (but currently impossible) case
+        # of lifetime_d1 == 0.
+        if ld1:
+            d1[pn.lower()] = _safe_int(ld1)
         if snapshot_date is None:
             snapshot_date = dt
 
