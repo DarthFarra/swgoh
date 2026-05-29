@@ -593,6 +593,98 @@ def format_auto_summary(
 
 
 # ---------------------------------------------------------------------------
+# format_auto_summary_split — TWO-message variant
+#
+# Used by the discord_listener so the planet summary and the undeployed
+# list can be sent as separate Telegram messages. The undeployed message
+# is the one that carries the inline buttons; the planet message has
+# none.
+#
+# Why a separate function (not "just split format_auto_summary's output"):
+#   The original function joins planet text and undeployed text into
+#   one rendered message. After joining, there's no clean boundary to
+#   split on — the section separator is "blank line then 'Undeployed'",
+#   but that's a string-match contract no caller should depend on.
+#   Returning the two pieces structurally is much cleaner.
+#
+# Why keep the original format_auto_summary too:
+#   preview_tb_messages.py and test_planet_briefing.py both import and
+#   call it. Removing it would break the test scaffolding. The original
+#   becomes a thin shim over format_auto_summary_split: render both
+#   pieces, join with a blank line. Same output as today.
+# ---------------------------------------------------------------------------
+
+def format_auto_summary_split(
+    snap: TBSnapshot,
+    map_config: Optional[MapConfig] = None,
+    tb_targets: Optional[TBTargets] = None,
+) -> tuple[List[str], str]:
+    """
+    Build the auto-summary as TWO independent pieces.
+
+    Returns:
+      (planet_messages, undeployed_message)
+
+      planet_messages — list of one or more strings. The first contains
+        the header (TB phase + guild + clock); each is bounded by
+        SOFT_MESSAGE_CAP. Splits at planet boundaries when long. Usually
+        a list of one.
+
+      undeployed_message — single string ready to send. ALWAYS produced,
+        even when no members are undeployed; in that case it reads
+        "Undeployed (0)" with no list, so officers can confirm the
+        export was processed and the answer is "all clear."
+
+    The undeployed_message is what discord_listener attaches buttons to;
+    planet_messages get no buttons.
+    """
+    cfg = map_config if map_config else MapConfig()
+    targets = tb_targets if tb_targets else TBTargets()
+
+    # ---- Build the planet message(s) ----
+    planet_lines: List[str] = list(_header_lines(snap))
+
+    active = active_planet_zones(snap)
+    if not active:
+        planet_lines.append("")
+        planet_lines.append("_No active planets at this snapshot._")
+    else:
+        planet_lines.append("")
+        for zone_id in active:
+            planet_cfg = cfg.planet(zone_id) if not cfg.is_empty else None
+            if planet_cfg is None or not planet_cfg.thresholds:
+                planet_lines.append(_unconfigured_planet_line(zone_id, snap))
+            else:
+                planet_lines.extend(
+                    _minimal_planet_block(snap, zone_id, planet_cfg, targets)
+                )
+
+    planet_message = _enforce_message_cap("\n".join(planet_lines).rstrip())
+
+    # In practice the planet section fits in one message (≤2 KB even
+    # for 6 active planets). If it ever overflows, we'd need to apply
+    # _pack_into_messages here too. For now, return a one-element list
+    # to match the documented signature and future-proof the contract.
+    planet_messages = [planet_message]
+
+    # ---- Build the undeployed message ----
+    undep_lines = _undeployed_section_lines(
+        snap,
+        threshold_pct=AUTO_SUMMARY_UNDEPLOYED_THRESHOLD,
+    )
+    if undep_lines:
+        undeployed_message = _enforce_message_cap("\n".join(undep_lines).rstrip())
+    else:
+        # User explicitly requested: send the message even when nobody
+        # is undeployed, so officers see a clear "0 pending" signal.
+        # No buttons in this case (the listener handles that based on
+        # the row count).
+        undeployed_message = "Undeployed (0):"
+
+    return planet_messages, undeployed_message
+
+
+# ---------------------------------------------------------------------------
 # Public helper exposed for the discord_listener
 # ---------------------------------------------------------------------------
 
