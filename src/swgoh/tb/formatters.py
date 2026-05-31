@@ -27,14 +27,14 @@ from typing import Iterable, List, Optional, Sequence
 
 from .analysis import (
     DEFAULT_DEPLOYMENT_THRESHOLD_PCT,
+    AllocationResult,
+    AllocationState,
     DeploymentGap,
-    EstimationResult,
-    EstimationState,
     PlanetReport,
     SpecialFailure,
     StrikeMissionStatus,
     active_planet_zones,
-    estimate_to_target,
+    allocate_undeployed_to_targets,
     members_missing_deployment,
     members_with_failed_specials,
     planet_report,
@@ -532,6 +532,88 @@ def _pack_into_messages(
 # format_auto_summary — minimal push-notification format
 # ---------------------------------------------------------------------------
 
+def _build_allocation_dict(
+    snap: TBSnapshot,
+    active_zones: List[str],
+    map_config: MapConfig,
+    targets: TBTargets,
+) -> dict[str, AllocationResult]:
+    """
+    Build the cross-planet allocation result that the planet blocks
+    will reference.
+
+    Process:
+      1. Build the (zone_id, planet_report, thresholds) tuples in
+         active-zone order. Skip zones without a MapConfig entry —
+         we can't allocate to a planet whose thresholds we don't know.
+      2. Look up target_stars per zone via tb_targets (keyed by
+         snap.current_round, NOT planet_cfg.phase — officers think
+         "what's my target THIS phase" rather than "what's the target
+         for the phase this planet first appeared in").
+      3. Compute total_budget = sum of missing_gp across the
+         under-deployed list. This matches the "Undeployed (N) — XM"
+         number officers see on the second message.
+      4. Hand off to allocate_undeployed_to_targets.
+
+    Returns:
+      Dict zone_id -> AllocationResult. Zones not in the dict are
+      either unconfigured (no MapConfig) or have no target_stars
+      entry — caller treats both as "no allocation line to render."
+    """
+    # Compute the budget — same number that appears in the undeployed
+    # message header. We compute it inline rather than refactoring
+    # _undeployed_section_lines because that function still owns the
+    # rendering and there's no clean place to share the intermediate.
+    undep_rows = auto_summary_undeployed(
+        snap, threshold_pct=AUTO_SUMMARY_UNDEPLOYED_THRESHOLD,
+    )
+    total_budget = sum(r.missing_gp for r in undep_rows)
+
+    # Build the per-planet inputs to the allocator. Honor the active-zone
+    # order (which is already the order the message renders).
+    planets_in_order = []
+    target_stars_by_zone: dict[str, int] = {}
+
+    for zone_id in active_zones:
+        planet_cfg = map_config.planet(zone_id) if not map_config.is_empty else None
+        if planet_cfg is None or not planet_cfg.thresholds:
+            # No threshold config — can't allocate.
+            continue
+
+        report = planet_report(
+            snap,
+            zone_id,
+            thresholds=[(t.value, t.stars) for t in planet_cfg.thresholds],
+            platoon_count=planet_cfg.platoon_count,
+            points_per_platoon=planet_cfg.points_per_platoon,
+        )
+        if report is None:
+            continue
+
+        planets_in_order.append((
+            zone_id,
+            report,
+            [(t.value, t.stars) for t in planet_cfg.thresholds],
+        ))
+
+        if not targets.is_empty:
+            # Keyed by snap.current_round so officers can set different
+            # targets for the same planet in different rounds.
+            ts = targets.lookup(
+                guild_name=snap.guild_name,
+                phase=snap.current_round,
+                zone_id=zone_id,
+            )
+            if ts:
+                target_stars_by_zone[zone_id] = ts
+
+    return allocate_undeployed_to_targets(
+        planets_in_order=planets_in_order,
+        target_stars_by_zone=target_stars_by_zone,
+        total_budget=total_budget,
+    )
+
+
 def format_auto_summary(
     snap: TBSnapshot,
     map_config: Optional[MapConfig] = None,
@@ -541,24 +623,17 @@ def format_auto_summary(
     Build the message posted automatically when a new TB export arrives.
 
     DELIBERATELY MINIMAL. Officers want two things at a glance:
-      1. Per-planet star summary (achieved/missing) + estimation line.
+      1. Per-planet star summary + cross-planet "Estimado" allocation line.
       2. Who hasn't deployed.
 
-    The estimation line ("Est: ...") appears under each planet when
-    tb_targets contains a target for that (guild, phase, zone). It
-    shows one of four states:
-      - "Est: sin objetivo"               — no target configured
-      - "Est: Objetivo alcanzado"         — target already met
-      - "Est: 50M platoons + 28M"         — gap covered partly by platoons
-      - "Est: 100M faltan"                — gap, no platoon contribution
+    The "Estimado: ..." line on each planet renders one of 5 states
+    per the design wording matrix; see _allocation_line.
 
     Args:
       snap: parsed TB snapshot.
       map_config: planet name/threshold lookups. Empty MapConfig if None.
       tb_targets: per-guild per-phase targets. None or empty means no
-        estimation lines anywhere (silent — not "sin objetivo" on every
-        planet, since "no targets configured at all" is officer-visible
-        elsewhere via /tb_reload_targets).
+        estimation lines anywhere.
     """
     cfg = map_config if map_config else MapConfig()
     targets = tb_targets if tb_targets else TBTargets()
@@ -571,6 +646,10 @@ def format_auto_summary(
         lines.append("_No active planets at this snapshot._")
         return [_enforce_message_cap("\n".join(lines))]
 
+    # Build the allocation dict ONCE. Pass per-planet results into
+    # _minimal_planet_block. Planets with no entry get no allocation line.
+    allocation_by_zone = _build_allocation_dict(snap, active, cfg, targets)
+
     lines.append("")
     for zone_id in active:
         planet_cfg = cfg.planet(zone_id) if not cfg.is_empty else None
@@ -578,7 +657,10 @@ def format_auto_summary(
             lines.append(_unconfigured_planet_line(zone_id, snap))
         else:
             lines.extend(
-                _minimal_planet_block(snap, zone_id, planet_cfg, targets)
+                _minimal_planet_block(
+                    snap, zone_id, planet_cfg,
+                    allocation=allocation_by_zone.get(zone_id),
+                )
             )
 
     undep_lines = _undeployed_section_lines(
@@ -609,9 +691,7 @@ def format_auto_summary(
 #
 # Why keep the original format_auto_summary too:
 #   preview_tb_messages.py and test_planet_briefing.py both import and
-#   call it. Removing it would break the test scaffolding. The original
-#   becomes a thin shim over format_auto_summary_split: render both
-#   pieces, join with a blank line. Same output as today.
+#   call it. Removing it would break the test scaffolding.
 # ---------------------------------------------------------------------------
 
 def format_auto_summary_split(
@@ -625,15 +705,8 @@ def format_auto_summary_split(
     Returns:
       (planet_messages, undeployed_message)
 
-      planet_messages — list of one or more strings. The first contains
-        the header (TB phase + guild + clock); each is bounded by
-        SOFT_MESSAGE_CAP. Splits at planet boundaries when long. Usually
-        a list of one.
-
-      undeployed_message — single string ready to send. ALWAYS produced,
-        even when no members are undeployed; in that case it reads
-        "Undeployed (0)" with no list, so officers can confirm the
-        export was processed and the answer is "all clear."
+      planet_messages — list of one or more strings. Usually a list of one.
+      undeployed_message — single string ready to send. ALWAYS produced.
 
     The undeployed_message is what discord_listener attaches buttons to;
     planet_messages get no buttons.
@@ -649,6 +722,10 @@ def format_auto_summary_split(
         planet_lines.append("")
         planet_lines.append("_No active planets at this snapshot._")
     else:
+        # Build the allocation dict ONCE. Pass per-planet results into
+        # _minimal_planet_block.
+        allocation_by_zone = _build_allocation_dict(snap, active, cfg, targets)
+
         planet_lines.append("")
         for zone_id in active:
             planet_cfg = cfg.planet(zone_id) if not cfg.is_empty else None
@@ -656,15 +733,13 @@ def format_auto_summary_split(
                 planet_lines.append(_unconfigured_planet_line(zone_id, snap))
             else:
                 planet_lines.extend(
-                    _minimal_planet_block(snap, zone_id, planet_cfg, targets)
+                    _minimal_planet_block(
+                        snap, zone_id, planet_cfg,
+                        allocation=allocation_by_zone.get(zone_id),
+                    )
                 )
 
     planet_message = _enforce_message_cap("\n".join(planet_lines).rstrip())
-
-    # In practice the planet section fits in one message (≤2 KB even
-    # for 6 active planets). If it ever overflows, we'd need to apply
-    # _pack_into_messages here too. For now, return a one-element list
-    # to match the documented signature and future-proof the contract.
     planet_messages = [planet_message]
 
     # ---- Build the undeployed message ----
@@ -735,26 +810,35 @@ def _minimal_planet_block(
     snap: TBSnapshot,
     zone_id: str,
     planet_cfg: PlanetConfig,
-    targets: TBTargets,
+    allocation: Optional[AllocationResult],
 ) -> List[str]:
     """
     One planet's star summary, MINIMAL flavor (auto-summary only).
 
     Three cases for the header:
       * All stars achieved → header line with ✓ marker.
-      * Some stars missing → header + one "X points missing" line per
-        unreached threshold.
+      * Some stars missing → header + one "To star N: X points missing"
+        line per unreached threshold.
 
-    Then always: an "Est: ..." line if a target is configured for this
-    (guild, phase, zone) triple — even if all stars are met, since
-    officers like the confirmation that target was met.
+    Then optionally: an "Estimado: ..." line driven by the
+    pre-computed AllocationResult (computed once globally in
+    format_auto_summary_split, not per-planet). When `allocation` is
+    None or its state is NO_TARGET, the line is omitted — same effect
+    as "the planet has no target in the sheet."
 
-    Uses planet_report from analysis (single source of truth — same math
-    the briefing uses, with platoon math enabled so we know how much
-    platoon contribution is still available for the estimation).
+    Label fix:
+      For bonus-territory layouts like Mandalore with thresholds
+      [(100M, 0), (200M, 0), (300M, 1)], the previous version labelled
+      these as "To reward 1 / reward 2 / star 3" — using the CONFIG
+      INDEX. That's wrong for the star: the third threshold is the
+      FIRST star, so it should read "To star 1." The fix is to use
+      CUMULATIVE STAR count for star-thresholds (so the n-th unreached
+      star is "star n" where n counts cumulatively), and to keep
+      reward indices separate (reward 1, reward 2, ...).
+
+    Uses planet_report from analysis. Platoon math is still enabled
+    because it's used elsewhere (the briefing); harmless here.
     """
-    # We DO want platoon math here, unlike pre-feature, because the
-    # estimation line needs platoons.points_remaining.
     report = planet_report(
         snap,
         zone_id,
@@ -773,59 +857,107 @@ def _minimal_planet_block(
 
     block: List[str] = []
     if report.current_stars >= report.max_stars and report.max_stars > 0:
-        # All stars met — just the header with the check mark.
         block.append(f"{header} ✓")
     else:
         block.append(header)
-        threshold_index = {
-            t.value: i + 1 for i, t in enumerate(planet_cfg.thresholds)
-        }
-        for gap in report.thresholds_remaining:
-            idx = threshold_index.get(gap.value, 0)
-            label = f"reward {idx}" if gap.stars == 0 else f"star {idx}"
-            block.append(
-                f"  To {label}: {_fmt_gp(gap.points_short)} points missing"
-            )
+        block.extend(_threshold_remaining_lines(planet_cfg, report))
 
-    # Estimation line — only included if a target is configured. Skipping
-    # silently when targets is empty (the whole feature is off for this
-    # guild) is what the docstring promises.
-    if not targets.is_empty:
-        target_stars = targets.lookup(
-            guild_name=snap.guild_name,
-            phase=planet_cfg.phase,
-            zone_id=zone_id,
-        )
-        # Compute even when target_stars is None — the function handles
-        # NO_TARGET as a state. We render conditionally below.
-        est = estimate_to_target(
-            report=report,
-            target_stars=target_stars,
-            thresholds=[(t.value, t.stars) for t in planet_cfg.thresholds],
-        )
-        block.append(_estimation_line(est))
+    # Allocation line — emitted only for targeted planets (states other
+    # than NO_TARGET). Planets without a target or with target=0 silently
+    # skip this line.
+    if allocation is not None and allocation.state != AllocationState.NO_TARGET:
+        block.append(_allocation_line(allocation))
 
     return block
 
 
-def _estimation_line(est: EstimationResult) -> str:
+def _threshold_remaining_lines(
+    planet_cfg: PlanetConfig,
+    report: PlanetReport,
+) -> List[str]:
     """
-    Render one estimation line per the state machine in EstimationResult.
+    Render the "To star N: X points missing" / "To reward N: X points missing"
+    lines for each unreached threshold.
 
-    Wording matches the design conversation (Spanish, "Est:" prefix).
+    Indexing is cumulative-by-type:
+      * star_N is the N-th UNREACHED star (counting cumulatively across
+        the planet's thresholds — so for [(R, 0), (R, 0), (S, 1)] the
+        single star threshold is "star 1," not "star 3").
+      * reward_N is the N-th UNREACHED reward (rewards are stars=0
+        thresholds, counted separately from stars).
+
+    The indices reset each call because the rendering is for a single
+    planet; we don't aggregate across planets.
+
+    Walks `planet_cfg.thresholds` in declared order (which matches the
+    sheet order; both should be score-ascending). For each threshold,
+    increments either the reward counter or the star counter
+    cumulatively, and emits a line only if that specific threshold
+    appears in `report.thresholds_remaining` (i.e. the planet hasn't
+    yet reached it).
+    """
+    # Build a quick lookup so we can decide "is this specific threshold
+    # remaining or already met?" Match by `value` is safe because each
+    # threshold has a distinct point-target (duplicates would be a sheet
+    # error and would already be misbehaving elsewhere).
+    remaining_by_value = {
+        gap.value: gap for gap in report.thresholds_remaining
+    }
+
+    lines: List[str] = []
+    star_counter = 0
+    reward_counter = 0
+    for t in planet_cfg.thresholds:
+        if t.stars == 0:
+            reward_counter += 1
+            label = f"reward {reward_counter}"
+        else:
+            star_counter += 1
+            label = f"star {star_counter}"
+        gap = remaining_by_value.get(t.value)
+        if gap is None:
+            # Already reached; don't render.
+            continue
+        lines.append(
+            f"  To {label}: {_fmt_gp(gap.points_short)} points missing"
+        )
+    return lines
+
+
+def _allocation_line(alloc: AllocationResult) -> str:
+    """
+    Render the "Estimado: ..." line per the 5-state wording matrix.
+
+    State → wording (NO_TARGET is handled by caller — never reaches here):
+
+      ALREADY_ACHIEVED:
+          Estimado: Objetivo alcanzado
+      ALLOCATED_ACHIEVES:
+          Estimado: Desplegando 153.1M → Objetivo alcanzado
+      ALLOCATED_SHORT:
+          Estimado: Desplegando 99.1M → Faltan 233.4M para objetivo
+      NO_BUDGET_LEFT:
+          Estimado: 0 disponibles, faltan 332.5M
+
     Numbers reuse _fmt_gp for consistency with the rest of the message.
     """
-    if est.state == EstimationState.NO_TARGET:
-        return "  Est: sin objetivo"
-    if est.state == EstimationState.TARGET_MET:
-        return "  Est: Objetivo alcanzado"
-    if est.state == EstimationState.PLATOONS_PLUS_RESIDUAL:
+    if alloc.state == AllocationState.ALREADY_ACHIEVED:
+        return "  Estimado: Objetivo alcanzado"
+    if alloc.state == AllocationState.ALLOCATED_ACHIEVES:
         return (
-            f"  Est: {_fmt_gp(est.platoon_part)} platoons + "
-            f"{_fmt_gp(est.residual)}"
+            f"  Estimado: Desplegando {_fmt_gp(alloc.assigned)} "
+            f"\u2192 Objetivo alcanzado"
         )
-    # RESIDUAL_ONLY
-    return f"  Est: {_fmt_gp(est.residual)} faltan"
+    if alloc.state == AllocationState.ALLOCATED_SHORT:
+        return (
+            f"  Estimado: Desplegando {_fmt_gp(alloc.assigned)} "
+            f"\u2192 Faltan {_fmt_gp(alloc.missing_after)} para objetivo"
+        )
+    # NO_BUDGET_LEFT
+    return (
+        f"  Estimado: 0 disponibles, faltan "
+        f"{_fmt_gp(alloc.missing_after)}"
+    )
 
 
 def _unconfigured_planet_line(zone_id: str, snap: TBSnapshot) -> str:
