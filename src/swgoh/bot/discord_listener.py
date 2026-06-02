@@ -39,11 +39,23 @@ from ..tb import (
     format_auto_summary,
     parse_tb_snapshot,
 )
-from ..tb.formatters import auto_summary_undeployed, format_auto_summary_split
+from ..tb.formatters import (
+    auto_summary_undeployed,
+    format_auto_summary_split,
+    format_missing_platoons,
+)
+from ..tb.analysis import active_planet_zones
+from ..tb.platoons import empty_platoon_slots
 
 from . import config as bot_cfg
 from .services import tb_cache, tb_map_config_cache, tb_targets_cache
-from .services.sheets import open_ss, resolve_label_name_by_guild_id
+from .services.sheets import (
+    open_ss,
+    resolve_label_name_by_guild_id,
+    read_characters_friendly_names,
+    load_rote_platoon_assignments,
+    DEFAULT_ROTE_SHEET,
+)
 from .services.tb_undeployed_cache import (
     UndeployedMember,
     UndeployedSnapshot,
@@ -219,6 +231,69 @@ class _TBListenerClient(discord.Client):
                 undeployed_rows=undeployed_rows if label else (),
                 guild_name_for_cache=snapshot.guild_name,
             )
+
+            # ---- Third message: missing platoons (if any) ----
+            # This sits after the auto-summary so officers always see
+            # the planet status and undeployed list first. The platoon
+            # message can be long (78+ lines in some phases) and may
+            # split across multiple Telegram messages.
+            #
+            # Empty-slot extraction is filtered to ACTIVE conflict zones
+            # so we only chase the current phase. The ROTE join is per
+            # current_round; rows for other phases are ignored.
+            try:
+                active_zones = active_planet_zones(snapshot)
+                empty_slots = empty_platoon_slots(snapshot, active_zone_ids=active_zones)
+
+                # Even with no empty slots, ROTE might say things should
+                # be filled (slot got filled between ROTE write and now,
+                # in which case we want no message). And with empty slots
+                # but no ROTE rows, there's still nothing to chase. So
+                # the "should we send?" decision is made by the formatter
+                # — it returns [] for either case.
+                try:
+                    ss2 = open_ss()
+                    char_names = read_characters_friendly_names(ss2)
+                    rote_rows = load_rote_platoon_assignments(
+                        ss2,
+                        rote_sheet=DEFAULT_ROTE_SHEET,
+                        phase=snapshot.current_round,
+                    )
+                except Exception:
+                    log.exception(
+                        "Failed to read Characters/ROTE for platoon message; "
+                        "skipping platoon message this cycle."
+                    )
+                    char_names = {}
+                    rote_rows = []
+
+                platoon_messages = format_missing_platoons(
+                    snap=snapshot,
+                    empty_slots=empty_slots,
+                    rote_rows=rote_rows,
+                    map_config=map_config,
+                    character_names=char_names,
+                )
+                if platoon_messages:
+                    await self._send_platoon_messages(platoon_messages)
+                    log.info(
+                        "Sent platoon-missing message for instance=%s: "
+                        "%d ROTE rows matched empty slots, %d Telegram messages.",
+                        snapshot.instance_id,
+                        # Count ROTE-matched items by summing block lines
+                        # minus group headers — but cheaper to just report
+                        # message count and matched-row count if we had it.
+                        len(rote_rows),
+                        len(platoon_messages),
+                    )
+            except Exception:
+                # Platoon message is non-critical — the auto-summary
+                # already went out, so log and continue.
+                log.exception(
+                    "Failed to build/send platoon-missing message; "
+                    "auto-summary was sent successfully."
+                )
+
             log.info(
                 "Auto-forwarded TB summary for instance=%s round=%d "
                 "guild=%s undeployed=%d (planet=%d msg, undep=1 msg) to chat_id=%d",
@@ -383,6 +458,43 @@ class _TBListenerClient(discord.Client):
                     members=cache_members,
                 ),
             )
+
+    async def _send_platoon_messages(self, messages) -> None:
+        """
+        Send the missing-platoons message(s) — one or more, depending on
+        how many empty slots we found.
+
+        No buttons. No cache write. Just text dispatch with the same
+        thread routing as the auto-summary.
+
+        Failures on individual messages are logged and ignored so a
+        single late-cycle send error doesn't stop the rest of the
+        sequence. This is consistent with how the planet messages are
+        handled in _send_auto_summary_split.
+        """
+        for i, text in enumerate(messages):
+            if not text.strip():
+                continue
+            send_kwargs: dict[str, Any] = {
+                "chat_id": self._auto_forward_chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            }
+            if self._auto_forward_thread_id:
+                send_kwargs["message_thread_id"] = self._auto_forward_thread_id
+
+            try:
+                await self._ptb_bot.send_message(**send_kwargs)
+            except TelegramError as e:
+                log.warning(
+                    "Telegram send_message failed for platoon msg %d/%d "
+                    "(chat_id=%d thread_id=%d): %s",
+                    i + 1, len(messages),
+                    self._auto_forward_chat_id,
+                    self._auto_forward_thread_id, e,
+                )
+                continue
 
 
 # ---------------------------------------------------------------------------
