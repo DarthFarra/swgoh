@@ -4,6 +4,7 @@ from typing import List, Tuple, Dict, Optional
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from .sheets_io import read_values_cached
+from dataclasses import dataclass
 
 from .. import config as bot_cfg
 from ... import sheets as core_sheets
@@ -13,6 +14,7 @@ GUILDS_SHEET           = bot_cfg.GUILDS_SHEET
 PLAYERS_SHEET          = bot_cfg.PLAYERS_SHEET
 DEFAULT_ROTE_SHEET     = bot_cfg.DEFAULT_ROTE_SHEET
 TICKET_SNAPSHOTS_SHEET = bot_cfg.TICKET_SNAPSHOTS_SHEET
+CHARACTERS_SHEET = bot_cfg.CHARACTERS_SHEET
 TZ                     = bot_cfg.TZ
 
 
@@ -1048,3 +1050,248 @@ def _safe_int(val: str, default: int = 0) -> int:
         return int(val)
     except (ValueError, TypeError):
         return default
+
+
+
+def read_characters_friendly_names(ss) -> Dict[str, str]:
+    """
+    Read the Characters sheet and return base_id → friendly Name lookup.
+ 
+    Returns lowercased keys for case-insensitive matching, but preserves
+    the friendly Name in its original casing (officers like "Leviathan",
+    not "leviathan").
+ 
+    Schema (per sync_data.run()): headers = ["base_id", "Name", "Alignment"]
+ 
+    Returns an empty dict on:
+      - sheet missing
+      - required columns missing
+      - empty rows
+ 
+    The empty-dict return causes the formatter to fall back to the
+    raw base_id (e.g. "CAPITALLEVIATHAN") — ugly but doesn't break the
+    message. Officers see something is wrong and can investigate.
+ 
+    Why not return Optional[Dict] or raise:
+      Consistent with get_officer_player_names: return-empty-on-error
+      makes call sites simpler (`lookup.get(base_id, base_id)` is the
+      natural pattern), and the auto-summary fail-soft principle wants
+      degraded output rather than blocked output.
+    """
+    try:
+        headers, rows = read_values_cached(ss, CHARACTERS_SHEET)
+    except Exception as exc:
+        log.warning("Could not read %s: %s", CHARACTERS_SHEET, exc)
+        return {}
+ 
+    if not rows:
+        log.info("%s is empty.", CHARACTERS_SHEET)
+        return {}
+ 
+    hl = [h.strip().lower() for h in headers]
+    try:
+        i_base = hl.index("base_id")
+        i_name = hl.index("name")
+    except ValueError:
+        log.warning(
+            "%s missing required columns (need 'base_id' and 'Name').",
+            CHARACTERS_SHEET,
+        )
+        return {}
+ 
+    lookup: Dict[str, str] = {}
+    for r in rows:
+        base = (r[i_base] if i_base < len(r) else "").strip()
+        name = (r[i_name] if i_name < len(r) else "").strip()
+        if base and name:
+            # Key on uppercase (matches the export's identifier casing)
+            # and preserve display casing for the value.
+            lookup[base.upper()] = name
+ 
+    return lookup
+ 
+ 
+def load_rote_platoon_assignments(
+    ss, rote_sheet: str, phase: int,
+) -> List["RotePlatoonRow"]:
+    """
+    Read Asignaciones ROTE and return the rows for the current phase.
+ 
+    Returns a list of RotePlatoonRow dataclasses, one per matching sheet
+    row. Order is preserved from the sheet (officers may have ordered
+    rows meaningfully by planet/operation/character).
+ 
+    Schema (existing, per send_assignments_daily.py):
+      Required: fase, planeta, operacion, personaje, jugador
+      Optional: user_id, reliquia (unused here)
+ 
+    Returns an empty list on:
+      - sheet missing
+      - required columns missing
+      - no rows match the requested phase
+ 
+    Filter by `phase` is intentional: ROTE has rows for multiple phases
+    (Zeffo P3 prefill, Zeffo P6 star-push), and we only want the rows
+    relevant to the current snapshot.
+ 
+    Why a list, not a dict:
+      The formatter is the only caller. It needs the full row data
+      (planet name in original casing for display, operation number
+      as an integer parsed from "Operation #N", etc). A dict keyed
+      by tuple would force the formatter to either store the
+      pre-display values in the key or re-look-them-up — both worse
+      than just keeping the row intact.
+    """
+    try:
+        headers, rows = read_values_cached(ss, rote_sheet)
+    except Exception as exc:
+        log.warning("Could not read %s: %s", rote_sheet, exc)
+        return []
+ 
+    if not rows:
+        log.info("%s is empty.", rote_sheet)
+        return []
+ 
+    hl = [h.strip().lower() for h in headers]
+ 
+    required = ("fase", "planeta", "operacion", "personaje", "jugador")
+    indices: Dict[str, int] = {}
+    for col in required:
+        if col in hl:
+            indices[col] = hl.index(col)
+        elif _accent_strip(col) in [_accent_strip(h) for h in hl]:
+            # Tolerate accent variants (operación / operacion).
+            for i, h in enumerate(hl):
+                if _accent_strip(h) == _accent_strip(col):
+                    indices[col] = i
+                    break
+ 
+    if len(indices) < len(required):
+        missing = [c for c in required if c not in indices]
+        log.warning(
+            "%s missing required columns: %s",
+            rote_sheet, ", ".join(missing),
+        )
+        return []
+ 
+    phase_str = str(phase).strip()
+    out: List[RotePlatoonRow] = []
+ 
+    for r in rows:
+        fase = (r[indices["fase"]] if indices["fase"] < len(r) else "").strip()
+        if fase != phase_str:
+            continue
+ 
+        planeta = (r[indices["planeta"]] if indices["planeta"] < len(r) else "").strip()
+        oper_raw = (r[indices["operacion"]] if indices["operacion"] < len(r) else "").strip()
+        pers = (r[indices["personaje"]] if indices["personaje"] < len(r) else "").strip()
+        jug = (r[indices["jugador"]] if indices["jugador"] < len(r) else "").strip()
+ 
+        if not (planeta and oper_raw and pers and jug):
+            continue
+ 
+        op_number = _parse_operation_number(oper_raw)
+        if op_number is None:
+            log.warning(
+                "%s row for fase=%s planeta=%r personaje=%r: cannot parse "
+                "operation number from %r; skipping.",
+                rote_sheet, phase_str, planeta, pers, oper_raw,
+            )
+            continue
+ 
+        out.append(RotePlatoonRow(
+            planet=planeta,
+            operation_number=op_number,
+            character=pers,
+            player=jug,
+        ))
+ 
+    return out
+ 
+ 
+def _parse_operation_number(raw: str) -> Optional[int]:
+    """
+    Parse the operation column from ROTE into a 1-6 number.
+ 
+    Accepts these formats (case-insensitive, accent-insensitive, trimmed):
+      "Operation #1"     → 1
+      "Operation 1"      → 1
+      "operación #1"     → 1
+      "Op #1"            → 1
+      "1"                → 1
+ 
+    Returns None if no integer can be extracted.
+ 
+    Lenient parsing because officers may use slight variations across
+    rows; we surface unparseable values as warnings in the loader.
+    """
+    if not raw:
+        return None
+    # Find the first run of digits in the string.
+    digits = []
+    seen_digit = False
+    for ch in raw:
+        if ch.isdigit():
+            digits.append(ch)
+            seen_digit = True
+        elif seen_digit:
+            break
+    if not digits:
+        return None
+    try:
+        n = int("".join(digits))
+        if 1 <= n <= 6:
+            return n
+    except ValueError:
+        pass
+    return None
+ 
+ 
+@dataclass(frozen=True, slots=True)
+class RotePlatoonRow:
+    """
+    One row from Asignaciones ROTE filtered to the current phase.
+ 
+    All four fields are in their ORIGINAL casing/accents from the sheet
+    so the formatter can display them as officers typed them.
+ 
+    Fields:
+      planet            Display name of the planet (e.g. "Mandalore").
+      operation_number  Parsed from "Operation #N" into 1..6.
+      character         Display name of the character (e.g. "Leviathan").
+      player            Player alias to display (e.g. "Roykary").
+    """
+    planet: str
+    operation_number: int
+    character: str
+    player: str
+ 
+ 
+# ---------------------------------------------------------------------------
+# String normalization helpers (private; reusable for either function)
+# ---------------------------------------------------------------------------
+ 
+import unicodedata as _ud
+ 
+def _accent_strip(s: str) -> str:
+    """Remove diacritics. 'operación' → 'operacion'."""
+    return "".join(
+        ch for ch in _ud.normalize("NFD", s or "")
+        if _ud.category(ch) != "Mn"
+    )
+ 
+ 
+def _norm_match(s: str) -> str:
+    """
+    Normalize a string for case- and accent-insensitive matching:
+      strip whitespace, lowercase, drop diacritics, collapse internal
+      spaces.
+ 
+    This is the same normalization sendassignments.py applies; we
+    reproduce it here to keep this module self-contained, with the
+    same matching semantics officers are already familiar with.
+    """
+    if not s:
+        return ""
+    s = _accent_strip(s).strip().lower()
+    return " ".join(s.split())
