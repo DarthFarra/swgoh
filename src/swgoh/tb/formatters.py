@@ -45,6 +45,7 @@ from .analysis import (
 )
 from .map_config import MapConfig, PlanetConfig
 from .models import Member, TBSnapshot
+from .platoons import EmptyPlatoonSlot
 from .tb_targets import TBTargets
 
 log = logging.getLogger(__name__)
@@ -1110,3 +1111,261 @@ def format_no_data(reason: str = "no_export_yet") -> str:
             "Run `/tb export` in Discord to re-publish the latest snapshot."
         )
     return f"_No TB data available ({_escape_md(reason)})._"
+
+# ============================================================================
+# Platoon-missing message (third auto-summary message)
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# Public formatter
+# ----------------------------------------------------------------------------
+
+def format_missing_platoons(
+    snap: TBSnapshot,
+    empty_slots: List[EmptyPlatoonSlot],
+    rote_rows: list,
+    *,
+    map_config: Optional[MapConfig] = None,
+    character_names: Optional[dict] = None,
+) -> List[str]:
+    """
+    Build the "platoons pendientes" message(s) for the auto-summary.
+
+    ROTE-driven: for every ROTE row matching the current phase, we check
+    whether the snapshot has a corresponding EMPTY slot. If yes, the row
+    is included in the output. If no (slot is already filled, or there's
+    no matching slot at all), the row is silently skipped.
+
+    Why ROTE-driven (and not snapshot-driven):
+      - ROTE encodes officer intent for the current phase. A slot that's
+        empty in-game but not in ROTE is a slot the officers intentionally
+        left empty (e.g. Mandalore in phase 5 is prefilled for phase 6 —
+        many slots empty, none yet expected).
+      - Driving from ROTE means the message only shows slots officers
+        actually care about chasing this phase.
+      - Avoids the "ghost slots" problem where a slot that's blank in-game
+        but unplanned shows up as a fake action item.
+
+    Args:
+      snap: parsed TB snapshot. Used for the header (phase, guild name).
+      empty_slots: from tb.platoons.empty_platoon_slots(). Used for the
+        join — the formatter checks "is this (planet, operation, character)
+        from ROTE actually empty in the snapshot?"
+      rote_rows: list of RotePlatoonRow records, already filtered to
+        snap.current_round by load_rote_platoon_assignments().
+      map_config: MapConfig with planet_name lookups. Used to resolve
+        ROTE's friendly planet name → zone_id, so the planet-name
+        join with empty_slots' conflict_zone_id works.
+      character_names: dict[base_id.upper(), friendly_name]. Used to
+        translate the snapshot's technical unit_id (e.g. "CAPITALLEVIATHAN")
+        into a friendly name for matching against ROTE's character field.
+
+    Returns:
+      Empty list iff no matching rows (call site should not send any
+      message in that case).
+      Otherwise: one or more message strings, split at (planet, operation)
+      boundaries when they'd exceed SOFT_MESSAGE_CAP.
+
+    Output structure (each string is one Telegram message):
+
+        *Platoons pendientes en fase 6* (3):
+
+        *Mandalore* — Operation #1:
+          • Lord Vader — Roykary
+          • Executor — Bao Dur
+
+        *Geonosis* — Operation #4:
+          • Leviathan — JDV
+    """
+    if not rote_rows:
+        return []
+
+    cfg = map_config if map_config else MapConfig()
+    chars = character_names or {}
+
+    # Build a fast lookup: (conflict_zone_id, op_number, friendly_character_lower)
+    # → COUNT of empty slots matching that combination. We use a count
+    # (not a bool) so two ROTE rows for "Mandalore Op #1 Leviathan" can
+    # both be matched if the snapshot has two empty Leviathan slots — and
+    # so the second ROTE row doesn't double-count the same physical slot.
+    empty_counts: dict = {}
+    for slot in empty_slots:
+        friendly = chars.get(slot.unit_id.upper())
+        if not friendly:
+            # Character not in our friendly-name map — can't match
+            # against ROTE's friendly names. Log once at debug; this
+            # may happen for newly released characters before the
+            # Characters sheet is re-synced.
+            log.debug(
+                "Empty slot for unknown unit_id %r in zone %r; "
+                "skipping ROTE join (character not in Characters sheet).",
+                slot.unit_id, slot.conflict_zone_id,
+            )
+            continue
+        key = (
+            slot.conflict_zone_id,
+            slot.operation_number,
+            _norm_match_for_rote(friendly),
+        )
+        empty_counts[key] = empty_counts.get(key, 0) + 1
+
+    # Build a reverse lookup: friendly planet name → conflict_zone_id.
+    # ROTE has friendly planet names; we need the zone_id to join with
+    # empty_counts. Done once, used per row.
+    zone_id_by_planet: dict = {}
+    if not cfg.is_empty:
+        for zid, pcfg in cfg.planets.items():
+            zone_id_by_planet[_norm_match_for_rote(pcfg.planet_name)] = zid
+
+    # Walk ROTE rows in order. For each, find a matching empty slot
+    # (decrement the count to "consume" the slot). Group output by
+    # (planet, operation) — ROTE's natural ordering already tends to
+    # group these, but we re-group defensively in case it doesn't.
+    matched: list = []  # list of (planet_display, op_number, character, player)
+
+    for row in rote_rows:
+        zone_id = zone_id_by_planet.get(_norm_match_for_rote(row.planet))
+        if not zone_id:
+            # ROTE references a planet we don't know about (typo, or
+            # planet not in MapConfig). Log and skip.
+            log.warning(
+                "ROTE row references unknown planet %r; not in MapConfig. "
+                "Skipping row for op #%d character %r.",
+                row.planet, row.operation_number, row.character,
+            )
+            continue
+
+        key = (
+            zone_id,
+            row.operation_number,
+            _norm_match_for_rote(row.character),
+        )
+        count = empty_counts.get(key, 0)
+        if count <= 0:
+            # Either slot is filled, or the snapshot doesn't have a
+            # matching slot at all. Either way, nothing to chase.
+            continue
+
+        empty_counts[key] = count - 1
+        matched.append((
+            row.planet,
+            row.operation_number,
+            row.character,
+            row.player,
+        ))
+
+    if not matched:
+        return []
+
+    # Group matched rows by (planet_display, op_number). Preserve the
+    # order they appeared in ROTE — officers may have ordered their
+    # sheet intentionally.
+    groups: list = []  # list of (planet, op_number, [(character, player), ...])
+    current_key = None
+    current_items: list = []
+
+    for planet_display, op_number, character, player in matched:
+        key = (planet_display, op_number)
+        if key != current_key:
+            if current_items:
+                groups.append((current_key[0], current_key[1], current_items))
+            current_key = key
+            current_items = [(character, player)]
+        else:
+            current_items.append((character, player))
+    if current_items:
+        groups.append((current_key[0], current_key[1], current_items))
+
+    # Build the lines per group.
+    blocks: List[List[str]] = []
+    for planet, op_number, items in groups:
+        block: List[str] = [
+            f"*{_escape_md(planet)}* — Operation #{op_number}:"
+        ]
+        for character, player in items:
+            block.append(
+                f"  • {_escape_md(character)} — {_escape_md(player)}"
+            )
+        blocks.append(block)
+
+    primary_header = (
+        f"*Platoons pendientes en fase {snap.current_round}* "
+        f"({len(matched)}):"
+    )
+    continuation_header = "_(continúa)_"
+
+    return _pack_platoon_blocks(
+        primary_header=primary_header,
+        continuation_header=continuation_header,
+        blocks=blocks,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Helpers — private
+# ----------------------------------------------------------------------------
+
+def _norm_match_for_rote(s: str) -> str:
+    """
+    Normalize a string for case- and accent-insensitive matching against
+    ROTE values.
+
+    The same normalization sheets.load_rote_platoon_assignments uses on
+    its keys (lowercase + strip diacritics + collapse spaces). Defined
+    here so the formatter doesn't import from bot.services (which would
+    inverse the layering).
+    """
+    import unicodedata
+    if not s:
+        return ""
+    no_accent = "".join(
+        ch for ch in unicodedata.normalize("NFD", s)
+        if unicodedata.category(ch) != "Mn"
+    )
+    return " ".join(no_accent.strip().lower().split())
+
+
+def _pack_platoon_blocks(
+    *,
+    primary_header: str,
+    continuation_header: str,
+    blocks: List[List[str]],
+) -> List[str]:
+    """
+    Pack a list of (planet, op) blocks into one or more messages bounded
+    by SOFT_MESSAGE_CAP. Splits at block boundaries.
+
+    Why not use _pack_into_messages: that function operates on the
+    briefing format which has a single fixed top-of-message header.
+    Platoon messages have a primary_header for the first message and
+    a continuation_header for the rest, which doesn't fit the briefing
+    pattern. ~25 lines of duplication; cleaner than parameterizing the
+    other function.
+
+    Edge cases:
+      - A single block larger than SOFT_MESSAGE_CAP: emit it as one
+        message anyway (truncation handled by _enforce_message_cap).
+        In practice, a single (planet, operation) maxes out at 15
+        slots which is ~700 chars — comfortably under the cap.
+      - blocks is empty: returns an empty list. Caller should already
+        have short-circuited this case.
+    """
+    messages: List[str] = []
+    current_lines: List[str] = [primary_header, ""]
+
+    for block in blocks:
+        addition = [""] + block
+        prospective = current_lines + addition
+        prospective_size = len("\n".join(prospective))
+
+        if prospective_size > SOFT_MESSAGE_CAP and len(current_lines) > 2:
+            messages.append("\n".join(current_lines).rstrip())
+            current_lines = [continuation_header, ""] + block
+        else:
+            current_lines = prospective
+
+    if current_lines:
+        messages.append("\n".join(current_lines).rstrip())
+
+    return [_enforce_message_cap(m) for m in messages]
