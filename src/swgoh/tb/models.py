@@ -95,6 +95,79 @@ class ZoneStats:
     score: int            # contributions or completion count, type-dependent
     players_participated: Optional[int] = None  # only set for strike/covert
 
+@dataclass(frozen=True, slots=True)
+class PlatoonSlot:
+    """
+    One slot in a platoon squad. 15 slots per platoon (3 squads × 5 units).
+ 
+    Fields:
+      unit_id   Technical character base id, e.g. "CAPITALLEVIATHAN".
+                For filled slots, the export carries this with a rarity
+                suffix (":SEVEN_STAR"); we strip it at parse time so
+                consumers see a uniform value.
+      member_id Player who filled this slot, or "" if empty.
+ 
+    We deliberately drop the level/tier/relic-tier fields the export
+    carries. They're meaningful only for filled slots (empty slots
+    carry zeros), and our consumers don't need them — they want to
+    know "is this slot filled, and if not which character did it
+    require." The full per-unit detail is recoverable from the raw
+    JSON if a future feature ever needs it.
+    """
+    unit_id: str
+    member_id: str
+ 
+    @property
+    def is_filled(self) -> bool:
+        return bool(self.member_id)
+ 
+ 
+@dataclass(frozen=True, slots=True)
+class PlatoonSquad:
+    """
+    One of 3 squads inside a platoon. 5 unit slots each.
+ 
+    squad_number is 1-3, parsed from "tb3-squad-N". Officers don't
+    distinguish squads visually (they think in "Operation" units only),
+    but the export's structure has them and the data shape is cleaner
+    if we preserve it.
+    """
+    squad_number: int
+    units: tuple = field(default_factory=tuple)  # tuple[PlatoonSlot, ...]
+ 
+ 
+@dataclass(frozen=True, slots=True)
+class Platoon:
+    """
+    One of 6 platoons in a recon zone. Maps 1:1 to officers' notion
+    of "Operation #N" — the platoon_number field IS the operation
+    number used in Asignaciones ROTE.
+ 
+    platoon_number is 1-6, parsed from "tb3-platoon-N".
+    """
+    platoon_number: int
+    squads: tuple = field(default_factory=tuple)  # tuple[PlatoonSquad, ...]
+ 
+ 
+@dataclass(frozen=True, slots=True)
+class ReconZone:
+    """
+    A recon zone (the platoon-bearing zone for a conflict territory).
+ 
+    The zone_id is the recon zone's own id, e.g.
+    "tb3_mixed_phase05_conflict01_recon01". The parent conflict zone
+    can be derived by stripping the _recon01 suffix; we don't compute
+    it here because not every caller needs it.
+ 
+    Fields:
+      zone_id     Full recon zone id with the _recon01 suffix.
+      platoons    Tuple of Platoon entries, in the order they appeared
+                  in the export. Note: CG does NOT guarantee numerical
+                  order — platoon 6 may appear before platoon 1. Sort
+                  by platoon_number if you need stable ordering.
+    """
+    zone_id: str
+    platoons: tuple = field(default_factory=tuple)  # tuple[Platoon, ...]
 
 # ---------------------------------------------------------------------------
 # Root snapshot
@@ -163,6 +236,15 @@ class TBSnapshot:
     # A missing (zone_id, player_id) pair means zero contribution.
     zone_member_summary: Dict[str, Dict[str, int]] = field(default_factory=dict)
 
+    #   Keyed by recon zone_id (NOT by parent conflict zone id). Use
+    #   `_conflict_from_recon(rzid)` in tb/platoons.py to map back to
+    #   the parent if needed. An empty dict means either (a) the
+    #   snapshot has no recon zones (TB1/TB2 maps don't), or (b) the
+    #   parser is from before this feature was added and didn't
+    #   populate the field — both should degrade gracefully.
+    recon_zones: Dict[str, ReconZone] = field(default_factory=dict)
+
+  
     # Per-zone per-member GP deployed: zone_id -> {player_id -> power}.
     # Same structure as zone_member_summary but captures the `power_zone_*`
     # entries from currentStat. Used to compute "GP undeployed to active zones"
