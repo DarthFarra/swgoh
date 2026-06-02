@@ -55,6 +55,10 @@ from .models import (
     CategoryCounts,
     Member,
     PhaseStats,
+    Platoon,
+    PlatoonSlot,
+    PlatoonSquad,
+    ReconZone,
     TBSnapshot,
     ZoneStats,
 )
@@ -370,6 +374,153 @@ def _parse_zone_block(
         )
     return result
 
+def _parse_recon_zones(zone_list: Any) -> Dict[str, "ReconZone"]:
+    """
+    Parse the reconZoneStatus array into a dict of typed ReconZone entries.
+ 
+    Why a separate function from _parse_zone_block:
+      _parse_zone_block reads zoneStatus and produces ZoneStats — the
+      generic per-zone metadata. Recon zones carry an additional
+      `platoon` array with deeply nested structure (platoon → squad →
+      unit), which has no analog in conflict/strike/covert zones.
+      Keeping the recon-specific parsing here makes _parse_zone_block
+      simpler and surfaces the platoon model in its own dedicated
+      function.
+ 
+    Defensive parsing (consistent with the rest of parser.py):
+      - Malformed entries are logged at debug level and skipped.
+      - A single bad platoon/squad/unit doesn't poison the whole zone.
+      - Returns an empty dict (not None) when input is missing —
+        downstream consumers can iterate without null checks.
+ 
+    Unit identifier normalization:
+      The export's `unitIdentifier` carries a rarity suffix for filled
+      slots (e.g. "CAPITALLEVIATHAN:SEVEN_STAR") but only the base id
+      for empty slots ("CAPITALLEVIATHAN"). We strip the suffix
+      uniformly so downstream consumers see a single canonical id
+      regardless of fill state.
+    """
+    if not isinstance(zone_list, list):
+        return {}
+ 
+    result: Dict[str, "ReconZone"] = {}
+ 
+    for entry in zone_list:
+        if not isinstance(entry, dict):
+            continue
+        zs = entry.get("zoneStatus")
+        if not isinstance(zs, dict):
+            continue
+        zone_id = zs.get("zoneId") or ""
+        if not zone_id:
+            continue
+ 
+        platoon_list = entry.get("platoon")
+        if not isinstance(platoon_list, list):
+            # Zone exists but has no platoon data — store empty.
+            result[zone_id] = ReconZone(zone_id=zone_id, platoons=tuple())
+            continue
+ 
+        platoons: list = []
+        for p in platoon_list:
+            if not isinstance(p, dict):
+                continue
+            platoon_n = _parse_platoon_number(p.get("id", ""))
+            if platoon_n is None:
+                log.debug(
+                    "Skipping platoon with unparseable id %r in recon zone %r",
+                    p.get("id"), zone_id,
+                )
+                continue
+ 
+            squad_list = p.get("squad")
+            if not isinstance(squad_list, list):
+                continue
+ 
+            squads: list = []
+            for sq in squad_list:
+                if not isinstance(sq, dict):
+                    continue
+                squad_n = _parse_squad_number(sq.get("id", ""))
+                if squad_n is None:
+                    log.debug(
+                        "Skipping squad with unparseable id %r in zone %r platoon %d",
+                        sq.get("id"), zone_id, platoon_n,
+                    )
+                    continue
+ 
+                unit_list = sq.get("unit")
+                if not isinstance(unit_list, list):
+                    continue
+ 
+                units: list = []
+                for u in unit_list:
+                    if not isinstance(u, dict):
+                        continue
+                    unit_id = _normalize_unit_id(u.get("unitIdentifier", ""))
+                    member_id = str(u.get("memberId") or "").strip()
+                    units.append(PlatoonSlot(
+                        unit_id=unit_id,
+                        member_id=member_id,
+                    ))
+ 
+                squads.append(PlatoonSquad(
+                    squad_number=squad_n,
+                    units=tuple(units),
+                ))
+ 
+            platoons.append(Platoon(
+                platoon_number=platoon_n,
+                squads=tuple(squads),
+            ))
+ 
+        result[zone_id] = ReconZone(
+            zone_id=zone_id,
+            platoons=tuple(platoons),
+        )
+ 
+    return result
+ 
+ 
+def _parse_platoon_number(platoon_id: str) -> Optional[int]:
+    """Parse 'tb3-platoon-6' → 6. Returns None if id doesn't match."""
+    prefix = "tb3-platoon-"
+    if not platoon_id or not platoon_id.lower().startswith(prefix):
+        return None
+    tail = platoon_id[len(prefix):]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+ 
+ 
+def _parse_squad_number(squad_id: str) -> Optional[int]:
+    """Parse 'tb3-squad-01' → 1. Returns None if id doesn't match."""
+    prefix = "tb3-squad-"
+    if not squad_id or not squad_id.lower().startswith(prefix):
+        return None
+    tail = squad_id[len(prefix):]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+ 
+ 
+def _normalize_unit_id(raw: str) -> str:
+    """
+    Strip the rarity suffix from a unit identifier.
+ 
+    "CAPITALLEVIATHAN:SEVEN_STAR" → "CAPITALLEVIATHAN"
+    "CAPITALLEVIATHAN"            → "CAPITALLEVIATHAN"
+    ""                            → ""
+ 
+    The rarity is meaningful for the game but not for our lookups
+    (the Characters sheet keys by base id only).
+    """
+    if not raw:
+        return ""
+    colon = raw.find(":")
+    return raw[:colon] if colon != -1 else raw
 
 def _parse_current_stat(
     stat_list: Any,
@@ -544,6 +695,11 @@ def parse_tb_snapshot(raw: Dict[str, Any]) -> TBSnapshot:
     zones.update(_parse_zone_block(raw.get("reconZoneStatus"),    "recon"))
     zones.update(_parse_zone_block(raw.get("covertZoneStatus"),   "covert"))
 
+    # Recon zones get a richer parse than _parse_zone_block does — we
+    # preserve the platoon → squad → unit nested structure so the
+    # platoon-missing feature can analyze fill state.
+    recon_zones = _parse_recon_zones(raw.get("reconZoneStatus"))
+
     snapshot = TBSnapshot(
         instance_id=str(instance_id),
         definition_id=str(raw.get("definitionId", "")),
@@ -557,6 +713,7 @@ def parse_tb_snapshot(raw: Dict[str, Any]) -> TBSnapshot:
         phase_stats=phase_stats,
         total_stats=total_stats,
         zones=zones,
+        recon_zones=recon_zones,
         zone_member_summary=zone_member_summary,
         zone_member_power=zone_member_power,
     )
