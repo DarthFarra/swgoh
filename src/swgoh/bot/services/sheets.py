@@ -932,6 +932,7 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
         row[i_gn]  = guild_name
         row[i_pn]  = player_name
         row[i_date] = today_str
+        row[i_ld]   = str(fresh_lifetime)
 
         existing_row = this_guild.get(player_name.lower())
         if existing_row is not None:
@@ -946,6 +947,8 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
             # readers treat empty as "no data yet" and place this member in the
             # 'new members' bucket (no judgement) — which is the honest answer.
             row[i_ld1] = ""
+
+        new_rows.append(row)
 
     new_rows.sort(key=lambda r: r[i_pn].lower())
 
