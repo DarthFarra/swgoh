@@ -219,12 +219,11 @@ class AssignIndex:
             oper    = _gv_by_idx(r, self.idx_oper)    or "Sin operación"
             pers    = _gv_by_idx(r, self.idx_pers)    or "Sin personaje"
             uid     = _gv_by_idx(r, self.idx_userid)
+            jug     = _gv_by_idx(r, self.idx_jugador)
             if uid:
                 self.by_uid[uid].append((planeta, oper, pers))
-            else:
-                jug = _gv_by_idx(r, self.idx_jugador)
-                if jug:
-                    self.by_alias_norm[_norm_cell(jug)].append((planeta, oper, pers))
+            if jug:
+                self.by_alias_norm[_norm_cell(jug)].append((planeta, oper, pers))
 
         log.debug(
             "Index '%s' phase=%s: rows_in_phase=%d uids=%d aliases=%d",
@@ -235,9 +234,7 @@ class AssignIndex:
     def build_message_for(
         self, guild_name: str, user_id: str, alias: str
     ) -> Optional[str]:
-        items = self.by_uid.get(user_id)
-        if not items and alias:
-            items = self.by_alias_norm.get(_norm_cell(alias))
+        items = self.items_for(user_id, alias)
         if not items:
             return None
 
@@ -254,6 +251,19 @@ class AssignIndex:
             lines.extend(asigns)
             lines.append("")
         return "\n".join(lines)
+
+    def items_for(self, user_id: str, alias: str) -> List[Tuple[str, str, str]]:
+        """Return every assignment for one registered player.
+
+        Alias is the player-level identity. Telegram user_id is only a
+        fallback for legacy assignment rows that have no matching alias.
+        Lists are returned as-is so repeated sheet rows remain meaningful.
+        """
+        if alias:
+            alias_matches = self.by_alias_norm.get(_norm_cell(alias), [])
+            if alias_matches:
+                return list(alias_matches)
+        return list(self.by_uid.get(user_id, []))
 
 
 # ---------------------------------------------------------------------------

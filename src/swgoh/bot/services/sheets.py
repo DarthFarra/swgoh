@@ -364,6 +364,37 @@ def usuarios_guilds_for_user(ss, user_id: int) -> List[Tuple[str, str, str]]:
     return out
 
 
+def usuarios_registrations_for_user(
+    ss, user_id: int
+) -> List[Tuple[str, str, str, str, str]]:
+    """Returns all registered players for a Telegram user.
+
+    Each tuple is ``(label, guild_id, guild_name, rote_sheet, alias)``.
+    Unlike ``usuarios_guilds_for_user``, this deliberately keeps every
+    registration so one Telegram account can represent multiple players.
+    """
+    uh, ur = read_values_cached(ss, USERS_SHEET)
+    ul = [h.lower() for h in uh]
+    i_uid = ul.index("user_id") if "user_id" in ul else None
+    i_gn = ul.index("guild_name") if "guild_name" in ul else None
+    i_alias = ul.index("alias") if "alias" in ul else None
+    if i_uid is None or i_gn is None or i_alias is None:
+        return []
+
+    gmap = map_guild_name_to_label_id_rote(ss)
+    out = []
+    for r in ur:
+        if i_uid >= len(r) or str(r[i_uid]).strip() != str(user_id):
+            continue
+        gname = (r[i_gn] if i_gn < len(r) else "").strip()
+        alias = (r[i_alias] if i_alias < len(r) else "").strip()
+        if not gname or not alias or gname not in gmap:
+            continue
+        label, gid, rote = gmap[gname]
+        out.append((label, gid, gname, rote, alias))
+    return out
+
+
 def upsert_usuario(ss, info: dict, tg_username: str, user_id: int, chat_id: int):
     """Inserta/actualiza fila en Usuarios por (guild_name + alias)."""
     ws      = ss.worksheet(USERS_SHEET)
@@ -932,6 +963,7 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
         row[i_gn]  = guild_name
         row[i_pn]  = player_name
         row[i_date] = today_str
+        row[i_ld]   = str(fresh_lifetime)
 
         existing_row = this_guild.get(player_name.lower())
         if existing_row is not None:
@@ -946,6 +978,8 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
             # readers treat empty as "no data yet" and place this member in the
             # 'new members' bucket (no judgement) — which is the honest answer.
             row[i_ld1] = ""
+
+        new_rows.append(row)
 
     new_rows.sort(key=lambda r: r[i_pn].lower())
 
