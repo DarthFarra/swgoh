@@ -10,7 +10,7 @@ Can be invoked in three ways:
   3. Manually from a bot command (future).
 
 The send time is configured via SEND_ASSIGNMENTS_TIME (HH:MM, 24h,
-in the TIMEZONE timezone). main_bot.py reads that value and passes the
+in the ASSIGNMENTS_TIMEZONE timezone). main_bot.py reads that value and passes the
 correct datetime.time to PTB's run_daily().
 
 Phase logic (unchanged):
@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 TELEGRAM_BOT_TOKEN: str       = cfg.TELEGRAM_BOT_TOKEN
-TIMEZONE: str                  = cfg.TIMEZONE
+ASSIGNMENTS_TIMEZONE: str      = cfg.ASSIGNMENTS_TIMEZONE
 SHEET_USERS: str               = cfg.SHEET_USERS
 SHEET_GUILDS: str              = cfg.SHEET_GUILDS
 
@@ -165,7 +165,7 @@ def obtener_fase_actual() -> Optional[str]:
       - Even ISO week → phase = weekday + 1  (Mon→1, Tue→2, … Sat→6)
       - Odd ISO week  → None (no send)
     """
-    tz  = pytz.timezone(TIMEZONE)
+    tz  = pytz.timezone(ASSIGNMENTS_TIMEZONE)
     hoy = datetime.datetime.now(tz)
 
     if hoy.weekday() >= 6:

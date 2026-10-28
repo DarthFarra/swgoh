@@ -151,12 +151,27 @@ except ZoneInfoNotFoundError:
     )
 TIMEZONE: str = _tz_name  # raw string, for libs that need it (e.g. pytz, APScheduler)
 
+def _timezone(name: str, default: str) -> str:
+    value = _optional(name, default)
+    try:
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError:
+        raise SystemExit(
+            f"{name} value {value!r} is not a valid IANA timezone name. "
+            "Example: 'Europe/Madrid', 'America/New_York', 'UTC'."
+        )
+    return value
+
+
+TICKETS_TIMEZONE: str = _timezone("TICKETS_TIMEZONE", "Atlantic/Reykjavik")
+ASSIGNMENTS_TIMEZONE: str = _timezone("ASSIGNMENTS_TIMEZONE", "America/New_York")
+
 # ---------------------------------------------------------------------------
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 
-# Daily send-assignments: time in HH:MM format (24h, in TIMEZONE)
-SEND_ASSIGNMENTS_TIME: str = _optional("SEND_ASSIGNMENTS_TIME", "19:10")
+# Daily send-assignments: time in HH:MM format (24h, in ASSIGNMENTS_TIMEZONE)
+SEND_ASSIGNMENTS_TIME: str = _optional("SEND_ASSIGNMENTS_TIME", "12:59")
 
 # Weekly sync-guilds: full cron expression (runs in TIMEZONE)
 SYNC_GUILDS_CRON: str = _optional("SYNC_GUILDS_CRON", "0 3 * * 0")  # Sunday 03:00

@@ -16,6 +16,7 @@ DEFAULT_ROTE_SHEET     = bot_cfg.DEFAULT_ROTE_SHEET
 TICKET_SNAPSHOTS_SHEET = bot_cfg.TICKET_SNAPSHOTS_SHEET
 CHARACTERS_SHEET = bot_cfg.CHARACTERS_SHEET
 TZ                     = bot_cfg.TZ
+TICKETS_TZ             = ZoneInfo(bot_cfg.TICKETS_TIMEZONE)
 
 
 def open_ss():
@@ -1051,8 +1052,8 @@ def read_ticket_snapshot(
 
 
 def snapshot_taken_today(ss, guild_name: str) -> bool:
-    """Returns True if last_snapshot_date for guild_name equals today (Madrid TZ)."""
-    today_str = datetime.now(ZoneInfo("Europe/Madrid")).date().isoformat()
+    """Returns True if last_snapshot_date for guild_name equals today in the ticket timezone."""
+    today_str = datetime.now(TICKETS_TZ).date().isoformat()
     try:
         ws = ss.worksheet(TICKET_SNAPSHOTS_SHEET)
     except Exception:

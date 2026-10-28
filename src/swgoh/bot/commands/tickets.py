@@ -14,8 +14,6 @@ Flow:
 from __future__ import annotations
 
 import logging
-from zoneinfo import ZoneInfo
-
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
@@ -44,9 +42,6 @@ from ..services.tickets import (
 from ..keyboards.guild_select import make_keyboard_guilds
 
 log = logging.getLogger(__name__)
-
-MADRID_TZ = ZoneInfo("Europe/Madrid")
-
 
 # ---------------------------------------------------------------------------
 # Command entry point
