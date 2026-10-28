@@ -30,6 +30,7 @@ import logging
 from typing import Any, Optional
 
 import discord
+from discord import app_commands
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 from telegram.ext import Application
@@ -61,6 +62,7 @@ from .services.tb_undeployed_cache import (
     UndeployedSnapshot,
     set_snapshot as set_undeployed_snapshot,
 )
+from .discord_commands import install_commands
 
 
 log = logging.getLogger(__name__)
@@ -94,14 +96,21 @@ class _TBListenerClient(discord.Client):
         intents: discord.Intents,
     ) -> None:
         super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
         self._ptb_bot_data = ptb_bot_data
         self._ptb_bot = ptb_bot
         self._c3po_user_id = c3po_user_id
         self._watch_channel_id = watch_channel_id
         self._auto_forward_chat_id = auto_forward_chat_id
         self._auto_forward_thread_id = auto_forward_thread_id
+        self._commands_synced = False
 
     async def on_ready(self) -> None:
+        if not self._commands_synced:
+            install_commands(self)
+            await self.tree.sync()
+            self._commands_synced = True
+            log.info("Discord slash commands registered.")
         thread_note = (
             f" thread={self._auto_forward_thread_id}"
             if self._auto_forward_thread_id else ""
@@ -124,6 +133,12 @@ class _TBListenerClient(discord.Client):
             )
 
     async def _handle_message(self, message: discord.Message) -> None:
+        if (
+            self._c3po_user_id <= 0
+            or self._watch_channel_id <= 0
+            or self._auto_forward_chat_id == 0
+        ):
+            return
         if message.author.id != self._c3po_user_id:
             return
         if message.channel.id != self._watch_channel_id:
@@ -547,23 +562,16 @@ async def start_discord_listener(application: Application) -> None:
     if not token:
         log.warning("DISCORD_BOT_TOKEN not set; Discord listener disabled.")
         return
-    if c3po_id <= 0:
-        log.warning(
-            "DISCORD_C3PO_USER_ID not set or invalid; Discord listener disabled."
+    if c3po_id <= 0 or channel_id <= 0:
+        log.info(
+            "Discord slash commands enabled; C3PO TB forwarding disabled because "
+            "DISCORD_C3PO_USER_ID or DISCORD_WATCH_CHANNEL_ID is not configured."
         )
-        return
-    if channel_id <= 0:
-        log.warning(
-            "DISCORD_WATCH_CHANNEL_ID not set or invalid; "
-            "Discord listener disabled."
+    elif forward_chat == 0:
+        log.info(
+            "Discord slash commands enabled; TB auto-forwarding disabled because "
+            "TB_AUTO_FORWARD_CHAT_ID is not configured."
         )
-        return
-    if forward_chat == 0:
-        log.warning(
-            "TB_AUTO_FORWARD_CHAT_ID not set; Discord listener disabled. "
-            "Set it to the Telegram chat that should receive auto-summaries."
-        )
-        return
 
     if forward_thread < 0:
         log.warning(

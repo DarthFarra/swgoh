@@ -316,7 +316,10 @@ def resolve_label_name_by_guild_id(
 def ensure_usuarios_headers(ws) -> Dict[str, int]:
     headers = ws.row_values(1) or []
     low     = [h.strip().lower() for h in headers]
-    needed  = ["alias", "username", "user_id", "chat_id", "rol", "allycode", "guild_name"]
+    needed  = [
+        "alias", "username", "user_id", "chat_id", "discord_id",
+        "rol", "allycode", "guild_name",
+    ]
     changed = False
     for k in needed:
         if k not in low:
@@ -365,6 +368,54 @@ def usuarios_guilds_for_user(ss, user_id: int) -> List[Tuple[str, str, str]]:
     return out
 
 
+def usuarios_guilds_for_discord_user(
+    ss, discord_id: int
+) -> List[Tuple[str, str, str]]:
+    """Returns [(label, guild_id, guild_name)] for a Discord user."""
+    uh, ur = read_values_cached(ss, USERS_SHEET)
+    ul = [h.lower() for h in uh]
+    i_did = ul.index("discord_id") if "discord_id" in ul else None
+    i_gn = ul.index("guild_name") if "guild_name" in ul else None
+    if i_did is None or i_gn is None:
+        return []
+    gmap = map_guild_name_to_label_id_rote(ss)
+    out, seen = [], set()
+    for row in ur:
+        if i_did >= len(row) or str(row[i_did]).strip() != str(discord_id):
+            continue
+        gname = (row[i_gn] if i_gn < len(row) else "").strip()
+        if gname and gname in gmap:
+            label, gid, _ = gmap[gname]
+            if gid not in seen:
+                seen.add(gid)
+                out.append((label, gid, gname))
+    return out
+
+
+def discord_user_has_leadership_role(
+    ss, discord_id: int, guild_name: str
+) -> bool:
+    """Return whether a Discord user is an officer or leader in a guild."""
+    headers, rows = read_values_cached(ss, USERS_SHEET)
+    hl = [h.lower() for h in headers]
+    if not all(name in hl for name in ("discord_id", "guild_name", "rol")):
+        return False
+    i_did, i_gn, i_rol = (
+        hl.index("discord_id"),
+        hl.index("guild_name"),
+        hl.index("rol"),
+    )
+    for row in rows:
+        if (
+            i_did < len(row)
+            and str(row[i_did]).strip() == str(discord_id)
+            and i_gn < len(row)
+            and (row[i_gn] or "").strip() == guild_name
+        ):
+            return (row[i_rol] if i_rol < len(row) else "").strip().lower() in {
+                "oficial", "lider", "líder",
+            }
+    return False
 def usuarios_registrations_for_user(
     ss, user_id: int
 ) -> List[Tuple[str, str, str, str, str]]:
@@ -441,6 +492,108 @@ def upsert_usuario(ss, info: dict, tg_username: str, user_id: int, chat_id: int)
         setf(row_vals, i_rol,   role);         setf(row_vals, i_ac,   ally)
         setf(row_vals, i_gn,    gname)
         ws.update(f"{target_idx+2}:{target_idx+2}", [row_vals])
+
+
+def discord_usuario_already_registered(ss, discord_id: int, guild_name: str) -> bool:
+    """Return whether a Discord user already has a registration in a guild."""
+    headers, rows = _get_all(ss.worksheet(USERS_SHEET))
+    hl = [h.lower() for h in headers]
+    if "discord_id" not in hl or "guild_name" not in hl:
+        return False
+    i_did = hl.index("discord_id")
+    i_gn = hl.index("guild_name")
+    return any(
+        i_did < len(row)
+        and str(row[i_did]).strip() == str(discord_id)
+        and i_gn < len(row)
+        and (row[i_gn] or "").strip() == guild_name
+        for row in rows
+    )
+
+
+def upsert_discord_usuario(ss, info: dict, discord_id: int):
+    """Insert/update a registration while preserving any Telegram identity."""
+    ws = ss.worksheet(USERS_SHEET)
+    hdr_map = ensure_usuarios_headers(ws)
+    vals = ws.get_all_values() or []
+    rows = vals[1:] if len(vals) > 1 else []
+
+    i_alias = hdr_map["alias"]
+    i_user = hdr_map["username"]
+    i_did = hdr_map["discord_id"]
+    i_rol = hdr_map["rol"]
+    i_ac = hdr_map["allycode"]
+    i_gn = hdr_map["guild_name"]
+
+    alias = info.get("alias", "")
+    gname = info.get("guild_name", "")
+    role = info.get("role", "")
+    ally = info.get("allycode", "")
+
+    target_idx = None
+    for idx, row in enumerate(rows):
+        row_gname = (row[i_gn] if i_gn < len(row) else "").strip()
+        row_alias = (row[i_alias] if i_alias < len(row) else "").strip()
+        row_discord = (row[i_did] if i_did < len(row) else "").strip()
+        if row_gname == gname and (
+            row_alias.lower() == alias.strip().lower()
+            or row_discord == str(discord_id)
+        ):
+            target_idx = idx
+            break
+
+    def setf(row, index, value):
+        if index < len(row) and value is not None:
+            row[index] = str(value)
+
+    if target_idx is None:
+        new_row = [""] * len(ws.row_values(1) or [])
+        setf(new_row, i_alias, alias)
+        setf(new_row, i_user, "")
+        setf(new_row, i_did, discord_id)
+        setf(new_row, i_rol, role)
+        setf(new_row, i_ac, ally)
+        setf(new_row, i_gn, gname)
+        ws.append_row(new_row, value_input_option="USER_ENTERED")
+        return
+
+    row_vals = rows[target_idx][:]
+    need_len = len(ws.row_values(1) or [])
+    row_vals += [""] * (need_len - len(row_vals))
+    setf(row_vals, i_alias, alias)
+    if not (row_vals[i_user] if i_user < len(row_vals) else "").strip():
+        setf(row_vals, i_user, "")
+    setf(row_vals, i_did, discord_id)
+    setf(row_vals, i_rol, role)
+    setf(row_vals, i_ac, ally)
+    setf(row_vals, i_gn, gname)
+    ws.update(f"{target_idx + 2}:{target_idx + 2}", [row_vals])
+
+
+def usuarios_registrations_for_discord_user(
+    ss, discord_id: int
+) -> List[Tuple[str, str, str, str, str]]:
+    """Returns all registered players for a Discord user."""
+    uh, ur = read_values_cached(ss, USERS_SHEET)
+    ul = [h.lower() for h in uh]
+    i_did = ul.index("discord_id") if "discord_id" in ul else None
+    i_gn = ul.index("guild_name") if "guild_name" in ul else None
+    i_alias = ul.index("alias") if "alias" in ul else None
+    if i_did is None or i_gn is None or i_alias is None:
+        return []
+
+    gmap = map_guild_name_to_label_id_rote(ss)
+    out = []
+    for row in ur:
+        if i_did >= len(row) or str(row[i_did]).strip() != str(discord_id):
+            continue
+        gname = (row[i_gn] if i_gn < len(row) else "").strip()
+        alias = (row[i_alias] if i_alias < len(row) else "").strip()
+        if not gname or not alias or gname not in gmap:
+            continue
+        label, gid, rote = gmap[gname]
+        out.append((label, gid, gname, rote, alias))
+    return out
 
 
 def user_has_leadership_role(ss, user_id: int, guild_name: str) -> bool:

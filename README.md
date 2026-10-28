@@ -88,6 +88,12 @@ Key variables:
 | `SYNC_GUILDS_CRON` | | `0 3 * * 0` | Weekly guild sync schedule |
 | `SYNC_DATA_CRON` | | `0 2 1 * *` | Monthly data sync schedule |
 
+Discord users can register with `/register`, query their own ROTE assignments
+with `/misoperaciones`, and officers/leaders can query another player's
+assignments with `/operacionesjugador`. The daily assignment job sends the
+same assignment message by Discord DM to registered Discord users. The bot
+adds the `discord_id` column to the `Usuarios` sheet automatically when needed.
+
 ## Project structure
 
 ```

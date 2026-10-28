@@ -38,6 +38,7 @@ from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs, set_bot_for_snapshot_jobs
 from .jobs.ticket_reminder import schedule_reminder_jobs
 from .jobs.send_assignments_daily import job_send_assignments
+from .discord_commands import job_send_discord_assignments
 from .services.sync_runner import run_sync_guilds_once, run_sync_data
 
 logging.basicConfig(
@@ -211,6 +212,11 @@ def main() -> None:
             job_send_assignments,
             time=send_time,
             name="daily_send_assignments",
+        )
+        application.job_queue.run_daily(
+            job_send_discord_assignments,
+            time=send_time,
+            name="daily_send_assignments_discord",
         )
         log.info(
             "send_assignments scheduled daily at %s %s",
