@@ -54,6 +54,21 @@ git pull
 sudo systemctl restart swgoh-bot
 ```
 
+## Offline `/syncguild` mock
+
+When Google Sheets is unavailable, the effect of `/syncguild` can be simulated
+from a saved Comlink `/guild` response in `guild-comlink.json`. The script
+writes CSV equivalents of the `Guilds`, `Players`, `Player_Units`, and
+`Player_Skills` tabs:
+
+```bash
+python scripts/mock_syncguild.py pTtJHHuYQcSMinxQXXZJgA
+```
+
+Use `--comlink-json` to provide another saved Comlink response, `--snapshot`
+to use a legacy ticket CSV explicitly, and `--output-dir` to keep the
+generated files outside the repository.
+
 ## Environment variables
 
 See `.env.example` — single file, all variables documented.
@@ -66,10 +81,18 @@ Key variables:
 | `SERVICE_ACCOUNT_FILE` | ✅ | — | Google credentials (path, JSON, or base64) |
 | `SPREADSHEET_ID` | ✅* | — | Google Sheet ID (`*` or `SPREADSHEET_NAME`) |
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Telegram bot token |
-| `TIMEZONE` | | `Europe/Madrid` | IANA timezone name |
-| `SEND_ASSIGNMENTS_TIME` | | `19:10` | Daily send time (HH:MM) |
+| `TIMEZONE` | | `Europe/Madrid` | IANA timezone for sync cron jobs |
+| `TICKETS_TIMEZONE` | | `Atlantic/Reykjavik` | IANA timezone for ticket snapshots and reminders |
+| `ASSIGNMENTS_TIMEZONE` | | `America/New_York` | IANA timezone for assignment sends |
+| `SEND_ASSIGNMENTS_TIME` | | `12:59` | Daily send time (HH:MM) in `ASSIGNMENTS_TIMEZONE` |
 | `SYNC_GUILDS_CRON` | | `0 3 * * 0` | Weekly guild sync schedule |
 | `SYNC_DATA_CRON` | | `0 2 1 * *` | Monthly data sync schedule |
+
+Discord users can register with `/register`, query their own ROTE assignments
+with `/misoperaciones`, and officers/leaders can query another player's
+assignments with `/operacionesjugador`. The daily assignment job sends the
+same assignment message by Discord DM to registered Discord users. The bot
+adds the `discord_id` column to the `Usuarios` sheet automatically when needed.
 
 ## Project structure
 

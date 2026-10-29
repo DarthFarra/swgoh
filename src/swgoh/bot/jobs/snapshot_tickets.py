@@ -4,9 +4,10 @@ Snapshot job: reads lifetimeValue (ticket contribution type=2) for every
 guild member at reset time and stores it in the Ticket_Snapshots sheet.
 
 Scheduling logic:
-  - A CronTrigger job fires at exactly the guild's reset_time (HH:MM Madrid TZ).
+  - A CronTrigger job fires at exactly the guild's reset_time (HH:MM in the
+    configured ticket timezone).
   - On bot startup a catch-up check runs: if today's snapshot is missing AND
-    the current Madrid time is between reset_time and 23:59, the snapshot is
+    the current ticket-local time is between reset_time and 23:59, the snapshot is
     taken immediately. This handles Railway restarts that occur after reset.
 
 Missed-deadline auto-post (opt-in via `ticket_missed_post_enabled` column):
@@ -41,7 +42,7 @@ from zoneinfo import ZoneInfo
 
 from telegram.error import Forbidden, BadRequest, TelegramError
 
-from ..config import TIMEZONE
+from ..config import TICKETS_TIMEZONE
 from ..services.sheets import (
     open_ss,
     list_guilds_with_reset_time,
@@ -62,7 +63,7 @@ from ..services.tickets import (
 
 log = logging.getLogger(__name__)
 
-MADRID_TZ = ZoneInfo(TIMEZONE)
+TICKETS_TZ = ZoneInfo(TICKETS_TIMEZONE)
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +117,7 @@ def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets
             "Snapshot saved for guild '%s': %d members, date=%s",
             guild_name,
             len(snapshots),
-            datetime.now(MADRID_TZ).date().isoformat(),
+            datetime.now(TICKETS_TZ).date().isoformat(),
         )
         return members
     except Exception:
@@ -212,7 +213,7 @@ def _snapshot_for_guild_with_capture(
             "Snapshot saved for guild '%s': %d members, date=%s",
             guild_name,
             len(snapshots),
-            datetime.now(MADRID_TZ).date().isoformat(),
+            datetime.now(TICKETS_TZ).date().isoformat(),
         )
 
         snapshot_d  = {m.player_name.lower(): m.lifetime_value for m in members}
@@ -395,7 +396,8 @@ async def _maybe_publish_missed_post(
 def schedule_snapshot_jobs(scheduler) -> None:
     """
     Reads all guilds with a configured reset_time and registers a daily
-    CronTrigger for each, firing at exactly the reset time (Madrid TZ).
+    CronTrigger for each, firing at exactly the reset time in the configured
+    ticket timezone.
 
     Also performs a catch-up check: if today's snapshot is missing and the
     current time is past the reset, runs the snapshot immediately. Catch-up
@@ -419,7 +421,7 @@ def schedule_snapshot_jobs(scheduler) -> None:
         )
         return
 
-    now_madrid = datetime.now(MADRID_TZ)
+    now_tickets = datetime.now(TICKETS_TZ)
 
     for guild_id, guild_name, reset_time_str in guilds:
         hour, minute = _parse_reset_time(reset_time_str, guild_name)
@@ -439,7 +441,7 @@ def schedule_snapshot_jobs(scheduler) -> None:
             trigger="cron",
             hour=hour,
             minute=minute,
-            timezone=MADRID_TZ,
+            timezone=TICKETS_TZ,
             id=job_id,
             name=f"Ticket snapshot — {guild_name}",
             kwargs={"guild_id": guild_id, "guild_name": guild_name},
@@ -448,16 +450,16 @@ def schedule_snapshot_jobs(scheduler) -> None:
         )
 
         log.info(
-            "Scheduled ticket snapshot for guild '%s' at %02d:%02d Madrid time",
-            guild_name, hour, minute,
+            "Scheduled ticket snapshot for guild '%s' at %02d:%02d %s time",
+            guild_name, hour, minute, TICKETS_TIMEZONE,
         )
 
         # Catch-up via SYNC helper — does not post (silent by design).
-        reset_today = now_madrid.replace(
+        reset_today = now_tickets.replace(
             hour=hour, minute=minute, second=0, microsecond=0,
         )
-        past_reset      = now_madrid >= reset_today
-        before_midnight = now_madrid.time() < time(23, 59)
+        past_reset      = now_tickets >= reset_today
+        before_midnight = now_tickets.time() < time(23, 59)
 
         if past_reset and before_midnight:
             try:

@@ -2,7 +2,8 @@
 """
 Pre-reset ticket reminder job.
 
-Fires at `reset_time − TICKET_REMINDER_LEAD_MINUTES` (per guild, Madrid TZ) and
+Fires at `reset_time − TICKET_REMINDER_LEAD_MINUTES` (per guild, in the
+configured ticket timezone) and
 posts the current "missing tickets" list to the guild's announcements channel
 — same payload as the officer-triggered "Publicar en Avisos" flow.
 
@@ -37,7 +38,7 @@ from zoneinfo import ZoneInfo
 
 from telegram.error import Forbidden, BadRequest, TelegramError
 
-from ..config import TIMEZONE
+from ..config import TICKETS_TIMEZONE
 from ..services.sheets import (
     open_ss,
     list_guilds_with_reset_time,
@@ -53,7 +54,7 @@ from ..services.tickets import (
 
 log = logging.getLogger(__name__)
 
-MADRID_TZ = ZoneInfo(TIMEZONE)
+TICKETS_TZ = ZoneInfo(TICKETS_TIMEZONE)
 
 
 # In-memory de-dup for catch-up. Keyed by (guild_id, ISO date).
@@ -213,7 +214,7 @@ async def run_reminder_for_guild(
         )
         return
 
-    today_iso = datetime.now(MADRID_TZ).date().isoformat()
+    today_iso = datetime.now(TICKETS_TZ).date().isoformat()
     _FIRED_TODAY.add((guild_id, today_iso))
     log.info(
         "[ticket_reminder] posted for guild '%s' (%d delinquents).",
@@ -264,7 +265,7 @@ def schedule_reminder_jobs(scheduler, application, lead_minutes: int) -> None:
         )
         return
 
-    now_madrid = datetime.now(MADRID_TZ)
+    now_tickets = datetime.now(TICKETS_TZ)
     bot = application.bot
 
     for guild_id, guild_name, reset_time_str in guilds:
@@ -294,7 +295,7 @@ def schedule_reminder_jobs(scheduler, application, lead_minutes: int) -> None:
         # Compute reminder time by subtracting lead_minutes from "today's reset".
         # The actual date doesn't matter — APScheduler's cron uses hour/minute
         # independently — but timedelta arithmetic handles wrap-around cleanly.
-        anchor = now_madrid.replace(
+        anchor = now_tickets.replace(
             hour=reset_h, minute=reset_m, second=0, microsecond=0,
         )
         reminder_dt = anchor - timedelta(minutes=lead_minutes)
@@ -316,16 +317,17 @@ def schedule_reminder_jobs(scheduler, application, lead_minutes: int) -> None:
             trigger="cron",
             hour=rem_h,
             minute=rem_m,
-            timezone=MADRID_TZ,
+            timezone=TICKETS_TZ,
             id=job_id,
             name=f"Ticket reminder — {guild_name}",
             replace_existing=True,
             misfire_grace_time=300,
         )
         log.info(
-            "[ticket_reminder] scheduled for guild '%s' at %02d:%02d Madrid "
+            "[ticket_reminder] scheduled for guild '%s' at %02d:%02d %s "
             "(reset %02d:%02d − %d min)",
-            guild_name, rem_h, rem_m, reset_h, reset_m, lead_minutes,
+            guild_name, rem_h, rem_m, TICKETS_TIMEZONE,
+            reset_h, reset_m, lead_minutes,
         )
 
         # Catch-up: did we start inside the reminder window today?
@@ -333,8 +335,8 @@ def schedule_reminder_jobs(scheduler, application, lead_minutes: int) -> None:
         reset_dt_today = anchor
         reminder_dt_today = reset_dt_today - timedelta(minutes=lead_minutes)
 
-        in_window = reminder_dt_today <= now_madrid < reset_dt_today
-        today_iso = now_madrid.date().isoformat()
+        in_window = reminder_dt_today <= now_tickets < reset_dt_today
+        today_iso = now_tickets.date().isoformat()
         already_fired = (guild_id, today_iso) in _FIRED_TODAY
 
         if in_window and not already_fired:
@@ -342,7 +344,7 @@ def schedule_reminder_jobs(scheduler, application, lead_minutes: int) -> None:
                 "[ticket_reminder] catch-up: firing missed reminder for '%s' "
                 "(now %s is inside [%s, %s))",
                 guild_name,
-                now_madrid.strftime("%H:%M"),
+                now_tickets.strftime("%H:%M"),
                 reminder_dt_today.strftime("%H:%M"),
                 reset_dt_today.strftime("%H:%M"),
             )
@@ -353,7 +355,7 @@ def schedule_reminder_jobs(scheduler, application, lead_minutes: int) -> None:
             scheduler.add_job(
                 _job,
                 trigger="date",
-                run_date=now_madrid + timedelta(seconds=5),
+                run_date=now_tickets + timedelta(seconds=5),
                 id=f"{job_id}_catchup",
                 name=f"Ticket reminder catch-up — {guild_name}",
                 replace_existing=True,

@@ -6,7 +6,7 @@ Runs:
   - Telegram polling (PTB)
   - APScheduler for the ticket snapshot jobs (guild-specific, time-driven)
   - PTB JobQueue for the three consolidated batch jobs:
-      * send_assignments  — daily at SEND_ASSIGNMENTS_TIME (TIMEZONE)
+      * send_assignments  — daily at SEND_ASSIGNMENTS_TIME (ASSIGNMENTS_TIMEZONE)
       * sync_guilds       — on SYNC_GUILDS_CRON schedule
       * sync_data         — on SYNC_DATA_CRON schedule
 
@@ -28,13 +28,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from telegram.ext import ApplicationBuilder
 
-from .config import BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON, TIMEZONE, TICKET_REMINDER_LEAD_MINUTES
+from .config import (
+    BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON,
+    TIMEZONE, ASSIGNMENTS_TIMEZONE, TICKET_REMINDER_LEAD_MINUTES,
+)
 from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache, tb_reload_targets
 from .error_handler import on_error
 from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs, set_bot_for_snapshot_jobs
 from .jobs.ticket_reminder import schedule_reminder_jobs
 from .jobs.send_assignments_daily import job_send_assignments
+from .discord_commands import job_send_discord_assignments
 from .services.sync_runner import run_sync_guilds_once, run_sync_data
 
 logging.basicConfig(
@@ -150,8 +154,12 @@ def main() -> None:
     app.add_error_handler(on_error)
 
     # --- Parse send-assignments time ---
-    send_time = _parse_send_time(SEND_ASSIGNMENTS_TIME, tz)
-    log.info("send_assignments scheduled at %s %s", send_time.strftime("%H:%M"), TIMEZONE)
+    assignments_tz = ZoneInfo(ASSIGNMENTS_TIMEZONE)
+    send_time = _parse_send_time(SEND_ASSIGNMENTS_TIME, assignments_tz)
+    log.info(
+        "send_assignments scheduled at %s %s",
+        send_time.strftime("%H:%M"), ASSIGNMENTS_TIMEZONE,
+    )
 
     # --- APScheduler (for jobs that need cron expressions) ---
     scheduler = AsyncIOScheduler(timezone=tz)
@@ -205,9 +213,14 @@ def main() -> None:
             time=send_time,
             name="daily_send_assignments",
         )
+        application.job_queue.run_daily(
+            job_send_discord_assignments,
+            time=send_time,
+            name="daily_send_assignments_discord",
+        )
         log.info(
             "send_assignments scheduled daily at %s %s",
-            send_time.strftime("%H:%M"), TIMEZONE,
+            send_time.strftime("%H:%M"), ASSIGNMENTS_TIMEZONE,
         )
 
       # Load TB map config from Sheets into bot_data so commands and
