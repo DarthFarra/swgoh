@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 from typing import Optional
 
 import discord
@@ -23,6 +24,9 @@ from .services.sheets import (
     open_ss,
     players_find_by_alias,
     players_find_by_ally,
+    usuario_player_already_registered,
+    is_registration_user_banned,
+    log_registration_attempt,
     render_ops_for_alias_phase_grouped,
     upsert_discord_usuario,
     usuarios_guilds_for_discord_user,
@@ -183,10 +187,18 @@ class RegistrationModal(discord.ui.Modal):
             )
             return
 
+        if usuario_player_already_registered(ss, found.get("allycode", "")):
+            await interaction.followup.send(
+                "❌ Ese jugador ya está registrado y no puede ser reasignado.",
+                ephemeral=True,
+            )
+            return
+
         upsert_discord_usuario(
             ss,
             found,
             interaction.user.id,
+            interaction.user.name,
         )
         await interaction.followup.send(
             f"✅ Registrado en **{self.label}** como **{found.get('alias', '')}** "
@@ -350,6 +362,17 @@ class DiscordCommands:
 
     async def register(self, interaction: discord.Interaction) -> None:
         ss = open_ss()
+        log_registration_attempt(
+            ss,
+            discord_username=interaction.user.name,
+            discord_id=interaction.user.id,
+        )
+        if is_registration_user_banned(ss, discord_id=interaction.user.id):
+            await interaction.response.send_message(
+                random.choice(("💩", "🖕🏿", "👎🏿", "🚫", "🤡", "🙅🏿‍♂️", "🗑️")),
+                ephemeral=True,
+            )
+            return
         guilds = list(map_guild_name_to_label_id_rote(ss).items())
         if not guilds:
             await interaction.response.send_message(

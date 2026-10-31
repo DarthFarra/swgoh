@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
+import logging
 from .sheets_io import read_values_cached
 from dataclasses import dataclass
 
@@ -14,9 +15,12 @@ GUILDS_SHEET           = bot_cfg.GUILDS_SHEET
 PLAYERS_SHEET          = bot_cfg.PLAYERS_SHEET
 DEFAULT_ROTE_SHEET     = bot_cfg.DEFAULT_ROTE_SHEET
 TICKET_SNAPSHOTS_SHEET = bot_cfg.TICKET_SNAPSHOTS_SHEET
+REGISTER_LOG_SHEET      = bot_cfg.REGISTER_LOG_SHEET
+BANNED_USERS_SHEET      = bot_cfg.BANNED_USERS_SHEET
 CHARACTERS_SHEET = bot_cfg.CHARACTERS_SHEET
 TZ                     = bot_cfg.TZ
 TICKETS_TZ             = ZoneInfo(bot_cfg.TICKETS_TIMEZONE)
+log = logging.getLogger(__name__)
 
 
 def open_ss():
@@ -317,7 +321,7 @@ def ensure_usuarios_headers(ws) -> Dict[str, int]:
     headers = ws.row_values(1) or []
     low     = [h.strip().lower() for h in headers]
     needed  = [
-        "alias", "username", "user_id", "chat_id", "discord_id",
+        "alias", "username", "user_id", "chat_id", "discord_username", "discord_id",
         "rol", "allycode", "guild_name",
     ]
     changed = False
@@ -329,6 +333,78 @@ def ensure_usuarios_headers(ws) -> Dict[str, int]:
     if changed:
         ws.update("1:1", [headers])
     return {h: i for i, h in enumerate([h.strip().lower() for h in headers])}
+
+
+def _ensure_registration_sheet(ss, sheet_name: str, headers: list[str]):
+    try:
+        return ss.worksheet(sheet_name)
+    except Exception:
+        log.info("Creating missing registration sheet %r.", sheet_name)
+        ws = ss.add_worksheet(title=sheet_name, rows=1000, cols=len(headers))
+        ws.update("1:1", [headers])
+        return ws
+
+
+def is_registration_user_banned(
+    ss, *, telegram_id: int | None = None, discord_id: int | None = None
+) -> bool:
+    """Return whether either platform identity has an explicit registration ban."""
+    ws = _ensure_registration_sheet(
+        ss,
+        BANNED_USERS_SHEET,
+        ["telegram_id", "discord_id", "telegram_username", "discord_username"],
+    )
+    headers, rows = _get_all(ws)
+    hl = [header.strip().lower() for header in headers]
+    for column, value in (("telegram_id", telegram_id), ("discord_id", discord_id)):
+        if value is None or column not in hl:
+            continue
+        index = hl.index(column)
+        if any(index < len(row) and str(row[index]).strip() == str(value) for row in rows):
+            return True
+    return False
+
+
+def log_registration_attempt(
+    ss,
+    *,
+    telegram_username: str = "",
+    telegram_id: int | None = None,
+    discord_username: str = "",
+    discord_id: int | None = None,
+) -> None:
+    """Append one registration attempt with the identities available to the bot."""
+    ws = _ensure_registration_sheet(
+        ss,
+        REGISTER_LOG_SHEET,
+        ["telegram_username", "telegram_id", "discord_username", "discord_id", "timestamp"],
+    )
+    ws.append_row(
+        [
+            telegram_username or "",
+            str(telegram_id) if telegram_id is not None else "",
+            discord_username or "",
+            str(discord_id) if discord_id is not None else "",
+            datetime.now(TZ).isoformat(),
+        ],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def usuario_player_already_registered(ss, allycode: str) -> bool:
+    """Return whether an allycode is already owned by any registered user."""
+    headers, rows = _get_all(ss.worksheet(USERS_SHEET))
+    hl = [header.strip().lower() for header in headers]
+    if "allycode" not in hl:
+        return False
+    index = hl.index("allycode")
+    normalized = "".join(str(allycode or "").split()).replace("-", "")
+    return any(
+        index < len(row)
+        and "".join(str(row[index] or "").split()).replace("-", "") == normalized
+        and normalized
+        for row in rows
+    )
 
 
 def usuarios_already_registered(ss, user_id: int, guild_name: str) -> bool:
@@ -395,27 +471,29 @@ def usuarios_guilds_for_discord_user(
 def discord_user_has_leadership_role(
     ss, discord_id: int, guild_name: str
 ) -> bool:
-    """Return whether a Discord user is an officer or leader in a guild."""
+    """Return whether a Discord user is currently an officer or leader in a guild."""
+    from .auth import _has_current_role
+
     headers, rows = read_values_cached(ss, USERS_SHEET)
     hl = [h.lower() for h in headers]
-    if not all(name in hl for name in ("discord_id", "guild_name", "rol")):
+    if not all(name in hl for name in ("discord_id", "guild_name")):
         return False
-    i_did, i_gn, i_rol = (
+    i_did, i_gn = (
         hl.index("discord_id"),
         hl.index("guild_name"),
-        hl.index("rol"),
     )
-    for row in rows:
-        if (
-            i_did < len(row)
-            and str(row[i_did]).strip() == str(discord_id)
-            and i_gn < len(row)
-            and (row[i_gn] or "").strip() == guild_name
-        ):
-            return (row[i_rol] if i_rol < len(row) else "").strip().lower() in {
-                "oficial", "lider", "líder",
-            }
-    return False
+    guild_ids = {
+        gid for name, (_label, gid, _rote) in map_guild_name_to_label_id_rote(ss).items()
+        if name == guild_name
+    }
+    return any(
+        i_did < len(row)
+        and str(row[i_did]).strip() == str(discord_id)
+        and i_gn < len(row)
+        and (row[i_gn] or "").strip() == guild_name
+        and _has_current_role(ss, gid, discord_id=discord_id)
+        for gid in guild_ids
+    )
 def usuarios_registrations_for_user(
     ss, user_id: int
 ) -> List[Tuple[str, str, str, str, str]]:
@@ -448,7 +526,7 @@ def usuarios_registrations_for_user(
 
 
 def upsert_usuario(ss, info: dict, tg_username: str, user_id: int, chat_id: int):
-    """Inserta/actualiza fila en Usuarios por (guild_name + alias)."""
+    """Inserta/actualiza fila en Usuarios por (guild_name + allycode)."""
     ws      = ss.worksheet(USERS_SHEET)
     hdr_map = ensure_usuarios_headers(ws)
     vals    = ws.get_all_values() or []
@@ -466,8 +544,12 @@ def upsert_usuario(ss, info: dict, tg_username: str, user_id: int, chat_id: int)
     target_idx = None
     for idx, r in enumerate(rows):
         gn = (r[i_gn]    if i_gn    < len(r) else "").strip()
-        al = (r[i_alias] if i_alias < len(r) else "").strip()
-        if gn == gname and al.strip().lower() == alias.strip().lower():
+        row_ally = (r[i_ac] if i_ac < len(r) else "").strip()
+        if gn == gname and (
+            "".join(row_ally.split()).replace("-", "")
+            == "".join(str(ally).split()).replace("-", "")
+            and ally
+        ):
             target_idx = idx
             break
 
@@ -511,7 +593,7 @@ def discord_usuario_already_registered(ss, discord_id: int, guild_name: str) -> 
     )
 
 
-def upsert_discord_usuario(ss, info: dict, discord_id: int):
+def upsert_discord_usuario(ss, info: dict, discord_id: int, discord_username: str = ""):
     """Insert/update a registration while preserving any Telegram identity."""
     ws = ss.worksheet(USERS_SHEET)
     hdr_map = ensure_usuarios_headers(ws)
@@ -520,6 +602,7 @@ def upsert_discord_usuario(ss, info: dict, discord_id: int):
 
     i_alias = hdr_map["alias"]
     i_user = hdr_map["username"]
+    i_discord_user = hdr_map["discord_username"]
     i_did = hdr_map["discord_id"]
     i_rol = hdr_map["rol"]
     i_ac = hdr_map["allycode"]
@@ -533,10 +616,12 @@ def upsert_discord_usuario(ss, info: dict, discord_id: int):
     target_idx = None
     for idx, row in enumerate(rows):
         row_gname = (row[i_gn] if i_gn < len(row) else "").strip()
-        row_alias = (row[i_alias] if i_alias < len(row) else "").strip()
+        row_ally = (row[i_ac] if i_ac < len(row) else "").strip()
         row_discord = (row[i_did] if i_did < len(row) else "").strip()
         if row_gname == gname and (
-            row_alias.lower() == alias.strip().lower()
+            "".join(row_ally.split()).replace("-", "")
+            == "".join(str(ally).split()).replace("-", "")
+            and ally
             or row_discord == str(discord_id)
         ):
             target_idx = idx
@@ -554,6 +639,7 @@ def upsert_discord_usuario(ss, info: dict, discord_id: int):
         setf(new_row, i_rol, role)
         setf(new_row, i_ac, ally)
         setf(new_row, i_gn, gname)
+        setf(new_row, i_discord_user, discord_username)
         ws.append_row(new_row, value_input_option="USER_ENTERED")
         return
 
@@ -567,6 +653,7 @@ def upsert_discord_usuario(ss, info: dict, discord_id: int):
     setf(row_vals, i_rol, role)
     setf(row_vals, i_ac, ally)
     setf(row_vals, i_gn, gname)
+    setf(row_vals, i_discord_user, discord_username)
     ws.update(f"{target_idx + 2}:{target_idx + 2}", [row_vals])
 
 
