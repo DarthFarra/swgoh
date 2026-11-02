@@ -499,33 +499,48 @@ async def send_discord_assignments(client: discord.Client) -> None:
 
 
 async def job_send_discord_assignments(context) -> None:
+    from .services.audit_log import ScheduledTrace
+    trace = ScheduledTrace(
+        job="send_discord_assignments",
+        arguments="envío diario de asignaciones",
+    )
+    trace.event(step="started", action="Iniciar envío diario de asignaciones en Discord")
     entry = context.application.bot_data.get("__discord_listener__")
     if not entry:
+        trace.event(
+            step="skipped", action="Enviar asignaciones en Discord",
+            status="skipped", result="El listener de Discord no está disponible",
+        )
         return
     client, _task = entry
     await send_discord_assignments(client)
+    trace.event(
+        step="completed", action="Enviar asignaciones diarias en Discord",
+        result="Trabajo completado",
+    )
 
 
 def install_commands(client: discord.Client) -> None:
+    from .services.audit_log import wrap_discord_callback
     commands = DiscordCommands(client)
     client.tree.add_command(
         app_commands.Command(
             name="register",
             description="Registra tu jugador",
-            callback=commands.register,
+            callback=wrap_discord_callback(commands.register, "register"),
         )
     )
     client.tree.add_command(
         app_commands.Command(
             name="misoperaciones",
             description="Consulta tus asignaciones ROTE",
-            callback=commands.misoperaciones,
+            callback=wrap_discord_callback(commands.misoperaciones, "misoperaciones"),
         )
     )
     client.tree.add_command(
         app_commands.Command(
             name="operacionesjugador",
             description="Consulta las asignaciones de un jugador",
-            callback=commands.operacionesjugador,
+            callback=wrap_discord_callback(commands.operacionesjugador, "operacionesjugador"),
         )
     )

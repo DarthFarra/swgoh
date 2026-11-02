@@ -436,10 +436,18 @@ async def job_send_assignments(context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio event loop.
     """
     import asyncio
+    from ..services.audit_log import ScheduledTrace
+    trace = ScheduledTrace(job="send_assignments", arguments="envío diario de asignaciones")
+    trace.event(step="started", action="Iniciar envío diario de asignaciones")
     log.info("[send_assignments] PTB job triggered.")
     try:
         await asyncio.to_thread(run)
+        trace.event(step="completed", action="Enviar asignaciones diarias", result="Trabajo completado")
     except Exception:
+        trace.event(
+            step="failed", action="Enviar asignaciones diarias",
+            status="failed", error="Error no controlado; consultar el log técnico",
+        )
         log.exception("[send_assignments] Unhandled error in job.")
 
 

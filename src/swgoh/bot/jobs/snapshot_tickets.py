@@ -145,17 +145,33 @@ async def run_snapshot_and_publish(guild_id: str, guild_name: str) -> None:
     needs (the other half — today's lifetime_d — is in the `members` list
     we just fetched).
     """
+    from ..services.audit_log import ScheduledTrace
+    trace = ScheduledTrace(
+        job="ticket_snapshot",
+        arguments=f"gremio={guild_name}; guild_id={guild_id}",
+        entity="guild",
+        entity_id=guild_id,
+    )
+    trace.event(step="started", action=f"Iniciar snapshot de tickets para {guild_name}")
     loop = asyncio.get_running_loop()
 
     captured = await loop.run_in_executor(
         None, _snapshot_for_guild_with_capture, guild_id, guild_name,
     )
     if captured is None:
+        trace.event(
+            step="skipped", action=f"Guardar snapshot de tickets de {guild_name}",
+            status="skipped", result="No se pudo obtener información",
+        )
         return
 
     members, snapshot_d, snapshot_d1 = captured
     await _maybe_publish_missed_post(
         guild_id, guild_name, members, snapshot_d, snapshot_d1,
+    )
+    trace.event(
+        step="completed", action=f"Completar snapshot de tickets de {guild_name}",
+        result=f"{len(members)} jugadores procesados",
     )
 
 
