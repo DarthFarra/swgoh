@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import random
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -21,6 +22,9 @@ from ..services.sheets import (
     usuarios_already_registered,
     players_find_by_alias,
     players_find_by_ally,
+    usuario_player_already_registered,
+    is_registration_user_banned,
+    log_registration_attempt,
     upsert_usuario,
 )
 from ..security import (
@@ -37,11 +41,23 @@ _S_GUILD_NAME = "reg_guild_name"
 _S_LABEL      = "reg_label"
 _S_METHOD     = "reg_method"
 _S_WAITING    = "reg_waiting"
+_NEGATIVE_EMOJIS = (
+    "💩", "🖕🏿", "🚫", "🤡", "🗑", "🍆", "🤮", "🤢", "🪳",
+    "🐀", "🧌", "🧟‍♂️", "🫏", "🐍", "☠️",
+)
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("cmd_register called by user %s", update.effective_user.id if update.effective_user else "unknown")
     ss   = open_ss()
+    user = update.effective_user
+    if user:
+        log_registration_attempt(
+            ss, telegram_username=user.username or "", telegram_id=user.id
+        )
+        if is_registration_user_banned(ss, telegram_id=user.id):
+            await update.message.reply_text(random.choice(_NEGATIVE_EMOJIS))
+            return
     gmap = map_guild_name_to_label_id_rote(ss)
     if not gmap:
         await update.message.reply_text("No hay gremios configurados.")
@@ -164,6 +180,13 @@ async def msg_register_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"❌ El {kind} proporcionado no se pudo encontrar en *{label}*.\n"
             "Revisa que coincida exactamente con el del juego.",
             parse_mode="Markdown",
+        )
+        session_clear(context, user_id)
+        return
+
+    if usuario_player_already_registered(ss, found.get("allycode", "")):
+        await update.message.reply_text(
+            "❌ Ese jugador ya está registrado y no puede ser reasignado.",
         )
         session_clear(context, user_id)
         return
