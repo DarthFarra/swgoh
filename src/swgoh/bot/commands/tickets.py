@@ -14,6 +14,8 @@ Flow:
 from __future__ import annotations
 
 import logging
+import hashlib
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
@@ -29,6 +31,8 @@ from ..services.sheets import (
     get_channel_id_for_guild,
     get_channel_config_for_guild,
     get_usernames_for_members,
+    get_guild_reset_time,
+    TICKETS_TZ,
 )
 from ..services.tickets import (
     fetch_guild_tickets,
@@ -38,6 +42,7 @@ from ..services.tickets import (
     send_ticket_reminders,
     publish_tickets_to_channel,
     DAILY_TICKET_GOAL,
+    MemberTickets,
 )
 from ..keyboards.guild_select import make_keyboard_guilds
 
@@ -94,10 +99,6 @@ async def cb_tickets_guild(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     gid = data.split(":", 1)[1]
     ss = open_ss()
 
-    if not user_has_leadership_role(ss, q.from_user.id, _guild_name_for_id(ss, gid)):
-        await q.edit_message_text("No tienes permisos de Oficial/Lider en este gremio.")
-        return
-
     label, _, _ = resolve_label_name_rote_by_id(ss, gid)
     await _show_mode_selector(update, context, gid, label, via_callback=True)
 
@@ -142,6 +143,10 @@ async def cb_tickets_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not data.startswith("ticketstoday:"):
         return
     gid = data.split(":", 1)[1]
+    ss = open_ss()
+    if not _is_authorized(ss, q.from_user.id, gid):
+        await _show_fake_today(q, context, gid, _label_for_id(ss, gid))
+        return
     await _fetch_and_show_today(q, gid, context)
 
 
@@ -213,6 +218,10 @@ async def cb_tickets_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     gid = data.split(":", 1)[1]
     ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+    if not _is_authorized(ss, q.from_user.id, gid):
+        count = _fake_delinquent_count(q.from_user.id, gid)
+        await _show_reminder_confirmation(q, label, gid, count)
+        return
     members = await _get_cached_or_fetch(q, context, gid, gname)
     if members is None:
         return
@@ -264,6 +273,9 @@ async def cb_tickets_remind_confirm(
     gid = data.split(":", 1)[1]
     ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+    if not _is_authorized(ss, q.from_user.id, gid):
+        await _show_fake_action_result(q, label, gid, "recordatorio")
+        return
     members = context.user_data.get(f"tickets_members_{gid}")
     if members is None:
         await q.edit_message_text(
@@ -333,6 +345,10 @@ async def cb_tickets_publish(update: Update, context: ContextTypes.DEFAULT_TYPE)
     gid = data.split(":", 1)[1]
     ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+    if not _is_authorized(ss, q.from_user.id, gid):
+        count = _fake_delinquent_count(q.from_user.id, gid)
+        await _show_publish_confirmation(q, label, gid, count, "canal de avisos")
+        return
 
     # Validate channel is configured before showing confirm
     channel_id, thread_id = get_channel_config_for_guild(ss, gname)
@@ -396,6 +412,9 @@ async def cb_tickets_publish_confirm(
     gid = data.split(":", 1)[1]
     ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+    if not _is_authorized(ss, q.from_user.id, gid):
+        await _show_fake_action_result(q, label, gid, "publicación")
+        return
 
     channel_id, thread_id = get_channel_config_for_guild(ss, gname)
     if not channel_id:
@@ -495,6 +514,9 @@ async def cb_tickets_yesterday(update: Update, context: ContextTypes.DEFAULT_TYP
     gid = data.split(":", 1)[1]
     ss  = open_ss()
     label, gname, _ = resolve_label_name_rote_by_id(ss, gid)
+    if not _is_authorized(ss, q.from_user.id, gid):
+        await _show_fake_yesterday(q, q.from_user.id, gid, label)
+        return
     snapshot_result  = read_ticket_snapshot(ss, gname)
 
     if snapshot_result is None:
@@ -537,6 +559,155 @@ async def cb_tickets_back(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def _is_authorized(ss, user_id: int, gid: str) -> bool:
+    """Check authorization for every callback, not only for /tickets."""
+    gname = _guild_name_for_id(ss, gid)
+    return bool(gname and user_has_leadership_role(ss, user_id, gname))
+
+
+def _label_for_id(ss, gid: str) -> str:
+    return resolve_label_name_rote_by_id(ss, gid)[0]
+
+
+def _decoy_cycle(now: datetime, reset_time: str | None) -> tuple[datetime, float]:
+    if not reset_time:
+        raise ValueError("No reset_time configured for guild")
+    hour, minute = (int(part) for part in reset_time.split(":", 1))
+    reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now < reset:
+        reset -= timedelta(days=1)
+    elapsed = (now - reset).total_seconds() / (24 * 60 * 60)
+    return reset, max(0.0, min(1.0, elapsed))
+
+
+def _decoy_number(user_id: int, gid: str, index: int, progress: float, salt: str) -> int:
+    seed = hashlib.sha256(
+        f"tickets:{salt}:{user_id}:{gid}:{index}".encode()
+    ).digest()
+    start = 6 + (int.from_bytes(seed[:2], "big") % 58) * 2
+    return min(
+        DAILY_TICKET_GOAL,
+        start + int((DAILY_TICKET_GOAL - start) * progress / 2) * 2,
+    )
+
+
+def _fake_members(user_id: int, gid: str) -> list[MemberTickets]:
+    real_members = fetch_guild_tickets(gid)
+    now = datetime.now(TICKETS_TZ)
+    reset, progress = _decoy_cycle(
+        now,
+        get_guild_reset_time(open_ss(), gid),
+    )
+    cycle = reset.strftime("%Y-%m-%dT%H:%M")
+    return [
+        MemberTickets(
+            player_id=member.player_id,
+            player_name=member.player_name,
+            current_value=_decoy_number(user_id, gid, index, progress, cycle),
+            lifetime_value=0,
+        )
+        for index, member in enumerate(real_members)
+    ]
+
+
+async def _show_fake_today(q, context, gid: str, label: str) -> None:
+    members = _fake_members(q.from_user.id, gid)
+    context.user_data[f"tickets_members_{gid}"] = members
+    text = render_tickets_today(members, label)
+    delinquents = [member for member in members if not member.completed_today]
+    rows = [
+        [
+            InlineKeyboardButton("Actualizar", callback_data=f"ticketstoday:{gid}"),
+            InlineKeyboardButton("Ayer", callback_data=f"ticketsyest:{gid}"),
+        ],
+    ]
+    if delinquents:
+        rows.extend([
+            [InlineKeyboardButton(
+                f"Enviar Recordatorio ({len(delinquents)})",
+                callback_data=f"ticketsremind:{gid}",
+            )],
+            [InlineKeyboardButton(
+                f"Publicar en Avisos ({len(delinquents)})",
+                callback_data=f"ticketspublish:{gid}",
+            )],
+        ])
+    rows.append([InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}")])
+    await q.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
+async def _show_fake_yesterday(q, user_id: int, gid: str, label: str) -> None:
+    text = render_tickets_yesterday({}, {}, label)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Hoy", callback_data=f"ticketstoday:{gid}"),
+        InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
+    ]])
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
+
+
+async def _show_reminder_confirmation(q, label: str, gid: str, count: int) -> None:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"Si, enviar a {count} miembros",
+            callback_data=f"ticketsremindconfirm:{gid}",
+        ),
+        InlineKeyboardButton("Cancelar", callback_data=f"ticketstoday:{gid}"),
+    ]])
+    await q.edit_message_text(
+        f"*{_escape_md(label)}* — Enviar recordatorio de tickets\n\n"
+        f"Se enviara un mensaje a *{_escape_md(str(count))}* miembro\\(s\\) "
+        f"que aun no han alcanzado los {_escape_md(str(DAILY_TICKET_GOAL))} "
+        "tickets de hoy\\.\n\nConfirmas?",
+        reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def _show_publish_confirmation(
+    q, label: str, gid: str, count: int, destination: str
+) -> None:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            f"Si, publicar ({count} miembros)",
+            callback_data=f"ticketspublishconfirm:{gid}",
+        ),
+        InlineKeyboardButton("Cancelar", callback_data=f"ticketstoday:{gid}"),
+    ]])
+    await q.edit_message_text(
+        f"*{_escape_md(label)}* — Publicar en avisos\n\n"
+        f"Se publicara el informe de *{_escape_md(str(count))}* miembro\\(s\\) "
+        f"con tickets pendientes en el {destination}\\.\n\nConfirmas?",
+        reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+
+async def _show_fake_action_result(q, label: str, gid: str, action: str) -> None:
+    fake_count = len([
+        member for member in _fake_members(q.from_user.id, gid)
+        if not member.completed_today
+    ])
+    failed = _decoy_number(
+        q.from_user.id, gid, 0,
+        0.5,
+        "action",
+    ) % min(3, fake_count + 1)
+    sent = fake_count - failed
+    if action == "recordatorio":
+        text = (
+            f"*{_escape_md(label)}* — Resultado del recordatorio\n\n"
+            f"Enviados: *{sent}* / {_escape_md(str(sent + failed))}"
+        )
+        if failed:
+            text += f"\nFallidos: *{failed}*"
+    else:
+        text = f"*{_escape_md(label)}* — Publicado correctamente en el canal\\!"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Actualizar tickets", callback_data=f"ticketstoday:{gid}"),
+        InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
+    ]])
+    await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN_V2)
 
 async def _get_cached_or_fetch(q, context, gid: str, gname: str):
     """

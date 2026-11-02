@@ -44,7 +44,7 @@ SAMPLE = "/mnt/user-data/uploads/pTtJHHuYQcSMinxQXXZJgA-tb.json"
 
 
 def _load_sample():
-    with open(SAMPLE) as f:
+    with SAMPLE.open() as f:
         return parse_tb_snapshot(json.load(f))
 
 

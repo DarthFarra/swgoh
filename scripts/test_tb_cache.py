@@ -41,7 +41,7 @@ def test_cache_round_trip() -> None:
     print("  empty cache → None  ✓")
 
     # Load sample, parse, put in cache
-    with open(SAMPLE) as f:
+    with SAMPLE.open() as f:
         snap = parse_tb_snapshot(json.load(f))
     entry = tb_cache.set_latest(bot_data, snap, source_filename="test.json")
     assert entry.source_filename == "test.json"

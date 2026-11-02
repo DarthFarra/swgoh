@@ -40,6 +40,7 @@ from .jobs.ticket_reminder import schedule_reminder_jobs
 from .jobs.send_assignments_daily import job_send_assignments
 from .discord_commands import job_send_discord_assignments
 from .services.sync_runner import run_sync_guilds_once, run_sync_data
+from .services.audit_log import wrap_handler, scheduled_job
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,7 +93,8 @@ def _parse_send_time(raw: str, tz: ZoneInfo) -> dt_time:
 #  or, simpler, by scheduling coroutines directly since we use AsyncIOScheduler)
 # ---------------------------------------------------------------------------
 
-async def _job_sync_guilds() -> None:
+@scheduled_job("sync_guilds", "todos los gremios")
+async def _job_sync_guilds() -> bool:
     """Scheduled weekly guild sync — syncs ALL guilds (no filter)."""
     log.info("[scheduled] sync_guilds triggered.")
     try:
@@ -103,18 +105,23 @@ async def _job_sync_guilds() -> None:
             ).run
         )
         log.info("[scheduled] sync_guilds completed.")
+        return True
     except Exception:
         log.exception("[scheduled] sync_guilds failed.")
+        return False
 
 
-async def _job_sync_data() -> None:
+@scheduled_job("sync_data", "sin argumentos")
+async def _job_sync_data() -> bool:
     """Scheduled monthly data sync."""
     log.info("[scheduled] sync_data triggered.")
     try:
         await run_sync_data()
         log.info("[scheduled] sync_data completed.")
+        return True
     except Exception:
         log.exception("[scheduled] sync_data failed.")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +153,7 @@ def main() -> None:
         + omicronsummary.get_handlers()
         + refreshcache.get_handlers()
     ):
-        app.add_handler(handler)
+        app.add_handler(wrap_handler(handler))
 
     # Global error handler — catches any exception that escapes a
     # registered handler. Without this, PTB logs "No error handlers

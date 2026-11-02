@@ -51,6 +51,7 @@ from ..services.tickets import (
     fetch_guild_tickets,
     publish_tickets_to_channel,
 )
+from .snapshot_tickets import run_snapshot_for_guild
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ async def run_reminder_for_guild(
     bot,
     guild_id: str,
     guild_name: str,
+    reset_time: str,
 ) -> None:
     """
     Reminder job entry point. Registered with AsyncIOScheduler as a coroutine
@@ -78,6 +80,14 @@ async def run_reminder_for_guild(
     Every blocking I/O call is dispatched via run_in_executor. Every error
     branch logs and returns — one guild's failure must not affect others.
     """
+    from ..services.audit_log import ScheduledTrace
+    trace = ScheduledTrace(
+        job="ticket_reminder",
+        arguments=f"gremio={guild_name}; guild_id={guild_id}",
+        entity="guild",
+        entity_id=guild_id,
+    )
+    trace.event(step="started", action=f"Iniciar recordatorio de tickets para {guild_name}")
     log.info("[ticket_reminder] firing for guild '%s' (id=%s)", guild_name, guild_id)
     loop = asyncio.get_running_loop()
 
@@ -106,6 +116,13 @@ async def run_reminder_for_guild(
             guild_name,
         )
         return
+
+    # Capture the pre-reset baseline. The operational snapshot date is still
+    # yesterday until the guild reset occurs, so this is idempotent and does
+    # not interfere with the post-reset snapshot.
+    await loop.run_in_executor(
+        None, run_snapshot_for_guild, guild_id, guild_name, reset_time,
+    )
 
     try:
         channel_id, thread_id = await loop.run_in_executor(
@@ -216,6 +233,11 @@ async def run_reminder_for_guild(
 
     today_iso = datetime.now(TICKETS_TZ).date().isoformat()
     _FIRED_TODAY.add((guild_id, today_iso))
+    trace.event(
+        step="completed",
+        action=f"Publicar recordatorio de tickets para {guild_name}",
+        result=f"{len(delinquents)} jugadores pendientes",
+    )
     log.info(
         "[ticket_reminder] posted for guild '%s' (%d delinquents).",
         guild_name, len(delinquents),
@@ -303,8 +325,12 @@ def schedule_reminder_jobs(scheduler, application, lead_minutes: int) -> None:
 
         # Wrap the coroutine with bound args. Default-arg binding pattern avoids
         # the classic late-binding closure trap inside a loop.
-        async def _job(_gid=guild_id, _gname=guild_name):
-            await run_reminder_for_guild(bot, _gid, _gname)
+        async def _job(
+            _gid=guild_id,
+            _gname=guild_name,
+            _reset_time=reset_time_str,
+        ):
+            await run_reminder_for_guild(bot, _gid, _gname, _reset_time)
 
         job_id = f"ticket_reminder_{guild_id}"
         try:

@@ -1,7 +1,7 @@
 # src/swgoh/bot/services/sheets.py
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
-from datetime import datetime, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 from .sheets_io import read_values_cached
@@ -337,18 +337,65 @@ def ensure_usuarios_headers(ws) -> Dict[str, int]:
 
 def _ensure_registration_sheet(ss, sheet_name: str, headers: list[str]):
     try:
-        return ss.worksheet(sheet_name)
+        ws = ss.worksheet(sheet_name)
     except Exception:
         log.info("Creating missing registration sheet %r.", sheet_name)
         ws = ss.add_worksheet(title=sheet_name, rows=1000, cols=len(headers))
         ws.update("1:1", [headers])
         return ws
 
+    current_headers = [header.strip().lower() for header in (ws.row_values(1) or [])]
+    expected_headers = [header.lower() for header in headers]
+    if current_headers != expected_headers:
+        if sheet_name == REGISTER_LOG_SHEET and {
+            "telegram_username", "telegram_id", "discord_username", "discord_id",
+            "timestamp",
+        }.issubset(current_headers):
+            values = ws.get_all_values() or []
+            old_rows = values[1:]
+            old_indices = {header: current_headers.index(header) for header in {
+                "telegram_username", "telegram_id", "discord_username",
+                "discord_id", "timestamp",
+            }}
+            migrated_rows = []
+            for row in old_rows:
+                def old_value(column: str) -> str:
+                    index = old_indices[column]
+                    return row[index].strip() if index < len(row) else ""
+
+                timestamp = old_value("timestamp")
+                if old_value("telegram_id"):
+                    migrated_rows.append([
+                        old_value("telegram_id"),
+                        old_value("telegram_username"),
+                        "telegram",
+                        timestamp,
+                        "",
+                    ])
+                if old_value("discord_id"):
+                    migrated_rows.append([
+                        old_value("discord_id"),
+                        old_value("discord_username"),
+                        "discord",
+                        timestamp,
+                        "",
+                    ])
+            ws.clear()
+            ws.update("A1", [headers, *migrated_rows])
+            return ws
+        ws.update("1:1", [headers])
+    return ws
+
 
 def is_registration_user_banned(
-    ss, *, telegram_id: int | None = None, discord_id: int | None = None
+    ss,
+    *,
+    telegram_id: int | None = None,
+    telegram_username: str | None = None,
+    discord_id: int | None = None,
+    discord_username: str | None = None,
 ) -> bool:
-    """Return whether either platform identity has an explicit registration ban."""
+    """Return whether any supplied platform identity has an explicit ban."""
     ws = _ensure_registration_sheet(
         ss,
         BANNED_USERS_SHEET,
@@ -356,11 +403,24 @@ def is_registration_user_banned(
     )
     headers, rows = _get_all(ws)
     hl = [header.strip().lower() for header in headers]
-    for column, value in (("telegram_id", telegram_id), ("discord_id", discord_id)):
+    identities = (
+        ("telegram_id", telegram_id),
+        ("telegram_username", telegram_username),
+        ("discord_id", discord_id),
+        ("discord_username", discord_username),
+    )
+    for column, value in identities:
         if value is None or column not in hl:
             continue
         index = hl.index(column)
-        if any(index < len(row) and str(row[index]).strip() == str(value) for row in rows):
+        expected = str(value).strip().lstrip("@").casefold()
+        if not expected:
+            continue
+        if any(
+            index < len(row)
+            and str(row[index]).strip().lstrip("@").casefold() == expected
+            for row in rows
+        ):
             return True
     return False
 
@@ -368,24 +428,24 @@ def is_registration_user_banned(
 def log_registration_attempt(
     ss,
     *,
-    telegram_username: str = "",
-    telegram_id: int | None = None,
-    discord_username: str = "",
-    discord_id: int | None = None,
+    userid: int,
+    username: str,
+    platform: str,
+    player_value: str = "",
 ) -> None:
-    """Append one registration attempt with the identities available to the bot."""
+    """Append one registration attempt to the platform-neutral audit log."""
     ws = _ensure_registration_sheet(
         ss,
         REGISTER_LOG_SHEET,
-        ["telegram_username", "telegram_id", "discord_username", "discord_id", "timestamp"],
+        ["userid", "username", "platform", "timestamp", "allycode/player_name"],
     )
     ws.append_row(
         [
-            telegram_username or "",
-            str(telegram_id) if telegram_id is not None else "",
-            discord_username or "",
-            str(discord_id) if discord_id is not None else "",
+            str(userid),
+            username or "",
+            platform,
             datetime.now(TZ).isoformat(),
+            player_value or "",
         ],
         value_input_option="USER_ENTERED",
     )
@@ -403,6 +463,28 @@ def usuario_player_already_registered(ss, allycode: str) -> bool:
         index < len(row)
         and "".join(str(row[index] or "").split()).replace("-", "") == normalized
         and normalized
+        for row in rows
+    )
+
+
+def usuario_player_platform_claimed(
+    ss, allycode: str, identity_column: str, identity: int
+) -> bool:
+    """Return whether a player's identity cell is already claimed on a platform."""
+    headers, rows = _get_all(ss.worksheet(USERS_SHEET))
+    hl = [header.strip().lower() for header in headers]
+    if "allycode" not in hl or identity_column.lower() not in hl:
+        return False
+    ally_index = hl.index("allycode")
+    identity_index = hl.index(identity_column.lower())
+    normalized = "".join(str(allycode or "").split()).replace("-", "")
+    return any(
+        ally_index < len(row)
+        and "".join(str(row[ally_index] or "").split()).replace("-", "") == normalized
+        and normalized
+        and identity_index < len(row)
+        and str(row[identity_index]).strip()
+        and str(row[identity_index]).strip() != str(identity)
         for row in rows
     )
 
@@ -1136,8 +1218,8 @@ def render_ops_for_alias_phase_grouped(ss, rote_sheet: str, alias: str, phase: s
 # Schema (one row per member per guild):
 #   guild_name | player_name | last_snapshot_date | lifetime_d | lifetime_d1
 #
-# lifetime_d  = lifetimeValue taken at today's reset
-# lifetime_d1 = lifetimeValue taken at yesterday's reset (promoted from lifetime_d)
+# lifetime_d  = lifetimeValue - currentValue taken at today's reset
+# lifetime_d1 = previous lifetime_d (promoted at today's snapshot)
 #
 # "Yesterday missed": lifetime_d - lifetime_d1 < 600
 
@@ -1159,14 +1241,19 @@ def _ensure_snapshot_headers(ws) -> Dict[str, int]:
     return {h.strip().lower(): i for i, h in enumerate(headers)}
 
 
-def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> None:
+def upsert_ticket_snapshots(
+    ss,
+    guild_name: str,
+    snapshots: Dict[str, int],
+    snapshot_date: Optional[str] = None,
+) -> None:
     """
     Called at reset time. For every member of guild_name:
       1. Promotes lifetime_d -> lifetime_d1
-      2. Writes fresh lifetimeValue -> lifetime_d
+      2. Writes fresh lifetimeValue - currentValue -> lifetime_d
       3. Updates last_snapshot_date to today
 
-    New members get lifetime_d1 = lifetime_d (can't be judged on first snapshot).
+    New members get an empty lifetime_d1 (can't be judged on first snapshot).
     Members absent from snapshots (left guild) are removed.
     Other guilds' rows are preserved untouched.
     """
@@ -1180,7 +1267,7 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
     i_ld1  = hdr["lifetime_d1"]
     n_cols = len(hdr)
 
-    today_str = date.today().isoformat()
+    today_str = snapshot_date or datetime.now(TICKETS_TZ).date().isoformat()
 
     all_vals = ws.get_all_values() or []
     existing: list[list[str]] = all_vals[1:] if len(all_vals) > 1 else []
@@ -1291,9 +1378,34 @@ def read_ticket_snapshot(
     return snapshot_date, d, d1
 
 
-def snapshot_taken_today(ss, guild_name: str) -> bool:
-    """Returns True if last_snapshot_date for guild_name equals today in the ticket timezone."""
-    today_str = datetime.now(TICKETS_TZ).date().isoformat()
+def snapshot_date_for_reset(
+    reset_time: Optional[str],
+    now: Optional[datetime] = None,
+) -> str:
+    """Return the operational snapshot date for a guild's reset cycle."""
+    current = now or datetime.now(TICKETS_TZ)
+    if not reset_time:
+        return current.date().isoformat()
+    try:
+        hour, minute = (int(part) for part in reset_time.split(":", 1))
+        reset_today = current.replace(
+            hour=hour, minute=minute, second=0, microsecond=0,
+        )
+        if current < reset_today:
+            reset_today -= timedelta(days=1)
+        return reset_today.date().isoformat()
+    except (TypeError, ValueError):
+        log.warning("Invalid reset_time %r; using calendar date.", reset_time)
+        return current.date().isoformat()
+
+
+def snapshot_taken_today(
+    ss,
+    guild_name: str,
+    reset_time: Optional[str] = None,
+) -> bool:
+    """Return whether the current operational reset cycle has a snapshot."""
+    today_str = snapshot_date_for_reset(reset_time)
     try:
         ws = ss.worksheet(TICKET_SNAPSHOTS_SHEET)
     except Exception:
