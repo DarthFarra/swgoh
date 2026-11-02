@@ -22,7 +22,7 @@ from ..services.sheets import (
     usuarios_already_registered,
     players_find_by_alias,
     players_find_by_ally,
-    usuario_player_already_registered,
+    usuario_player_platform_claimed,
     is_registration_user_banned,
     log_registration_attempt,
     upsert_usuario,
@@ -52,10 +52,17 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ss   = open_ss()
     user = update.effective_user
     if user:
-        log_registration_attempt(
-            ss, telegram_username=user.username or "", telegram_id=user.id
-        )
-        if is_registration_user_banned(ss, telegram_id=user.id):
+        if is_registration_user_banned(
+            ss,
+            telegram_id=user.id,
+            telegram_username=user.username,
+        ):
+            log_registration_attempt(
+                ss,
+                userid=user.id,
+                username=user.username or "",
+                platform="telegram",
+            )
             await update.message.reply_text(random.choice(_NEGATIVE_EMOJIS))
             return
     gmap = map_guild_name_to_label_id_rote(ss)
@@ -163,6 +170,13 @@ async def msg_register_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
     gname  = session_get(context, user_id, _S_GUILD_NAME)
     label  = session_get(context, user_id, _S_LABEL)
     value  = (update.message.text or "").strip()
+    log_registration_attempt(
+        ss,
+        userid=user_id,
+        username=update.effective_user.username or "",
+        platform="telegram",
+        player_value=value,
+    )
 
     if not method or not gname:
         session_clear(context, user_id)
@@ -184,9 +198,11 @@ async def msg_register_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
         session_clear(context, user_id)
         return
 
-    if usuario_player_already_registered(ss, found.get("allycode", "")):
+    if usuario_player_platform_claimed(
+        ss, found.get("allycode", ""), "user_id", user_id
+    ):
         await update.message.reply_text(
-            "❌ Ese jugador ya está registrado y no puede ser reasignado.",
+            "❌ La cuenta de Telegram de ese jugador ya está registrada y no puede ser reasignada.",
         )
         session_clear(context, user_id)
         return

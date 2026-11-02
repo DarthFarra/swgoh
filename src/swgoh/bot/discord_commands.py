@@ -24,7 +24,7 @@ from .services.sheets import (
     open_ss,
     players_find_by_alias,
     players_find_by_ally,
-    usuario_player_already_registered,
+    usuario_player_platform_claimed,
     is_registration_user_banned,
     log_registration_attempt,
     render_ops_for_alias_phase_grouped,
@@ -174,6 +174,13 @@ class RegistrationModal(discord.ui.Modal):
             return
 
         value = str(self.value).strip()
+        log_registration_attempt(
+            ss,
+            userid=interaction.user.id,
+            username=interaction.user.name,
+            platform="discord",
+            player_value=value,
+        )
         found = (
             players_find_by_ally(ss, self.guild_name, value)
             if self.method == "ally"
@@ -187,9 +194,11 @@ class RegistrationModal(discord.ui.Modal):
             )
             return
 
-        if usuario_player_already_registered(ss, found.get("allycode", "")):
+        if usuario_player_platform_claimed(
+            ss, found.get("allycode", ""), "discord_id", interaction.user.id
+        ):
             await interaction.followup.send(
-                "❌ Ese jugador ya está registrado y no puede ser reasignado.",
+                "❌ La cuenta de Discord de ese jugador ya está registrada y no puede ser reasignada.",
                 ephemeral=True,
             )
             return
@@ -362,12 +371,17 @@ class DiscordCommands:
 
     async def register(self, interaction: discord.Interaction) -> None:
         ss = open_ss()
-        log_registration_attempt(
+        if is_registration_user_banned(
             ss,
-            discord_username=interaction.user.name,
             discord_id=interaction.user.id,
-        )
-        if is_registration_user_banned(ss, discord_id=interaction.user.id):
+            discord_username=interaction.user.name,
+        ):
+            log_registration_attempt(
+                ss,
+                userid=interaction.user.id,
+                username=interaction.user.name,
+                platform="discord",
+            )
             await interaction.response.send_message(
                 random.choice(("💩", "🖕🏿", "👎🏿", "🚫", "🤡", "🙅🏿‍♂️", "🗑️")),
                 ephemeral=True,
