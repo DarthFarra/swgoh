@@ -611,6 +611,10 @@ def _fake_members(user_id: int, gid: str) -> list[MemberTickets]:
     ]
 
 
+def _fake_delinquent_count(user_id: int, gid: str) -> int:
+    return sum(not member.completed_today for member in _fake_members(user_id, gid))
+
+
 async def _show_fake_today(q, context, gid: str, label: str) -> None:
     members = _fake_members(q.from_user.id, gid)
     context.user_data[f"tickets_members_{gid}"] = members
