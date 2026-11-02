@@ -1,7 +1,7 @@
 # src/swgoh/bot/services/sheets.py
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
-from datetime import datetime, date
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import logging
 from .sheets_io import read_values_cached
@@ -1218,8 +1218,8 @@ def render_ops_for_alias_phase_grouped(ss, rote_sheet: str, alias: str, phase: s
 # Schema (one row per member per guild):
 #   guild_name | player_name | last_snapshot_date | lifetime_d | lifetime_d1
 #
-# lifetime_d  = lifetimeValue taken at today's reset
-# lifetime_d1 = lifetimeValue taken at yesterday's reset (promoted from lifetime_d)
+# lifetime_d  = lifetimeValue - currentValue taken at today's reset
+# lifetime_d1 = previous lifetime_d (promoted at today's snapshot)
 #
 # "Yesterday missed": lifetime_d - lifetime_d1 < 600
 
@@ -1245,10 +1245,10 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
     """
     Called at reset time. For every member of guild_name:
       1. Promotes lifetime_d -> lifetime_d1
-      2. Writes fresh lifetimeValue -> lifetime_d
+      2. Writes fresh lifetimeValue - currentValue -> lifetime_d
       3. Updates last_snapshot_date to today
 
-    New members get lifetime_d1 = lifetime_d (can't be judged on first snapshot).
+    New members get an empty lifetime_d1 (can't be judged on first snapshot).
     Members absent from snapshots (left guild) are removed.
     Other guilds' rows are preserved untouched.
     """
@@ -1262,7 +1262,7 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
     i_ld1  = hdr["lifetime_d1"]
     n_cols = len(hdr)
 
-    today_str = date.today().isoformat()
+    today_str = datetime.now(TICKETS_TZ).date().isoformat()
 
     all_vals = ws.get_all_values() or []
     existing: list[list[str]] = all_vals[1:] if len(all_vals) > 1 else []

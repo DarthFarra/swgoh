@@ -1,6 +1,6 @@
 # src/swgoh/bot/jobs/snapshot_tickets.py
 """
-Snapshot job: reads lifetimeValue (ticket contribution type=2) for every
+Snapshot job: reads lifetimeValue - currentValue (ticket contribution type=2) for every
 guild member at reset time and stores it in the Ticket_Snapshots sheet.
 
 Scheduling logic:
@@ -16,7 +16,8 @@ Missed-deadline auto-post (opt-in via `ticket_missed_post_enabled` column):
   600-ticket goal" list to the channel.
 
   The data shown is computed from the TWO SNAPSHOTS (today's lifetime_d vs
-  the previous lifetime_d which becomes today's lifetime_d1). This avoids
+  the previous lifetime_d which becomes today's lifetime_d1). Since each
+  snapshot is the lifetime total before the current cycle, this avoids
   the post-reset race where reading currentValue after reset returns 0 for
   every member — because the CG game server resets currentValue atomically
   at reset time, by the time our cron fires the live data is already wiped.
@@ -88,8 +89,8 @@ def set_bot_for_snapshot_jobs(bot) -> None:
 
 def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets]:
     """
-    Fetches lifetimeValue + currentValue for all guild members and writes the
-    snapshot to the sheet. Returns the fetched members list.
+    Fetches lifetimeValue + currentValue for all guild members and writes
+    lifetimeValue - currentValue to the sheet. Returns the fetched members list.
 
     Designed to be called by APScheduler (catch-up path) OR ad-hoc from a
     script/test. Exceptions are caught and logged so a single guild failure
@@ -102,6 +103,12 @@ def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets
     log.info("Starting ticket snapshot for guild '%s' (id=%s)", guild_name, guild_id)
     try:
         ss      = open_ss()
+        if snapshot_taken_today(ss, guild_name):
+            log.info(
+                "Snapshot already exists for guild '%s' today; skipping.",
+                guild_name,
+            )
+            return []
         members = fetch_guild_tickets(guild_id)
 
         if not members:
@@ -110,7 +117,10 @@ def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets
             )
             return []
 
-        snapshots = {m.player_name: m.lifetime_value for m in members}
+        snapshots = {
+            m.player_name: max(0, m.lifetime_value - m.current_value)
+            for m in members
+        }
         upsert_ticket_snapshots(ss, guild_name, snapshots)
 
         log.info(
@@ -203,6 +213,12 @@ def _snapshot_for_guild_with_capture(
     )
     try:
         ss      = open_ss()
+        if snapshot_taken_today(ss, guild_name):
+            log.info(
+                "Snapshot already exists for guild '%s' today; skipping.",
+                guild_name,
+            )
+            return None
         members = fetch_guild_tickets(guild_id)
 
         if not members:
@@ -222,7 +238,10 @@ def _snapshot_for_guild_with_capture(
             _, prev_d, _ = previous_snapshot   # (date, lifetime_d, lifetime_d1)
             previous_lifetime_d = prev_d
 
-        snapshots = {m.player_name: m.lifetime_value for m in members}
+        snapshots = {
+            m.player_name: max(0, m.lifetime_value - m.current_value)
+            for m in members
+        }
         upsert_ticket_snapshots(ss, guild_name, snapshots)
 
         log.info(
@@ -232,7 +251,10 @@ def _snapshot_for_guild_with_capture(
             datetime.now(TICKETS_TZ).date().isoformat(),
         )
 
-        snapshot_d  = {m.player_name.lower(): m.lifetime_value for m in members}
+        snapshot_d = {
+            m.player_name.lower(): max(0, m.lifetime_value - m.current_value)
+            for m in members
+        }
         snapshot_d1 = previous_lifetime_d   # already keyed by name_lower
 
         return members, snapshot_d, snapshot_d1
