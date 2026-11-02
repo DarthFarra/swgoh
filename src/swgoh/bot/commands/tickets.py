@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import Forbidden, BadRequest
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
@@ -31,6 +31,8 @@ from ..services.sheets import (
     get_channel_id_for_guild,
     get_channel_config_for_guild,
     get_usernames_for_members,
+    get_guild_reset_time,
+    TICKETS_TZ,
 )
 from ..services.tickets import (
     fetch_guild_tickets,
@@ -568,24 +570,42 @@ def _label_for_id(ss, gid: str) -> str:
     return resolve_label_name_rote_by_id(ss, gid)[0]
 
 
-def _decoy_seed(user_id: int, gid: str) -> bytes:
-    hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
-    return hashlib.sha256(f"tickets:{hour}:{user_id}:{gid}".encode()).digest()
+def _decoy_cycle(now: datetime, reset_time: str | None) -> tuple[datetime, float]:
+    if not reset_time:
+        raise ValueError("No reset_time configured for guild")
+    hour, minute = (int(part) for part in reset_time.split(":", 1))
+    reset = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now < reset:
+        reset -= timedelta(days=1)
+    elapsed = (now - reset).total_seconds() / (24 * 60 * 60)
+    return reset, max(0.0, min(1.0, elapsed))
 
 
-def _decoy_number(user_id: int, gid: str, offset: int) -> int:
-    seed = _decoy_seed(user_id, gid)
-    return int.from_bytes(seed[offset:offset + 2], "big") % (DAILY_TICKET_GOAL + 1)
+def _decoy_number(user_id: int, gid: str, index: int, progress: float, salt: str) -> int:
+    seed = hashlib.sha256(
+        f"tickets:{salt}:{user_id}:{gid}:{index}".encode()
+    ).digest()
+    start = 6 + (int.from_bytes(seed[:2], "big") % 58) * 2
+    return min(
+        DAILY_TICKET_GOAL,
+        start + int((DAILY_TICKET_GOAL - start) * progress / 2) * 2,
+    )
 
 
 def _fake_members(user_id: int, gid: str) -> list[MemberTickets]:
     real_members = fetch_guild_tickets(gid)
+    now = datetime.now(TICKETS_TZ)
+    reset, progress = _decoy_cycle(
+        now,
+        get_guild_reset_time(open_ss(), gid),
+    )
+    cycle = reset.strftime("%Y-%m-%dT%H:%M")
     return [
         MemberTickets(
             player_id=member.player_id,
             player_name=member.player_name,
-            current_value=_decoy_number(user_id, gid, (index % 10) * 2),
-            lifetime_value=_decoy_number(user_id, gid, ((index + 1) % 10) * 2),
+            current_value=_decoy_number(user_id, gid, index, progress, cycle),
+            lifetime_value=0,
         )
         for index, member in enumerate(real_members)
     ]
@@ -620,20 +640,7 @@ async def _show_fake_today(q, context, gid: str, label: str) -> None:
 
 
 async def _show_fake_yesterday(q, user_id: int, gid: str, label: str) -> None:
-    names = [
-        member.player_name.lower()
-        for member in fetch_guild_tickets(gid)
-        if member.player_name
-    ]
-    snapshot_d1 = {
-        name: _decoy_number(user_id, gid, (index % 10) * 2)
-        for index, name in enumerate(names)
-    }
-    snapshot_d = {
-        name: base + _decoy_number(user_id, gid, ((index + 1) % 10) * 2)
-        for index, (name, base) in enumerate(snapshot_d1.items())
-    }
-    text = render_tickets_yesterday(snapshot_d, snapshot_d1, label)
+    text = render_tickets_yesterday({}, {}, label)
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("Hoy", callback_data=f"ticketstoday:{gid}"),
         InlineKeyboardButton("Volver", callback_data=f"ticketsback:{gid}"),
@@ -681,7 +688,11 @@ async def _show_fake_action_result(q, label: str, gid: str, action: str) -> None
         member for member in _fake_members(q.from_user.id, gid)
         if not member.completed_today
     ])
-    failed = _decoy_number(q.from_user.id, gid, 2) % min(3, fake_count + 1)
+    failed = _decoy_number(
+        q.from_user.id, gid, 0,
+        0.5,
+        "action",
+    ) % min(3, fake_count + 1)
     sent = fake_count - failed
     if action == "recordatorio":
         text = (
