@@ -574,6 +574,7 @@ def discord_user_has_leadership_role(
         and i_gn < len(row)
         and (row[i_gn] or "").strip() == guild_name
         and _has_current_role(ss, gid, discord_id=discord_id)
+        for row in rows
         for gid in guild_ids
     )
 def usuarios_registrations_for_user(

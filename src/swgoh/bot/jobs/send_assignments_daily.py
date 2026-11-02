@@ -31,6 +31,7 @@ from collections import defaultdict
 from typing import DefaultDict, Dict, List, Optional, Tuple
 
 import pytz
+from gspread.exceptions import APIError
 from telegram.ext import ContextTypes
 
 # ── shared infrastructure ────────────────────────────────────────────────────
