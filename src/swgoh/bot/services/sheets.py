@@ -1,7 +1,7 @@
 # src/swgoh/bot/services/sheets.py
 from __future__ import annotations
 from typing import List, Tuple, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 from .sheets_io import read_values_cached
@@ -1241,7 +1241,12 @@ def _ensure_snapshot_headers(ws) -> Dict[str, int]:
     return {h.strip().lower(): i for i, h in enumerate(headers)}
 
 
-def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> None:
+def upsert_ticket_snapshots(
+    ss,
+    guild_name: str,
+    snapshots: Dict[str, int],
+    snapshot_date: Optional[str] = None,
+) -> None:
     """
     Called at reset time. For every member of guild_name:
       1. Promotes lifetime_d -> lifetime_d1
@@ -1262,7 +1267,7 @@ def upsert_ticket_snapshots(ss, guild_name: str, snapshots: Dict[str, int]) -> N
     i_ld1  = hdr["lifetime_d1"]
     n_cols = len(hdr)
 
-    today_str = datetime.now(TICKETS_TZ).date().isoformat()
+    today_str = snapshot_date or datetime.now(TICKETS_TZ).date().isoformat()
 
     all_vals = ws.get_all_values() or []
     existing: list[list[str]] = all_vals[1:] if len(all_vals) > 1 else []
@@ -1373,9 +1378,34 @@ def read_ticket_snapshot(
     return snapshot_date, d, d1
 
 
-def snapshot_taken_today(ss, guild_name: str) -> bool:
-    """Returns True if last_snapshot_date for guild_name equals today in the ticket timezone."""
-    today_str = datetime.now(TICKETS_TZ).date().isoformat()
+def snapshot_date_for_reset(
+    reset_time: Optional[str],
+    now: Optional[datetime] = None,
+) -> str:
+    """Return the operational snapshot date for a guild's reset cycle."""
+    current = now or datetime.now(TICKETS_TZ)
+    if not reset_time:
+        return current.date().isoformat()
+    try:
+        hour, minute = (int(part) for part in reset_time.split(":", 1))
+        reset_today = current.replace(
+            hour=hour, minute=minute, second=0, microsecond=0,
+        )
+        if current < reset_today:
+            reset_today -= timedelta(days=1)
+        return reset_today.date().isoformat()
+    except (TypeError, ValueError):
+        log.warning("Invalid reset_time %r; using calendar date.", reset_time)
+        return current.date().isoformat()
+
+
+def snapshot_taken_today(
+    ss,
+    guild_name: str,
+    reset_time: Optional[str] = None,
+) -> bool:
+    """Return whether the current operational reset cycle has a snapshot."""
+    today_str = snapshot_date_for_reset(reset_time)
     try:
         ws = ss.worksheet(TICKET_SNAPSHOTS_SHEET)
     except Exception:

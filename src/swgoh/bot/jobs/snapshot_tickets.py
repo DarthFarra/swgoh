@@ -49,6 +49,7 @@ from ..services.sheets import (
     list_guilds_with_reset_time,
     upsert_ticket_snapshots,
     snapshot_taken_today,
+    snapshot_date_for_reset,
     read_ticket_snapshot,
     get_ticket_auto_post_flags,
     get_channel_config_for_guild,
@@ -87,7 +88,11 @@ def set_bot_for_snapshot_jobs(bot) -> None:
 # Core snapshot logic — synchronous, no Telegram side-effects
 # ---------------------------------------------------------------------------
 
-def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets]:
+def run_snapshot_for_guild(
+    guild_id: str,
+    guild_name: str,
+    reset_time: Optional[str] = None,
+) -> list[MemberTickets]:
     """
     Fetches lifetimeValue + currentValue for all guild members and writes
     lifetimeValue - currentValue to the sheet. Returns the fetched members list.
@@ -103,7 +108,7 @@ def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets
     log.info("Starting ticket snapshot for guild '%s' (id=%s)", guild_name, guild_id)
     try:
         ss      = open_ss()
-        if snapshot_taken_today(ss, guild_name):
+        if snapshot_taken_today(ss, guild_name, reset_time):
             log.info(
                 "Snapshot already exists for guild '%s' today; skipping.",
                 guild_name,
@@ -121,7 +126,12 @@ def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets
             m.player_name: max(0, m.lifetime_value - m.current_value)
             for m in members
         }
-        upsert_ticket_snapshots(ss, guild_name, snapshots)
+        upsert_ticket_snapshots(
+            ss,
+            guild_name,
+            snapshots,
+            snapshot_date=snapshot_date_for_reset(reset_time),
+        )
 
         log.info(
             "Snapshot saved for guild '%s': %d members, date=%s",
@@ -143,7 +153,11 @@ def run_snapshot_for_guild(guild_id: str, guild_name: str) -> list[MemberTickets
 # Async wrapper — what the scheduler actually invokes
 # ---------------------------------------------------------------------------
 
-async def run_snapshot_and_publish(guild_id: str, guild_name: str) -> None:
+async def run_snapshot_and_publish(
+    guild_id: str,
+    guild_name: str,
+    reset_time: Optional[str] = None,
+) -> None:
     """
     Scheduler entry point. Runs the (sync) snapshot work in the default
     thread pool so a slow comlink fetch can't block the event loop, then
@@ -166,7 +180,7 @@ async def run_snapshot_and_publish(guild_id: str, guild_name: str) -> None:
     loop = asyncio.get_running_loop()
 
     captured = await loop.run_in_executor(
-        None, _snapshot_for_guild_with_capture, guild_id, guild_name,
+        None, _snapshot_for_guild_with_capture, guild_id, guild_name, reset_time,
     )
     if captured is None:
         trace.event(
@@ -176,6 +190,7 @@ async def run_snapshot_and_publish(guild_id: str, guild_name: str) -> None:
         return
 
     members, snapshot_d, snapshot_d1 = captured
+    await asyncio.sleep(120)
     await _maybe_publish_missed_post(
         guild_id, guild_name, members, snapshot_d, snapshot_d1,
     )
@@ -190,7 +205,9 @@ async def run_snapshot_and_publish(guild_id: str, guild_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _snapshot_for_guild_with_capture(
-    guild_id: str, guild_name: str,
+    guild_id: str,
+    guild_name: str,
+    reset_time: Optional[str] = None,
 ) -> Optional[Tuple[list[MemberTickets], Dict[str, int], Dict[str, int]]]:
     """
     Like run_snapshot_for_guild, but also captures the previous lifetime_d
@@ -213,7 +230,7 @@ def _snapshot_for_guild_with_capture(
     )
     try:
         ss      = open_ss()
-        if snapshot_taken_today(ss, guild_name):
+        if snapshot_taken_today(ss, guild_name, reset_time):
             log.info(
                 "Snapshot already exists for guild '%s' today; skipping.",
                 guild_name,
@@ -242,7 +259,12 @@ def _snapshot_for_guild_with_capture(
             m.player_name: max(0, m.lifetime_value - m.current_value)
             for m in members
         }
-        upsert_ticket_snapshots(ss, guild_name, snapshots)
+        upsert_ticket_snapshots(
+            ss,
+            guild_name,
+            snapshots,
+            snapshot_date=snapshot_date_for_reset(reset_time),
+        )
 
         log.info(
             "Snapshot saved for guild '%s': %d members, date=%s",
@@ -482,7 +504,11 @@ def schedule_snapshot_jobs(scheduler) -> None:
             timezone=TICKETS_TZ,
             id=job_id,
             name=f"Ticket snapshot — {guild_name}",
-            kwargs={"guild_id": guild_id, "guild_name": guild_name},
+            kwargs={
+                "guild_id": guild_id,
+                "guild_name": guild_name,
+                "reset_time": reset_time_str,
+            },
             replace_existing=True,
             misfire_grace_time=300,  # 5 min grace for delayed starts
         )
@@ -501,7 +527,7 @@ def schedule_snapshot_jobs(scheduler) -> None:
 
         if past_reset and before_midnight:
             try:
-                already_done = snapshot_taken_today(ss, guild_name)
+                already_done = snapshot_taken_today(ss, guild_name, reset_time_str)
             except Exception:
                 already_done = False
 
@@ -511,7 +537,7 @@ def schedule_snapshot_jobs(scheduler) -> None:
                     "(bot started after %02d:%02d) — silent (no auto-post)",
                     guild_name, hour, minute,
                 )
-                run_snapshot_for_guild(guild_id, guild_name)
+                run_snapshot_for_guild(guild_id, guild_name, reset_time_str)
             else:
                 log.info(
                     "Catch-up not needed for guild '%s': snapshot already taken today.",
