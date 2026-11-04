@@ -40,7 +40,7 @@ from .jobs.ticket_reminder import schedule_reminder_jobs
 from .jobs.send_assignments_daily import job_send_assignments
 from .discord_commands import job_send_discord_assignments
 from .services.sync_runner import run_sync_guilds_once, run_sync_data
-from .services.audit_log import wrap_handler, scheduled_job
+from .services.audit_log import wrap_handler, scheduled_job, flush_audit_buffer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,6 +128,12 @@ async def _job_sync_data() -> bool:
 # Main
 # ---------------------------------------------------------------------------
 
+async def _flush_audit_logs(_context) -> None:
+    written = await asyncio.to_thread(flush_audit_buffer)
+    if written:
+        log.debug("Flushed %d buffered audit rows.", written)
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set.")
@@ -176,6 +182,12 @@ def main() -> None:
         # 1. Start APScheduler
         scheduler.start()
         log.info("APScheduler started (timezone=%s).", TIMEZONE)
+        application.job_queue.run_repeating(
+            _flush_audit_logs,
+            interval=15,
+            first=15,
+            name="flush_audit_logs",
+        )
 
         # 2. Share bot with snapshot jobs so they can post auto-messages
         # when their async wrapper (run_snapshot_and_publish) fires.
@@ -267,6 +279,7 @@ def main() -> None:
         await start_discord_listener(application)
 
     async def _on_shutdown(application) -> None:
+        await asyncio.to_thread(flush_audit_buffer)
         await stop_discord_listener(application)
         if scheduler.running:
             scheduler.shutdown(wait=False)

@@ -433,13 +433,12 @@ def log_registration_attempt(
     platform: str,
     player_value: str = "",
 ) -> None:
-    """Append one registration attempt to the platform-neutral audit log."""
-    ws = _ensure_registration_sheet(
-        ss,
+    """Queue one registration attempt for batched persistence."""
+    from .audit_log import enqueue_audit_row
+
+    enqueue_audit_row(
         REGISTER_LOG_SHEET,
         ["userid", "username", "platform", "timestamp", "allycode/player_name"],
-    )
-    ws.append_row(
         [
             str(userid),
             username or "",
@@ -447,7 +446,6 @@ def log_registration_attempt(
             datetime.now(TZ).isoformat(),
             player_value or "",
         ],
-        value_input_option="USER_ENTERED",
     )
 
 
