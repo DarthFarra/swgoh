@@ -52,6 +52,31 @@ def fetch_data_items(version: str, items: str) -> Dict[str, Any]:
     print(f"[DEBUG] Request Body for /data endpoint:\n{json.dumps(body, indent=2)}")
     return post_json_retry("/data", body, attempts=8, base_sleep=1.5)
 
+
+def fetch_gamedata_segments(version: str, segments: range) -> Dict[str, Any]:
+    """Fetch selected gamedata segments and merge their repeated top-level lists."""
+    merged: Dict[str, List[Any]] = {}
+
+    for segment in segments:
+        body = {
+            "payload": {
+                "version": str(version),
+                "includePveUnits": False,
+                "devicePlatform": "Android",
+                "requestSegment": int(segment),
+            },
+            "enums": False,
+        }
+        log.debug("POST /data segment=%d payload=%s", segment, body)
+        data = post_json_retry("/data", body, attempts=8, base_sleep=1.5)
+        if not isinstance(data, dict):
+            continue
+        for key, value in data.items():
+            if isinstance(value, list):
+                merged.setdefault(key, []).extend(value)
+
+    return merged
+
 # ----- /guild ----------------------------------------------------------------
 def fetch_guild(identifier: Dict[str, Any] | str) -> Dict[str, Any]:
     """

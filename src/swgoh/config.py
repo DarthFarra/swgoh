@@ -121,6 +121,7 @@ SHEET_OMICRON_PRIORITIES:  str = _optional("SHEET_OMICRON_PRIORITIES",  "Omicron
 # Overridable via env if your default sheet has a different name.
 DEFAULT_ROTE_SHEET:    str = _optional("DEFAULT_ROTE_SHEET",    "Asignaciones ROTE")
 SHEET_TICKET_SNAPSHOTS: str = _optional("SHEET_TICKET_SNAPSHOTS", "Ticket_Snapshots")
+SHEET_RAID_HISTORY: str = _optional("SHEET_RAID_HISTORY", "raid_history")
 
 # ---------------------------------------------------------------------------
 # Telegram bot

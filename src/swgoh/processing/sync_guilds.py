@@ -8,15 +8,16 @@ import socket
 import logging
 import urllib.request
 import urllib.error
+import re
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Tuple, Optional, Set
 
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import gspread
 
-from ..comlink import fetch_guild
+from ..comlink import fetch_gamedata_segments, fetch_guild, fetch_metadata
 try:
     from ..comlink import fetch_player_by_id
 except Exception:
@@ -40,6 +41,7 @@ SHEET_GUILDS        = cfg.SHEET_GUILDS
 SHEET_PLAYERS       = cfg.SHEET_PLAYERS
 SHEET_PLAYER_UNITS  = cfg.SHEET_PLAYER_UNITS
 SHEET_PLAYER_SKILLS = cfg.SHEET_PLAYER_SKILLS
+SHEET_RAID_HISTORY  = cfg.SHEET_RAID_HISTORY
 SHEET_CHARACTERS    = cfg.SHEET_CHARACTERS
 SHEET_SHIPS         = cfg.SHEET_SHIPS
 EXCLUDE_BASEID_CONTAINS = cfg.EXCLUDE_BASEID_CONTAINS
@@ -72,6 +74,7 @@ PLAYERS_REQUIRED = [
     "Player Id", "Player Name", "Ally code", "Guild Name",
     "Role", "Level", "GP", "GAC League",
 ]
+RAID_HISTORY_REQUIRED = ["date", "member_id", "member_name", "raid_id", "score", "relic_levels"]
 
 PLAYER_UNITS_MIN_PREFIX = ["Guild Name", "Player Name"]
 
@@ -199,6 +202,236 @@ def write_table_body(ws, headers: List[str], rows: List[List[str]]):
         ws.update(values=rows, range_name="A2")
     else:
         ws.resize(1, cols)
+
+
+_RAID_CATALOG_VERSION: Optional[str] = None
+_RAID_CATALOG: Dict[str, Any] = {}
+
+
+def _load_raid_catalog() -> Dict[str, Any]:
+    global _RAID_CATALOG_VERSION, _RAID_CATALOG
+
+    metadata = fetch_metadata()
+    version = str(
+        metadata.get("latestGamedataVersion")
+        or _safe_get(metadata, ["config", "latestGamedataVersion"], "")
+    ).strip()
+    if not version:
+        raise RuntimeError("Could not determine latest gamedata version")
+    if version == _RAID_CATALOG_VERSION:
+        return _RAID_CATALOG
+
+    data = fetch_gamedata_segments(version, range(0, 5))
+    units: Dict[str, Dict[str, Any]] = {}
+    for unit in data.get("units", []):
+        if not isinstance(unit, dict):
+            continue
+        base_id = str(unit.get("baseId") or "").strip()
+        if base_id:
+            units.setdefault(base_id, unit)
+
+    categories = [
+        str(category.get("id") or "").strip()
+        for category in data.get("category", [])
+        if isinstance(category, dict)
+    ]
+    _RAID_CATALOG_VERSION = version
+    _RAID_CATALOG = {"units": units, "categories": set(categories)}
+    return _RAID_CATALOG
+
+
+def _normalized_category_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _resolve_allowed_category(
+    raid: Dict[str, Any],
+    raid_id: str,
+    categories: Set[str],
+) -> str:
+    raid_keys = {raid_id}
+    identifier = raid.get("identifier")
+    if isinstance(identifier, dict):
+        raid_keys.add(str(identifier.get("campaignNodeId") or "").strip())
+
+    normalized_keys = {
+        _normalized_category_key(key)
+        for key in raid_keys
+        if key
+    }
+    for category in categories:
+        if not (category.startswith("raid_") and category.endswith("_allowed")):
+            continue
+        stem = category[len("raid_"):-len("_allowed")]
+        normalized_stem = _normalized_category_key(stem)
+        if normalized_stem in normalized_keys:
+            return category
+    return ""
+
+
+def _relic_levels_for_member(
+    roster: List[Dict[str, Any]],
+    allowed_category: str,
+    catalog_units: Dict[str, Dict[str, Any]],
+) -> int:
+    if not allowed_category:
+        return 0
+
+    total = 0
+    for unit in roster or []:
+        if not isinstance(unit, dict):
+            continue
+        base_id = str(unit.get("definitionId") or "").split(":", 1)[0].strip()
+        unit_data = catalog_units.get(base_id)
+        if not unit_data or unit_data.get("combatType") == 2:
+            continue
+        unit_categories = unit_data.get("categoryId") or []
+        if allowed_category not in unit_categories:
+            continue
+        relic = unit.get("relic")
+        if not isinstance(relic, dict):
+            continue
+        try:
+            relic_level = rp.relic_level(int(relic.get("currentTier") or 0))
+        except (TypeError, ValueError):
+            relic_level = -1
+        if relic_level >= 0:
+            total += relic_level
+    return total
+
+
+def persist_raid_history(
+    ss,
+    guild_obj: Dict[str, Any],
+    players_data: Dict[str, Dict[str, Any]],
+) -> int:
+    recent_raids = guild_obj.get("recentRaidResult")
+    if not isinstance(recent_raids, list) or not recent_raids:
+        return 0
+
+    try:
+        ws = ss.worksheet(SHEET_RAID_HISTORY)
+    except gspread.WorksheetNotFound:
+        ws = ss.add_worksheet(title=SHEET_RAID_HISTORY, rows=1000, cols=len(RAID_HISTORY_REQUIRED))
+
+    headers, existing_rows = _get_all(ws)
+    if not headers:
+        ws_update(ws, "A1", [RAID_HISTORY_REQUIRED])
+        headers = RAID_HISTORY_REQUIRED[:]
+        existing_rows = []
+    else:
+        _ensure_headers(ws, RAID_HISTORY_REQUIRED)
+        headers, existing_rows = _get_all(ws)
+
+    col = {h.strip().lower(): i for i, h in enumerate(headers)}
+    if any(name not in col for name in ("date", "member_id", "raid_id", "score", "relic_levels")):
+        return 0
+
+    existing_dates = {
+        (row[col["date"]] if col["date"] < len(row) else "").strip()
+        for row in existing_rows
+    }
+    existing_dates.discard("")
+
+    member_names = {
+        str(member.get("playerId") or "").strip(): str(member.get("playerName") or "").strip()
+        for member in (guild_obj.get("member") or [])
+        if isinstance(member, dict)
+    }
+
+    try:
+        catalog = _load_raid_catalog()
+    except Exception as e:
+        log.warning("Could not load raid unit category catalog: %s", e)
+        catalog = {"units": {}, "categories": set()}
+
+    catalog_units = catalog["units"]
+    raid_categories = catalog["categories"]
+    new_rows: List[List[Any]] = []
+
+    for raid in recent_raids:
+        if not isinstance(raid, dict):
+            continue
+
+        raid_id = str(raid.get("raidId") or "").strip()
+        identifier = raid.get("identifier")
+        if not raid_id and isinstance(identifier, dict):
+            raid_id = str(identifier.get("campaignNodeId") or "").strip()
+        if not raid_id:
+            continue
+
+        try:
+            raid_date = datetime.fromtimestamp(
+                int(raid.get("endTime") or 0),
+                tz=timezone.utc,
+            ).strftime("%Y-%m-%d")
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not raid_date:
+            continue
+
+        allowed_category = _resolve_allowed_category(raid, raid_id, raid_categories)
+        raid_members = raid.get("raidMember")
+        if not isinstance(raid_members, list):
+            continue
+
+        relic_scores: Dict[str, int] = {}
+        for member in raid_members:
+            if not isinstance(member, dict):
+                continue
+            member_id = str(member.get("playerId") or "").strip()
+            if not member_id:
+                continue
+
+            roster = players_data.get(member_id, {}).get("roster") or []
+            relic_scores[member_id] = _relic_levels_for_member(
+                roster,
+                allowed_category,
+                catalog_units,
+            )
+
+        if raid_date in existing_dates:
+            for row_number, row in enumerate(existing_rows, start=2):
+                if col["date"] >= len(row) or col["member_id"] >= len(row):
+                    continue
+                if row[col["date"]].strip() != raid_date:
+                    continue
+                member_id = row[col["member_id"]].strip()
+                if member_id not in relic_scores:
+                    continue
+                if col["relic_levels"] < len(row) and row[col["relic_levels"]].strip():
+                    continue
+                ws.update(
+                    values=[[str(relic_scores[member_id])]],
+                    range_name=f"{gspread.utils.rowcol_to_a1(row_number, col['relic_levels'] + 1)}",
+                    value_input_option="RAW",
+                )
+            continue
+
+        for member in raid_members:
+            if not isinstance(member, dict):
+                continue
+            member_id = str(member.get("playerId") or "").strip()
+            if not member_id:
+                continue
+            member_name = member_names.get(member_id, "")
+            progress = member.get("memberProgress")
+            score = "" if progress is None else str(progress).strip()
+            relic_levels = relic_scores.get(member_id, 0)
+            new_rows.append([
+                raid_date,
+                member_id,
+                member_name,
+                raid_id,
+                score,
+                str(relic_levels),
+            ])
+
+        existing_dates.add(raid_date)
+
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="RAW")
+    return len(new_rows)
 
 
 # ----------------- REBUILD ÍNDICES -----------------
@@ -602,6 +835,13 @@ def process_guild(
             "roster": roster,
             "guild_name": guild_name,
         }
+
+    try:
+        raid_rows = persist_raid_history(ss, guild_obj, players_data)
+        if raid_rows:
+            log.info("Added %d raid_history row(s) for guildId=%s", raid_rows, guild_id)
+    except Exception as e:
+        log.warning("Could not persist raid history for guildId=%s: %s", guild_id, e)
 
     return guild_name, members_count, players_data
 
