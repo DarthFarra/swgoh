@@ -5,16 +5,17 @@ Bot entry point.
 Runs:
   - Telegram polling (PTB)
   - APScheduler for the ticket snapshot jobs (guild-specific, time-driven)
-  - PTB JobQueue for the three consolidated batch jobs:
+  - PTB JobQueue for the consolidated batch jobs:
       * send_assignments  — daily at SEND_ASSIGNMENTS_TIME (ASSIGNMENTS_TIMEZONE)
-      * sync_guilds       — on SYNC_GUILDS_CRON schedule
       * sync_data         — on SYNC_DATA_CRON schedule
+
+  Guild syncs run immediately after each guild's daily ticket snapshot.
 
 Previously these were three separate Railway services. They now run in the
 same process as the bot, eliminating deployment overhead and cost.
 
 Pi / local deployment:
-  Set SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON in .env.
+  Set SEND_ASSIGNMENTS_TIME and SYNC_DATA_CRON in .env.
   The systemd unit file (systemd/swgoh-bot.service) keeps this process alive.
 """
 from __future__ import annotations
@@ -29,18 +30,18 @@ from apscheduler.triggers.cron import CronTrigger
 from telegram.ext import ApplicationBuilder
 
 from .config import (
-    BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_GUILDS_CRON, SYNC_DATA_CRON,
+    BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_DATA_CRON,
     TIMEZONE, ASSIGNMENTS_TIMEZONE, TICKET_REMINDER_LEAD_MINUTES,
 )
-from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache, tb_reload_targets
+from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache, tb_reload_targets, informeasalto
 from .error_handler import on_error
 from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs, set_bot_for_snapshot_jobs
 from .jobs.ticket_reminder import schedule_reminder_jobs
 from .jobs.send_assignments_daily import job_send_assignments
 from .discord_commands import job_send_discord_assignments
-from .services.sync_runner import run_sync_guilds_once, run_sync_data
-from .services.audit_log import wrap_handler, scheduled_job
+from .services.sync_runner import run_sync_data
+from .services.audit_log import wrap_handler, scheduled_job, flush_audit_buffer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,24 +94,6 @@ def _parse_send_time(raw: str, tz: ZoneInfo) -> dt_time:
 #  or, simpler, by scheduling coroutines directly since we use AsyncIOScheduler)
 # ---------------------------------------------------------------------------
 
-@scheduled_job("sync_guilds", "todos los gremios")
-async def _job_sync_guilds() -> bool:
-    """Scheduled weekly guild sync — syncs ALL guilds (no filter)."""
-    log.info("[scheduled] sync_guilds triggered.")
-    try:
-        # Pass empty set → sync_guilds.run() will process all guilds.
-        await asyncio.to_thread(
-            __import__(
-                "swgoh.processing.sync_guilds", fromlist=["run"]
-            ).run
-        )
-        log.info("[scheduled] sync_guilds completed.")
-        return True
-    except Exception:
-        log.exception("[scheduled] sync_guilds failed.")
-        return False
-
-
 @scheduled_job("sync_data", "sin argumentos")
 async def _job_sync_data() -> bool:
     """Scheduled monthly data sync."""
@@ -127,6 +110,12 @@ async def _job_sync_data() -> bool:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+async def _flush_audit_logs(_context) -> None:
+    written = await asyncio.to_thread(flush_audit_buffer)
+    if written:
+        log.debug("Flushed %d buffered audit rows.", written)
+
 
 def main() -> None:
     if not BOT_TOKEN:
@@ -152,6 +141,7 @@ def main() -> None:
         + tb_reload_targets.get_handlers()
         + omicronsummary.get_handlers()
         + refreshcache.get_handlers()
+        + informeasalto.get_handlers()
     ):
         app.add_handler(wrap_handler(handler))
 
@@ -176,6 +166,12 @@ def main() -> None:
         # 1. Start APScheduler
         scheduler.start()
         log.info("APScheduler started (timezone=%s).", TIMEZONE)
+        application.job_queue.run_repeating(
+            _flush_audit_logs,
+            interval=15,
+            first=15,
+            name="flush_audit_logs",
+        )
 
         # 2. Share bot with snapshot jobs so they can post auto-messages
         # when their async wrapper (run_snapshot_and_publish) fires.
@@ -191,18 +187,7 @@ def main() -> None:
 
       
 
-        # 5. Weekly sync_guilds
-        scheduler.add_job(
-            _job_sync_guilds,
-            trigger=CronTrigger.from_crontab(SYNC_GUILDS_CRON, timezone=tz),
-            id="scheduled_sync_guilds",
-            name="Weekly guild sync",
-            replace_existing=True,
-            misfire_grace_time=300,  # 5 min tolerance for a slow cold start
-        )
-        log.info("sync_guilds scheduled: cron='%s' tz=%s", SYNC_GUILDS_CRON, TIMEZONE)
-
-        # 6. Monthly sync_data
+        # 5. Monthly sync_data
         scheduler.add_job(
             _job_sync_data,
             trigger=CronTrigger.from_crontab(SYNC_DATA_CRON, timezone=tz),
@@ -267,6 +252,7 @@ def main() -> None:
         await start_discord_listener(application)
 
     async def _on_shutdown(application) -> None:
+        await asyncio.to_thread(flush_audit_buffer)
         await stop_discord_listener(application)
         if scheduler.running:
             scheduler.shutdown(wait=False)

@@ -32,6 +32,12 @@ from .services.sheets import (
     usuarios_guilds_for_discord_user,
     usuarios_registrations_for_discord_user,
     discord_user_has_leadership_role,
+    get_discord_mentions_for_members,
+)
+from .services.raid_report import (
+    read_raid_history_rows,
+    read_raid_thresholds,
+    render_raid_report,
 )
 from .. import config as cfg
 
@@ -229,11 +235,20 @@ class PhaseSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         phase = self.values[0]
-        messages = _operations_for_players(
-            self.ss, self.registrations, phase
-        )
         await interaction.response.defer(ephemeral=True)
-        await _send_parts(interaction, messages)
+        try:
+            messages = _operations_for_players(
+                self.ss, self.registrations, phase
+            )
+            await _send_parts(interaction, messages)
+        except Exception:
+            log.exception(
+                "Error rendering Discord /misoperaciones for user %s",
+                interaction.user.id,
+            )
+            await interaction.edit_original_response(
+                content="❌ No se pudieron obtener las asignaciones.",
+            )
 
 
 class PhaseSelectView(discord.ui.View):
@@ -365,6 +380,84 @@ class OfficerPhaseView(discord.ui.View):
         )
 
 
+class RaidReportGuildSelect(discord.ui.Select):
+    def __init__(self, ss, user_id: int, guilds):
+        super().__init__(
+            placeholder="Elige el gremio",
+            options=[
+                discord.SelectOption(label=(label or gname)[:100], value=guild_id)
+                for label, guild_id, gname in guilds[:25]
+            ],
+        )
+        self.ss = ss
+        self.user_id = user_id
+        self.guilds = {guild_id: (label, gname) for label, guild_id, gname in guilds}
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        guild_id = self.values[0]
+        guild = self.guilds.get(guild_id)
+        if not guild:
+            await interaction.response.edit_message(
+                content="❌ Gremio no válido.", view=None
+            )
+            return
+        _label, guild_name = guild
+        if not discord_user_has_leadership_role(
+            self.ss, interaction.user.id, guild_name
+        ):
+            await interaction.response.edit_message(
+                content="❌ No tienes permisos de Oficial o Líder.",
+                view=None,
+            )
+            return
+
+        rows = read_raid_history_rows(self.ss, guild_id, guild_name)
+        if not rows:
+            await interaction.response.edit_message(
+                content="No hay datos suficientes en raid_history.",
+                view=None,
+            )
+            return
+        names = sorted({row.member_name for row in rows if row.member_name})
+        usernames = get_discord_mentions_for_members(
+            self.ss, guild_name, names
+        )
+        try:
+            threshold_high, threshold_low = read_raid_thresholds(
+                self.ss, guild_id, guild_name
+            )
+        except ValueError as exc:
+            await interaction.response.edit_message(
+                content=f"No se puede generar el informe: {exc}",
+                view=None,
+            )
+            return
+        report = render_raid_report(
+            guild_name,
+            rows,
+            usernames,
+            threshold_high,
+            threshold_low,
+            "discord",
+        )
+        if not report:
+            await interaction.response.edit_message(
+                content="No hay resultados de asalto registrados.",
+                view=None,
+            )
+            return
+
+        await interaction.response.edit_message(content=report[:2000], view=None)
+        if len(report) > 2000:
+            await interaction.followup.send(report[2000:4000], ephemeral=True)
+
+
+class RaidReportGuildView(discord.ui.View):
+    def __init__(self, ss, user_id: int, guilds):
+        super().__init__(timeout=300)
+        self.add_item(RaidReportGuildSelect(ss, user_id, guilds))
+
+
 class DiscordCommands:
     def __init__(self, client: discord.Client):
         self.client = client
@@ -436,6 +529,77 @@ class DiscordCommands:
         await interaction.response.send_message(
             "Elige el gremio para ver operaciones de jugadores:",
             view=OfficerGuildView(guilds),
+            ephemeral=True,
+        )
+
+    async def informeasalto(self, interaction: discord.Interaction) -> None:
+        ss = open_ss()
+        guilds = [
+            item for item in usuarios_guilds_for_discord_user(
+                ss, interaction.user.id
+            )
+            if discord_user_has_leadership_role(
+                ss, interaction.user.id, item[2]
+            )
+        ]
+        if not guilds:
+            await interaction.response.send_message(
+                "No tienes permisos de Oficial o Líder en ningún gremio.",
+                ephemeral=True,
+            )
+            return
+
+        if len(guilds) == 1:
+            _label, guild_id, guild_name = guilds[0]
+            rows = read_raid_history_rows(ss, guild_id, guild_name)
+            if not rows:
+                await interaction.response.send_message(
+                    "No hay datos suficientes en raid_history.",
+                    ephemeral=True,
+                )
+                return
+            names = sorted({row.member_name for row in rows if row.member_name})
+            usernames = get_discord_mentions_for_members(
+                ss, guild_name, names
+            )
+            try:
+                threshold_high, threshold_low = read_raid_thresholds(
+                    ss, guild_id, guild_name
+                )
+            except ValueError as exc:
+                await interaction.response.send_message(
+                    f"No se puede generar el informe: {exc}",
+                    ephemeral=True,
+                )
+                return
+            report = render_raid_report(
+                guild_name,
+                rows,
+                usernames,
+                threshold_high,
+                threshold_low,
+                "discord",
+            )
+            if not report:
+                await interaction.response.send_message(
+                    "No hay resultados de asalto registrados.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                report[:2000],
+                ephemeral=True,
+            )
+            if len(report) > 2000:
+                await interaction.followup.send(
+                    report[2000:4000],
+                    ephemeral=True,
+                )
+            return
+
+        await interaction.response.send_message(
+            "Elige el gremio para consultar el último asalto:",
+            view=RaidReportGuildView(ss, interaction.user.id, guilds),
             ephemeral=True,
         )
 
@@ -542,5 +706,12 @@ def install_commands(client: discord.Client) -> None:
             name="operacionesjugador",
             description="Consulta las asignaciones de un jugador",
             callback=wrap_discord_callback(commands.operacionesjugador, "operacionesjugador"),
+        )
+    )
+    client.tree.add_command(
+        app_commands.Command(
+            name="informeasalto",
+            description="Muestra el informe del último asalto",
+            callback=wrap_discord_callback(commands.informeasalto, "informeasalto"),
         )
     )

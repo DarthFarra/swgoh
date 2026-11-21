@@ -85,7 +85,7 @@ Key variables:
 | `TICKETS_TIMEZONE` | | `Atlantic/Reykjavik` | IANA timezone for ticket snapshots and reminders |
 | `ASSIGNMENTS_TIMEZONE` | | `America/New_York` | IANA timezone for assignment sends |
 | `SEND_ASSIGNMENTS_TIME` | | `12:59` | Daily send time (HH:MM) in `ASSIGNMENTS_TIMEZONE` |
-| `SYNC_GUILDS_CRON` | | `0 3 * * 0` | Weekly guild sync schedule |
+| `SYNC_GUILDS_CRON` | | — | Legacy variable; guild sync now follows each guild's ticket reset |
 | `SYNC_DATA_CRON` | | `0 2 1 * *` | Monthly data sync schedule |
 
 Discord users can register with `/register`, query their own ROTE assignments

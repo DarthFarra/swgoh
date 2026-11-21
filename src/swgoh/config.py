@@ -121,6 +121,7 @@ SHEET_OMICRON_PRIORITIES:  str = _optional("SHEET_OMICRON_PRIORITIES",  "Omicron
 # Overridable via env if your default sheet has a different name.
 DEFAULT_ROTE_SHEET:    str = _optional("DEFAULT_ROTE_SHEET",    "Asignaciones ROTE")
 SHEET_TICKET_SNAPSHOTS: str = _optional("SHEET_TICKET_SNAPSHOTS", "Ticket_Snapshots")
+SHEET_RAID_HISTORY: str = _optional("SHEET_RAID_HISTORY", "raid_history")
 
 # ---------------------------------------------------------------------------
 # Telegram bot
@@ -177,8 +178,9 @@ ASSIGNMENTS_TIMEZONE: str = _timezone("ASSIGNMENTS_TIMEZONE", "America/New_York"
 # Daily send-assignments: time in HH:MM format (24h, in ASSIGNMENTS_TIMEZONE)
 SEND_ASSIGNMENTS_TIME: str = _optional("SEND_ASSIGNMENTS_TIME", "12:59")
 
-# Weekly sync-guilds: full cron expression (runs in TIMEZONE)
-SYNC_GUILDS_CRON: str = _optional("SYNC_GUILDS_CRON", "0 3 * * 0")  # Sunday 03:00
+# Legacy variable. Guild sync is now scheduled immediately after each
+# guild's daily ticket snapshot/reset time.
+SYNC_GUILDS_CRON: str = _optional("SYNC_GUILDS_CRON", "")
 
 # Monthly sync-data: full cron expression (runs in TIMEZONE)
 SYNC_DATA_CRON: str = _optional("SYNC_DATA_CRON", "0 2 1 * *")  # 1st of month 02:00

@@ -189,6 +189,25 @@ async def run_snapshot_and_publish(
         )
         return
 
+    try:
+        from ..services.sync_runner import run_sync_guilds_once
+        trace.event(
+            step="started",
+            action=f"Sincronizar gremio tras snapshot de tickets de {guild_name}",
+        )
+        await run_sync_guilds_once(guild_id)
+        trace.event(
+            step="completed",
+            action=f"Sincronizar gremio tras snapshot de tickets de {guild_name}",
+            result="raid_history actualizado",
+        )
+    except Exception:
+        log.exception(
+            "Post-snapshot guild sync failed for guild '%s' (id=%s)",
+            guild_name,
+            guild_id,
+        )
+
     members, snapshot_d, snapshot_d1 = captured
     await asyncio.sleep(120)
     await _maybe_publish_missed_post(
@@ -538,6 +557,18 @@ def schedule_snapshot_jobs(scheduler) -> None:
                     guild_name, hour, minute,
                 )
                 run_snapshot_for_guild(guild_id, guild_name, reset_time_str)
+                try:
+                    from ...processing import sync_guilds
+                    sync_guilds.run(filter_guild_ids={guild_id})
+                    log.info(
+                        "Catch-up guild sync completed for guild '%s' after ticket snapshot",
+                        guild_name,
+                    )
+                except Exception:
+                    log.exception(
+                        "Catch-up guild sync failed for guild '%s' after ticket snapshot",
+                        guild_name,
+                    )
             else:
                 log.info(
                     "Catch-up not needed for guild '%s': snapshot already taken today.",

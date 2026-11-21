@@ -28,6 +28,7 @@ from ..services.sheets import (
     upsert_usuario,
 )
 from ..security import (
+    rate_limit,
     session_set,
     session_get,
     session_clear,
@@ -45,26 +46,52 @@ _NEGATIVE_EMOJIS = (
     "💩", "🖕🏿", "🚫", "🤡", "🗑", "🍆", "🤮", "🤢", "🪳",
     "🐀", "🧌", "🧟‍♂️", "🫏", "🐍", "☠️",
 )
+_BANNED_CACHE_KEY = "__registration_banned_identities__"
 
 
+def _identity_keys(user) -> set[str]:
+    keys = {f"telegram_id:{user.id}"}
+    if user.username:
+        keys.add(f"telegram_username:{user.username.lstrip('@').casefold()}")
+    return keys
+
+
+def _is_cached_banned(context: ContextTypes.DEFAULT_TYPE, user) -> bool:
+    cached = context.application.bot_data.get(_BANNED_CACHE_KEY, set())
+    return bool(_identity_keys(user) & cached)
+
+
+def _cache_banned_user(context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    cached = context.application.bot_data.setdefault(_BANNED_CACHE_KEY, set())
+    cached.update(_identity_keys(user))
+
+
+@rate_limit(cooldown_seconds=5)
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("cmd_register called by user %s", update.effective_user.id if update.effective_user else "unknown")
-    ss   = open_ss()
     user = update.effective_user
-    if user:
-        if is_registration_user_banned(
-            ss,
-            telegram_id=user.id,
-            telegram_username=user.username,
-        ):
+    if user and _is_cached_banned(context, user):
+        await update.message.reply_text(random.choice(_NEGATIVE_EMOJIS))
+        return
+
+    ss = open_ss()
+    if user and is_registration_user_banned(
+        ss,
+        telegram_id=user.id,
+        telegram_username=user.username,
+    ):
+        _cache_banned_user(context, user)
+        try:
             log_registration_attempt(
                 ss,
                 userid=user.id,
                 username=user.username or "",
                 platform="telegram",
             )
-            await update.message.reply_text(random.choice(_NEGATIVE_EMOJIS))
-            return
+        except Exception:
+            log.exception("Could not audit banned /register attempt for user %s", user.id)
+        await update.message.reply_text(random.choice(_NEGATIVE_EMOJIS))
+        return
     gmap = map_guild_name_to_label_id_rote(ss)
     if not gmap:
         await update.message.reply_text("No hay gremios configurados.")

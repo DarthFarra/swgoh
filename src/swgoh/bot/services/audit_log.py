@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -16,6 +17,12 @@ from .sheets import open_ss
 from .sheets_io import _with_backoff
 
 log = logging.getLogger(__name__)
+
+_BUFFER_LOCK = threading.Lock()
+_BUFFER: dict[str, tuple[list[str], list[list[Any]]]] = {}
+_MAX_BATCH_SIZE = 50
+_MAX_BUFFER_ROWS = 5000
+_DROPPED_ROWS = 0
 
 COMMAND_HEADERS = [
     "trace_id", "parent_trace_id", "username", "id", "platform", "timestamp",
@@ -58,17 +65,67 @@ def _ensure_sheet(sheet_name: str, headers: list[str]):
     return ws
 
 
+def enqueue_audit_row(sheet_name: str, headers: list[str], row: list[Any]) -> None:
+    """Queue an audit row for batched persistence."""
+    global _DROPPED_ROWS
+    with _BUFFER_LOCK:
+        entry = _BUFFER.setdefault(sheet_name, (headers, []))
+        if entry[0] != headers:
+            log.error("Audit headers changed for %s; discarding row.", sheet_name)
+            return
+        queued = sum(len(rows) for _, rows in _BUFFER.values())
+        if queued >= _MAX_BUFFER_ROWS:
+            _DROPPED_ROWS += 1
+            if _DROPPED_ROWS == 1 or _DROPPED_ROWS % 100 == 0:
+                log.error(
+                    "Audit buffer full (%d rows); dropped %d new rows.",
+                    _MAX_BUFFER_ROWS, _DROPPED_ROWS,
+                )
+            return
+        entry[1].append(row)
+
+
+def _append_rows(sheet_name: str, headers: list[str], rows: list[list[Any]]) -> None:
+    _with_backoff(
+        _ensure_sheet(sheet_name, headers).append_rows,
+        [[_text(value) for value in row] for row in rows],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def flush_audit_buffer() -> int:
+    """Write all queued audit rows in batches, retaining failed rows."""
+    with _BUFFER_LOCK:
+        pending = {
+            sheet: (headers, rows[:])
+            for sheet, (headers, rows) in _BUFFER.items()
+            if rows
+        }
+        for sheet in pending:
+            _BUFFER[sheet][1].clear()
+
+    written = 0
+    for sheet_name, (headers, rows) in pending.items():
+        for start in range(0, len(rows), _MAX_BATCH_SIZE):
+            batch = rows[start:start + _MAX_BATCH_SIZE]
+            try:
+                _append_rows(sheet_name, headers, batch)
+                written += len(batch)
+            except Exception:
+                with _BUFFER_LOCK:
+                    current = _BUFFER.setdefault(sheet_name, (headers, []))
+                    current[1][0:0] = rows[start:]
+                log.exception(
+                    "Could not flush audit rows to %s; rows retained.",
+                    sheet_name,
+                )
+                break
+    return written
+
+
 def _append(sheet_name: str, headers: list[str], row: list[Any]) -> None:
-    try:
-        _with_backoff(
-            _ensure_sheet(sheet_name, headers).append_row,
-            [_text(value) for value in row],
-            value_input_option="USER_ENTERED",
-        )
-    except Exception:
-        # Auditing must never change the user's command outcome, but its
-        # failure remains visible in the application log.
-        log.exception("Could not append audit row to %s.", sheet_name)
+    """Compatibility wrapper used by trace objects."""
+    enqueue_audit_row(sheet_name, headers, row)
 
 
 class CommandTrace:
