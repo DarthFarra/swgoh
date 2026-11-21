@@ -87,7 +87,9 @@ def read_raid_history_rows(
         row_guild_name = get("guild_name")
         if guild_id and row_guild_id and row_guild_id != guild_id:
             continue
-        if guild_name and row_guild_name and row_guild_name != guild_name:
+        # Legacy rows may contain a Comlink name that differs from the
+        # operator-curated Guilds sheet name. A matching guild_id is enough.
+        if not guild_id and guild_name and row_guild_name and row_guild_name != guild_name:
             continue
 
         member_id = get("member_id")

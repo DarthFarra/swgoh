@@ -784,17 +784,24 @@ def process_guild(
         else gdata
     )
 
-    guild_name = (
+    hdrs = _headers(ws_guilds)
+    existing_guild_name = ""
+    try:
+        idx_name = hdrs.index("Guild Name")
+        existing_guild_name = (
+            guild_row_vals[idx_name].strip()
+            if idx_name < len(guild_row_vals)
+            else ""
+        )
+    except (ValueError, AttributeError):
+        pass
+
+    # Sheets is the operator-curated source of truth. Preserve manual names
+    # (for example Łmperio...) instead of letting Comlink overwrite them.
+    guild_name = existing_guild_name or (
         _safe_get(guild_obj, ["profile", "name"], "")
         or guild_obj.get("name", "")
     )
-    if not guild_name and guild_row_vals:
-        try:
-            hdrs = _headers(ws_guilds)
-            idx_name = hdrs.index("Guild Name")
-            guild_name = guild_row_vals[idx_name] if idx_name < len(guild_row_vals) else guild_name
-        except Exception:
-            pass
 
     guild_gp = _safe_get(guild_obj, ["profile", "guildGalacticPower"], None)
     if guild_gp is None:
