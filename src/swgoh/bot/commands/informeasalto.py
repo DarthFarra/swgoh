@@ -66,7 +66,7 @@ async def _send_report(update: Update, guild_id: str) -> None:
         return
 
     for part in _split_message(report):
-        await update.message.reply_text(part)
+        await update.message.reply_text(part, parse_mode="HTML")
 
 
 async def cmd_informeasalto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -151,9 +151,13 @@ async def cb_informeasalto(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     parts = _split_message(report)
-    await query.edit_message_text(parts[0])
+    await query.edit_message_text(parts[0], parse_mode="HTML")
     for part in parts[1:]:
-        await context.bot.send_message(chat_id=query.message.chat_id, text=part)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=part,
+            parse_mode="HTML",
+        )
 
 
 def get_handlers():

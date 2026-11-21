@@ -25,12 +25,12 @@ def test_raid_report_header_and_sections():
 
     assert report is not None
     assert report.startswith(
-        "Informe del último asalto; Droid Destruction – Guild\n15/11/2026"
+        "<b>Informe del último asalto; Destrucción droide – Guild</b>\n15/11/2026"
     )
     assert "2 (67%) han llegado a los 10,4M requeridos." not in report
-    assert "1 (33%) han llegado a los 10,4M requeridos." in report
+    assert "<b>1 (33%)</b> han llegado a los 10,4M requeridos." in report
     assert "por quienes no llegan a los 10,4M: 2" in report
-    assert "Con 2 reliquias subidas: Beta" in report
+    assert "<b>Con 2 reliquias subidas</b>: Beta" in report
     assert "Beta" in report
     assert "Gamma" not in report.split(
         "Jugadores que no han llegado a 7,5M",
@@ -39,8 +39,8 @@ def test_raid_report_header_and_sections():
 
 
 def test_raid_name_derivation():
-    assert raid_name("order66") == "Order 66"
-    assert raid_name("droiddestruction") == "Droid Destruction"
+    assert raid_name("order66") == "La venganza de los Sith"
+    assert raid_name("droiddestruction") == "Destrucción droide"
     assert raid_name("unknown_raid") == "Unknown Raid"
 
 
@@ -66,3 +66,25 @@ def test_discord_mentions_use_native_format():
     assert report is not None
     assert "Alpha <@123456>" in report
     assert "Alpha @123456" not in report
+
+
+def test_missing_player_from_current_roster_is_not_rendered():
+    rows = [
+        RaidHistoryRow("2026-11-15", "old-id", "Former Member", "droiddestruction", 5_000_000, 100, "", "Guild"),
+        RaidHistoryRow("2026-11-15", "active-id", "Active Member", "droiddestruction", 8_000_000, 100, "", "Guild"),
+    ]
+    known_player_ids = {"active-id"}
+    filtered = [
+        row for row in rows
+        if row.member_id in known_player_ids
+    ]
+    report = render_raid_report(
+        "Guild",
+        filtered,
+        {},
+        10_400_000,
+        7_500_000,
+    )
+    assert report is not None
+    assert "Former Member" not in report
+    assert "old-id" not in report

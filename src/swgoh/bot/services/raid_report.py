@@ -3,10 +3,11 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from html import escape
 from typing import Dict, Iterable, Optional
 
 from .sheets_io import read_values_cached
-from ..config import RAID_HISTORY_SHEET, GUILDS_SHEET
+from ..config import RAID_HISTORY_SHEET, GUILDS_SHEET, PLAYERS_SHEET
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,37 @@ def read_raid_history_rows(
         return []
 
     out: list[RaidHistoryRow] = []
+
+    known_player_ids: set[str] = set()
+    known_player_names: set[str] = set()
+    try:
+        player_headers, player_rows = read_values_cached(ss, PLAYERS_SHEET)
+        player_lower = {
+            h.strip().lower(): i
+            for i, h in enumerate(player_headers)
+        }
+        player_id_index = player_lower.get("player id")
+        player_name_index = player_lower.get("player name")
+        guild_name_index = player_lower.get("guild name")
+        for player_row in player_rows:
+            row_guild = (
+                player_row[guild_name_index].strip()
+                if guild_name_index is not None and guild_name_index < len(player_row)
+                else ""
+            )
+            if guild_name and row_guild and row_guild != guild_name:
+                continue
+            if player_id_index is not None and player_id_index < len(player_row):
+                player_id = player_row[player_id_index].strip()
+                if player_id:
+                    known_player_ids.add(player_id)
+            if player_name_index is not None and player_name_index < len(player_row):
+                player_name = player_row[player_name_index].strip()
+                if player_name:
+                    known_player_names.add(player_name.lower())
+    except Exception:
+        pass
+
     for row in rows:
         def get(name: str) -> str:
             idx = lower.get(name)
@@ -57,6 +89,17 @@ def read_raid_history_rows(
             continue
         if guild_name and row_guild_name and row_guild_name != guild_name:
             continue
+
+        member_id = get("member_id")
+        member_name = get("member_name")
+        if known_player_ids or known_player_names:
+            in_players = (
+                member_id in known_player_ids
+                if member_id
+                else member_name.lower() in known_player_names
+            )
+            if not in_players:
+                continue
 
         out.append(RaidHistoryRow(
             date=get("date"),
@@ -74,12 +117,12 @@ def read_raid_history_rows(
 def raid_name(raid_id: str) -> str:
     normalized = (raid_id or "").strip().lower()
     names = {
-        "order66": "Order 66",
-        "droiddestruction": "Droid Destruction",
-        "kraytdragon": "Krayt Dragon",
-        "speederbike": "Speeder Bike",
-        "naboo": "Naboo",
-        "sith_raid": "Triumvirate",
+        "order66": "La venganza de los Sith",
+        "droiddestruction": "Destrucción droide",
+        "kraytdragon": "Caza del dragón krayt",
+        "speederbike": "Asalto de speeders",
+        "naboo": "Asalto de Naboo",
+        "sith_raid": "Triunvirato",
         "aat": "AAT",
         "rancor": "Rancor",
         "rancor_challenge": "Rancor Challenge",
@@ -160,11 +203,19 @@ def _member_label(
 ) -> str:
     mention = usernames.get(name.lower())
     if not mention:
-        return name
+        return escape(name, quote=False) if mention_mode == "telegram" else name
     if mention_mode == "discord":
         return f"{name} {mention}"
     handle = mention.lstrip("@")
-    return f"{name} @{handle}"
+    return f"{escape(name, quote=False)} @{escape(handle, quote=False)}"
+
+
+def _bold(text: str, mention_mode: str) -> str:
+    if mention_mode == "discord":
+        return f"**{text}**"
+    if mention_mode == "telegram":
+        return f"<b>{escape(text, quote=False)}</b>"
+    return text
 
 
 def render_raid_report(
@@ -242,20 +293,32 @@ def render_raid_report(
     high_text = format_raid_threshold(threshold_high)
     low_text = format_raid_threshold(threshold_low)
 
+    header = f"Informe del último asalto; {raid_label} – {guild_name}"
+    if mention_mode == "telegram":
+        header = escape(header, quote=False)
     lines = [
-        f"Informe del último asalto; {raid_label} – {guild_name}",
+        _bold(header, mention_mode),
         format_raid_date(latest_date),
         "",
-        f"{reached} ({percentage}%) han llegado a los {high_text} requeridos.",
-        "",
         (
-            "Niveles de reliquia subidos "
-            "(desde que terminó la raid anterior) "
-            f"por quienes no llegan a los {high_text}: {total_gains}"
+            f"{_bold(f'{reached} ({percentage}%)', mention_mode)} "
+            f"han llegado a los {high_text} requeridos."
         ),
         "",
-        f"Reliquias subidas de quienes no han llegado a los {high_text} "
-        "en esta última raid:",
+        (
+            _bold(
+                "Niveles de reliquia subidos "
+                "(desde que terminó la raid anterior) "
+                f"por quienes no llegan a los {high_text}: {total_gains}",
+                mention_mode,
+            )
+        ),
+        "",
+        _bold(
+            f"Reliquias subidas de quienes no han llegado a los {high_text} "
+            "en esta última raid:",
+            mention_mode,
+        ),
     ]
 
     if positive_gains:
@@ -263,7 +326,7 @@ def render_raid_report(
             relic_word = "reliquia" if gain == 1 else "reliquias"
             suffix = "subida" if gain == 1 else "subidas"
             lines.append(
-                f"{index}. Con {gain} {relic_word} {suffix}: "
+                f"{index}. {_bold(f'Con {gain} {relic_word} {suffix}', mention_mode)}: "
                 f"{_member_label(name, usernames, mention_mode)}"
             )
     else:
@@ -271,8 +334,11 @@ def render_raid_report(
 
     lines.extend([
         "",
-        f"Jugadores que no han llegado a {low_text} en esta última raid "
-        "y no han subido reliquias:",
+        _bold(
+            f"Jugadores que no han llegado a {low_text} en esta última raid "
+            "y no han subido reliquias:",
+            mention_mode,
+        ),
     ])
     if no_gains:
         for name in no_gains:
@@ -284,6 +350,6 @@ def render_raid_report(
         "",
         "Próximo informe cuando termine el próximo asalto.",
         "",
-        "¡Vamos por más!",
+        _bold("¡Vamos por más!", mention_mode),
     ])
     return "\n".join(lines)
