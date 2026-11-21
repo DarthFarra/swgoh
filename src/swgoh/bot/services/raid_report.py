@@ -92,7 +92,7 @@ def raid_name(raid_id: str) -> str:
 
 def format_raid_date(value: str) -> str:
     try:
-        return datetime.strptime(value, "%Y-%m-%d").strftime("%d-%m-%Y")
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%d/%m/%Y")
     except ValueError:
         return value
 

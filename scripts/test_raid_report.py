@@ -25,7 +25,7 @@ def test_raid_report_header_and_sections():
 
     assert report is not None
     assert report.startswith(
-        "Informe del último asalto; Droid Destruction – Guild\n15-11-2026"
+        "Informe del último asalto; Droid Destruction – Guild\n15/11/2026"
     )
     assert "2 (67%) han llegado a los 10,4M requeridos." not in report
     assert "1 (33%) han llegado a los 10,4M requeridos." in report
