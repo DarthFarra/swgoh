@@ -608,6 +608,8 @@ def usuarios_registrations_for_user(
 
 def upsert_usuario(ss, info: dict, tg_username: str, user_id: int, chat_id: int):
     """Inserta/actualiza fila en Usuarios por (guild_name + allycode)."""
+    from . import sheets_cache
+
     ws      = ss.worksheet(USERS_SHEET)
     hdr_map = ensure_usuarios_headers(ws)
     vals    = ws.get_all_values() or []
@@ -655,6 +657,7 @@ def upsert_usuario(ss, info: dict, tg_username: str, user_id: int, chat_id: int)
         setf(row_vals, i_rol,   role);         setf(row_vals, i_ac,   ally)
         setf(row_vals, i_gn,    gname)
         ws.update(f"{target_idx+2}:{target_idx+2}", [row_vals])
+    sheets_cache.invalidate(f"{ss.id}:{USERS_SHEET}")
 
 
 def discord_usuario_already_registered(ss, discord_id: int, guild_name: str) -> bool:
@@ -676,6 +679,8 @@ def discord_usuario_already_registered(ss, discord_id: int, guild_name: str) -> 
 
 def upsert_discord_usuario(ss, info: dict, discord_id: int, discord_username: str = ""):
     """Insert/update a registration while preserving any Telegram identity."""
+    from . import sheets_cache
+
     ws = ss.worksheet(USERS_SHEET)
     hdr_map = ensure_usuarios_headers(ws)
     vals = ws.get_all_values() or []
@@ -722,6 +727,7 @@ def upsert_discord_usuario(ss, info: dict, discord_id: int, discord_username: st
         setf(new_row, i_gn, gname)
         setf(new_row, i_discord_user, discord_username)
         ws.append_row(new_row, value_input_option="USER_ENTERED")
+        sheets_cache.invalidate(f"{ss.id}:{USERS_SHEET}")
         return
 
     row_vals = rows[target_idx][:]
@@ -736,6 +742,7 @@ def upsert_discord_usuario(ss, info: dict, discord_id: int, discord_username: st
     setf(row_vals, i_gn, gname)
     setf(row_vals, i_discord_user, discord_username)
     ws.update(f"{target_idx + 2}:{target_idx + 2}", [row_vals])
+    sheets_cache.invalidate(f"{ss.id}:{USERS_SHEET}")
 
 
 def usuarios_registrations_for_discord_user(
@@ -868,6 +875,78 @@ def get_usernames_for_members(
             raw = (r[i_user] if i_user < len(r) else "").strip()
             username = raw.lstrip("@") if raw else None
         result[alias.lower()] = username
+    return result
+
+
+def get_discord_usernames_for_members(
+    ss, guild_name: str, player_names: list[str]
+) -> Dict[str, Optional[str]]:
+    """Return {player_name_lower: discord_username_or_None}."""
+    headers, rows = read_values_cached(ss, USERS_SHEET)
+    hl = [h.strip().lower() for h in headers]
+    required = ["alias", "guild_name"]
+    if any(col not in hl for col in required):
+        return {}
+    i_alias = hl.index("alias")
+    i_gn = hl.index("guild_name")
+    i_user = hl.index("discord_username") if "discord_username" in hl else None
+    targets = {name.strip().lower() for name in player_names if name.strip()}
+    result: Dict[str, Optional[str]] = {}
+    for row in rows:
+        row_guild = (row[i_gn] if i_gn < len(row) else "").strip()
+        if row_guild != guild_name:
+            continue
+        alias = (row[i_alias] if i_alias < len(row) else "").strip()
+        if alias.lower() not in targets:
+            continue
+        username = None
+        if i_user is not None:
+            raw = (row[i_user] if i_user < len(row) else "").strip()
+            username = raw.lstrip("@") if raw else None
+        result[alias.lower()] = username
+    return result
+
+
+def get_discord_mentions_for_members(
+    ss, guild_name: str, player_names: list[str]
+) -> Dict[str, Optional[str]]:
+    """Return native Discord mentions for player names."""
+    headers, rows = read_values_cached(ss, USERS_SHEET)
+    hl = [h.strip().lower() for h in headers]
+    required = ["alias", "guild_name"]
+    if any(col not in hl for col in required):
+        return {}
+    i_alias = hl.index("alias")
+    i_gn = hl.index("guild_name")
+    i_discord_id = hl.index("discord_id") if "discord_id" in hl else None
+    i_discord_user = (
+        hl.index("discord_username") if "discord_username" in hl else None
+    )
+    targets = {name.strip().lower() for name in player_names if name.strip()}
+    result: Dict[str, Optional[str]] = {}
+    for row in rows:
+        row_guild = (row[i_gn] if i_gn < len(row) else "").strip()
+        if row_guild != guild_name:
+            continue
+        alias = (row[i_alias] if i_alias < len(row) else "").strip()
+        if alias.lower() not in targets:
+            continue
+
+        discord_id = (
+            (row[i_discord_id] if i_discord_id is not None and i_discord_id < len(row) else "")
+            .strip()
+        )
+        if discord_id:
+            result[alias.lower()] = f"<@{discord_id}>"
+            continue
+
+        discord_username = (
+            (row[i_discord_user] if i_discord_user is not None and i_discord_user < len(row) else "")
+            .strip()
+        )
+        if discord_username:
+            handle = discord_username if discord_username.startswith("@") else f"@{discord_username}"
+            result[alias.lower()] = handle
     return result
 
 

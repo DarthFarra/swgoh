@@ -69,12 +69,16 @@ GUILDS_HEADER_SYNONYMS = {"GP": ["GP", "Guild GP"]}
 GUILDS_REQUIRED = [
     "Guild Id", "Guild Name", "Members", "Guild GP",
     "Last Raid Id", "Last Raid Score", "Last Update",
+    "raid_threshold_high", "raid_threshold_low",
 ]
 PLAYERS_REQUIRED = [
     "Player Id", "Player Name", "Ally code", "Guild Name",
     "Role", "Level", "GP", "GAC League",
 ]
-RAID_HISTORY_REQUIRED = ["date", "member_id", "member_name", "raid_id", "score", "relic_levels"]
+RAID_HISTORY_REQUIRED = [
+    "date", "member_id", "member_name", "raid_id", "score", "relic_levels",
+    "guild_id", "guild_name",
+]
 
 PLAYER_UNITS_MIN_PREFIX = ["Guild Name", "Player Name"]
 
@@ -304,6 +308,8 @@ def persist_raid_history(
     ss,
     guild_obj: Dict[str, Any],
     players_data: Dict[str, Dict[str, Any]],
+    guild_id: str = "",
+    guild_name: str = "",
 ) -> int:
     recent_raids = guild_obj.get("recentRaidResult")
     if not isinstance(recent_raids, list) or not recent_raids:
@@ -324,14 +330,20 @@ def persist_raid_history(
         headers, existing_rows = _get_all(ws)
 
     col = {h.strip().lower(): i for i, h in enumerate(headers)}
-    if any(name not in col for name in ("date", "member_id", "raid_id", "score", "relic_levels")):
+    if any(name not in col for name in (
+        "date", "member_id", "raid_id", "score", "relic_levels",
+        "guild_id", "guild_name",
+    )):
         return 0
 
     existing_dates = {
-        (row[col["date"]] if col["date"] < len(row) else "").strip()
+        (
+            (row[col["guild_id"]] if col["guild_id"] < len(row) else "").strip(),
+            (row[col["date"]] if col["date"] < len(row) else "").strip(),
+        )
         for row in existing_rows
     }
-    existing_dates.discard("")
+    existing_dates.discard(("", ""))
 
     member_names = {
         str(member.get("playerId") or "").strip(): str(member.get("playerName") or "").strip()
@@ -390,20 +402,30 @@ def persist_raid_history(
                 catalog_units,
             )
 
-        if raid_date in existing_dates:
+        if (guild_id, raid_date) in existing_dates:
             for row_number, row in enumerate(existing_rows, start=2):
                 if col["date"] >= len(row) or col["member_id"] >= len(row):
                     continue
                 if row[col["date"]].strip() != raid_date:
                     continue
+                if guild_id and col["guild_id"] < len(row):
+                    if row[col["guild_id"]].strip() and row[col["guild_id"]].strip() != guild_id:
+                        continue
                 member_id = row[col["member_id"]].strip()
                 if member_id not in relic_scores:
                     continue
                 if col["relic_levels"] < len(row) and row[col["relic_levels"]].strip():
                     continue
                 ws.update(
-                    values=[[str(relic_scores[member_id])]],
-                    range_name=f"{gspread.utils.rowcol_to_a1(row_number, col['relic_levels'] + 1)}",
+                    values=[[
+                        str(relic_scores[member_id]),
+                        guild_id,
+                        guild_name,
+                    ]],
+                    range_name=(
+                        f"{gspread.utils.rowcol_to_a1(row_number, col['relic_levels'] + 1)}:"
+                        f"{gspread.utils.rowcol_to_a1(row_number, col['guild_name'] + 1)}"
+                    ),
                     value_input_option="RAW",
                 )
             continue
@@ -425,9 +447,11 @@ def persist_raid_history(
                 raid_id,
                 score,
                 str(relic_levels),
+            guild_id,
+            guild_name,
             ])
 
-        existing_dates.add(raid_date)
+        existing_dates.add((guild_id, raid_date))
 
     if new_rows:
         ws.append_rows(new_rows, value_input_option="RAW")
@@ -837,7 +861,13 @@ def process_guild(
         }
 
     try:
-        raid_rows = persist_raid_history(ss, guild_obj, players_data)
+        raid_rows = persist_raid_history(
+            ss,
+            guild_obj,
+            players_data,
+            guild_id=guild_id,
+            guild_name=guild_name,
+        )
         if raid_rows:
             log.info("Added %d raid_history row(s) for guildId=%s", raid_rows, guild_id)
     except Exception as e:
