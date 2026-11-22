@@ -105,9 +105,35 @@ class _TBListenerClient(discord.Client):
         self._auto_forward_thread_id = auto_forward_thread_id
         self._commands_synced = False
 
+    async def on_app_command_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        log.exception(
+            "Unhandled Discord app command error: command=%s user_id=%s",
+            getattr(interaction.command, "name", "unknown"),
+            interaction.user.id,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Error interno ejecutando el comando.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Error interno ejecutando el comando.",
+                    ephemeral=True,
+                )
+        except Exception:
+            log.exception("Could not send Discord app command error fallback")
+
     async def on_ready(self) -> None:
         if not self._commands_synced:
             install_commands(self)
+            self.tree.on_error = self.on_app_command_error
             await self.tree.sync()
             self._commands_synced = True
             log.info("Discord slash commands registered.")

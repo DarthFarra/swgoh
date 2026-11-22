@@ -6,7 +6,7 @@ from datetime import datetime
 from html import escape
 from typing import Dict, Iterable, Optional
 
-from .sheets_io import read_values_cached
+from .sheets_io import _read_all_values, read_values_cached
 from ..config import RAID_HISTORY_SHEET, GUILDS_SHEET, PLAYERS_SHEET
 
 
@@ -168,15 +168,21 @@ def read_raid_thresholds(
     guild_id: str,
     guild_name: str,
 ) -> tuple[int, int]:
-    headers, rows = read_values_cached(ss, GUILDS_SHEET)
-    lower = {h.strip().lower(): i for i, h in enumerate(headers)}
-    id_index = lower.get("guild id")
-    name_index = lower.get("guild name")
+    headers, rows = _read_all_values(ss, GUILDS_SHEET)
+    lower = {
+        h.strip().lower().replace(" ", "_"): i
+        for i, h in enumerate(headers)
+    }
+    id_index = lower.get("guild_id")
+    name_index = lower.get("guild_name")
     high_index = lower.get("raid_threshold_high")
     low_index = lower.get("raid_threshold_low")
     if id_index is None or high_index is None or low_index is None:
         raise ValueError(
-            "Guilds must contain raid_threshold_high and raid_threshold_low"
+            "Faltan columnas en Guilds: "
+            f"Guild Id={id_index is not None}, "
+            f"raid_threshold_high={high_index is not None}, "
+            f"raid_threshold_low={low_index is not None}"
         )
 
     for row in rows:

@@ -235,10 +235,16 @@ class PhaseSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         phase = self.values[0]
-        await interaction.response.defer(ephemeral=True)
         try:
+            await interaction.response.defer(ephemeral=True)
             messages = _operations_for_players(
                 self.ss, self.registrations, phase
+            )
+            log.info(
+                "Discord /misoperaciones phase=%s user=%s messages=%d",
+                phase,
+                interaction.user.id,
+                len(messages),
             )
             await _send_parts(interaction, messages)
         except Exception:
@@ -246,9 +252,18 @@ class PhaseSelect(discord.ui.Select):
                 "Error rendering Discord /misoperaciones for user %s",
                 interaction.user.id,
             )
-            await interaction.edit_original_response(
-                content="❌ No se pudieron obtener las asignaciones.",
-            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(
+                        content="❌ No se pudieron obtener las asignaciones.",
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "❌ No se pudieron obtener las asignaciones.",
+                        ephemeral=True,
+                    )
+            except Exception:
+                log.exception("Could not report Discord /misoperaciones failure")
 
 
 class PhaseSelectView(discord.ui.View):
@@ -491,26 +506,54 @@ class DiscordCommands:
         )
 
     async def misoperaciones(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        ss = open_ss()
-        registrations = usuarios_registrations_for_discord_user(
-            ss, interaction.user.id
-        )
-        if not registrations:
-            await interaction.edit_original_response(
-                content="No estás registrado en ningún gremio."
+        try:
+            await interaction.response.defer(ephemeral=True)
+            ss = open_ss()
+            registrations = usuarios_registrations_for_discord_user(
+                ss, interaction.user.id
             )
-            return
-        phases = _registrations_phases(ss, registrations)
-        if not phases:
-            await interaction.edit_original_response(
-                content="❌ No hay fases en tus hojas ROTE."
+            log.info(
+                "Discord /misoperaciones user=%s registrations=%d",
+                interaction.user.id,
+                len(registrations),
             )
-            return
-        await interaction.edit_original_response(
-            content="Elige la fase:",
-            view=PhaseSelectView(ss, registrations),
-        )
+            if not registrations:
+                await interaction.edit_original_response(
+                    content="No estás registrado en ningún gremio."
+                )
+                return
+            phases = _registrations_phases(ss, registrations)
+            log.info(
+                "Discord /misoperaciones user=%s phases=%s",
+                interaction.user.id,
+                phases,
+            )
+            if not phases:
+                await interaction.edit_original_response(
+                    content="❌ No hay fases en tus hojas ROTE."
+                )
+                return
+            await interaction.edit_original_response(
+                content="Elige la fase:",
+                view=PhaseSelectView(ss, registrations),
+            )
+        except Exception:
+            log.exception(
+                "Discord /misoperaciones failed for user %s",
+                interaction.user.id,
+            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.edit_original_response(
+                        content="❌ No se pudo cargar /misoperaciones.",
+                    )
+                else:
+                    await interaction.response.send_message(
+                        "❌ No se pudo cargar /misoperaciones.",
+                        ephemeral=True,
+                    )
+            except Exception:
+                log.exception("Could not send Discord /misoperaciones fallback")
 
     async def operacionesjugador(self, interaction: discord.Interaction) -> None:
         ss = open_ss()

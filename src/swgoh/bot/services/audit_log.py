@@ -269,6 +269,11 @@ def wrap_discord_callback(callback: Callable[..., Awaitable[Any]], command: str)
         try:
             result = await callback(interaction, *args, **kwargs)
         except Exception as exc:
+            log.exception(
+                "Unhandled Discord slash command error: command=%s user_id=%s",
+                command,
+                getattr(user, "id", ""),
+            )
             trace.event(
                 step="failed", action=f"Ejecutar /{command}", status="failed",
                 error=f"{type(exc).__name__}: {exc}",
