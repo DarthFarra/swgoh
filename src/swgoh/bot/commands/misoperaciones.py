@@ -1,6 +1,8 @@
 # src/swgoh/bot/commands/misoperaciones.py
 from __future__ import annotations
 
+from html import escape
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -17,6 +19,20 @@ from ..security import (
 )
 
 _S_PHASES = "myops_phases"
+
+
+def _split_html_message(message: str, limit: int = 4000) -> list[str]:
+    if len(message) <= limit:
+        return [message]
+    parts = []
+    remaining = message
+    while remaining:
+        cut = remaining.rfind("\n", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    return parts
 
 
 def _phase_keyboard(phases):
@@ -46,8 +62,25 @@ def _operations_for_players(ss, registrations, phase):
         body = render_ops_for_alias_phase_grouped(ss, rote_sheet, alias, phase)
         if "No tienes asignaciones" in body:
             continue
-        messages.append(f"Asignaciones de *{alias}* — *{label or gname}* (Fase {phase})\n\n{body}")
+        title = (
+            f"<b>Asignaciones de {escape(alias)}</b> — "
+            f"<b>{escape(label or gname)}</b> (Fase {escape(str(phase))})"
+        )
+        formatted_body = _format_operations_body(body)
+        messages.append(f"{title}\n\n{formatted_body}")
     return messages
+
+
+def _format_operations_body(body: str) -> str:
+    formatted = []
+    for line in body.splitlines():
+        if not line:
+            formatted.append("")
+        elif line.startswith("- "):
+            formatted.append(escape(line))
+        else:
+            formatted.append(f"<b>{escape(line)}</b>")
+    return "\n".join(formatted).strip()
 
 
 async def _show_phase_picker(target, context, user_id, phases, registrations):
@@ -134,9 +167,17 @@ async def cb_myops_phase(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await q.edit_message_text(messages[0], reply_markup=kb)
+    parts = _split_html_message(messages[0])
+    await q.edit_message_text(
+        parts[0],
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+    for part in parts[1:]:
+        await q.message.reply_text(part, reply_markup=kb, parse_mode="HTML")
     for message in messages[1:]:
-        await q.message.reply_text(message, reply_markup=kb)
+        for part in _split_html_message(message):
+            await q.message.reply_text(part, reply_markup=kb, parse_mode="HTML")
 
 
 async def cb_myops_choosephase(update: Update, context: ContextTypes.DEFAULT_TYPE):
