@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+import asyncio
 from typing import Optional
 
 import discord
@@ -33,11 +34,18 @@ from .services.sheets import (
     usuarios_registrations_for_discord_user,
     discord_user_has_leadership_role,
     get_discord_mentions_for_members,
+    player_id_for_alias,
 )
 from .services.raid_report import (
     read_raid_history_rows,
     read_raid_thresholds,
     render_raid_report,
+)
+from .services.gt_prep import (
+    evaluate_guild,
+    evaluate_player,
+    render_guild_prep,
+    render_player_prep,
 )
 from .. import config as cfg
 
@@ -473,6 +481,57 @@ class RaidReportGuildView(discord.ui.View):
         self.add_item(RaidReportGuildSelect(ss, user_id, guilds))
 
 
+class PrepGtGuildSelect(discord.ui.Select):
+    def __init__(self, ss, guilds):
+        super().__init__(
+            placeholder="Elige el gremio",
+            options=[
+                discord.SelectOption(label=(label or gname)[:100], value=guild_id)
+                for label, guild_id, gname in guilds[:25]
+            ],
+        )
+        self.ss = ss
+        self.guilds = {
+            guild_id: (label, gname)
+            for label, guild_id, gname in guilds
+        }
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        guild_id = self.values[0]
+        guild = self.guilds.get(guild_id)
+        if not guild:
+            await interaction.response.edit_message(
+                content="❌ Gremio no válido.",
+                view=None,
+            )
+            return
+        _label, guild_name = guild
+        if not discord_user_has_leadership_role(
+            self.ss,
+            interaction.user.id,
+            guild_name,
+        ):
+            await interaction.response.edit_message(
+                content="❌ No tienes permisos de Oficial o Líder.",
+                view=None,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        preps = await asyncio.to_thread(evaluate_guild, self.ss, guild_name)
+        report = render_guild_prep(guild_name, preps, telegram=False)
+        await interaction.edit_original_response(
+            content=report[:2000],
+        )
+        if len(report) > 2000:
+            await interaction.followup.send(report[2000:4000], ephemeral=True)
+
+
+class PrepGtGuildView(discord.ui.View):
+    def __init__(self, ss, guilds):
+        super().__init__(timeout=300)
+        self.add_item(PrepGtGuildSelect(ss, guilds))
+
+
 class DiscordCommands:
     def __init__(self, client: discord.Client):
         self.client = client
@@ -646,6 +705,82 @@ class DiscordCommands:
             ephemeral=True,
         )
 
+    async def prepgt(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        ss = open_ss()
+        registrations = usuarios_registrations_for_discord_user(
+            ss,
+            interaction.user.id,
+        )
+        if not registrations:
+            await interaction.edit_original_response(
+                content="No estás registrado en ningún jugador."
+            )
+            return
+
+        reports: list[str] = []
+        for _label, _guild_id, guild_name, _rote, alias in registrations:
+            player_id = player_id_for_alias(ss, guild_name, alias)
+            if not player_id:
+                continue
+            prep = await asyncio.to_thread(
+                evaluate_player,
+                ss,
+                player_id,
+                alias,
+            )
+            reports.append(render_player_prep(prep, telegram=False))
+
+        if not reports:
+            await interaction.edit_original_response(
+                content="No pude resolver ningún jugador registrado."
+            )
+            return
+
+        for index, report in enumerate(reports):
+            if index == 0:
+                await interaction.edit_original_response(
+                    content=report[:2000],
+                )
+            else:
+                await interaction.followup.send(report[:2000], ephemeral=True)
+            if len(report) > 2000:
+                await interaction.followup.send(report[2000:4000], ephemeral=True)
+
+    async def prepgtgremio(self, interaction: discord.Interaction) -> None:
+        ss = open_ss()
+        guilds = [
+            item for item in usuarios_guilds_for_discord_user(
+                ss,
+                interaction.user.id,
+            )
+            if discord_user_has_leadership_role(
+                ss,
+                interaction.user.id,
+                item[2],
+            )
+        ]
+        if not guilds:
+            await interaction.response.send_message(
+                "Este comando requiere rol Líder u Oficial.",
+                ephemeral=True,
+            )
+            return
+        if len(guilds) == 1:
+            _label, guild_id, guild_name = guilds[0]
+            await interaction.response.defer(ephemeral=True)
+            preps = await asyncio.to_thread(evaluate_guild, ss, guild_name)
+            report = render_guild_prep(guild_name, preps, telegram=False)
+            await interaction.edit_original_response(content=report[:2000])
+            if len(report) > 2000:
+                await interaction.followup.send(report[2000:4000], ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Elige el gremio:",
+            view=PrepGtGuildView(ss, guilds),
+            ephemeral=True,
+        )
+
 
 async def send_discord_assignments(client: discord.Client) -> None:
     """Send the daily assignment message to every registered Discord user."""
@@ -756,5 +891,19 @@ def install_commands(client: discord.Client) -> None:
             name="informeasalto",
             description="Muestra el informe del último asalto",
             callback=wrap_discord_callback(commands.informeasalto, "informeasalto"),
+        )
+    )
+    client.tree.add_command(
+        app_commands.Command(
+            name="prepgt",
+            description="Muestra la preparación GT de tus jugadores",
+            callback=wrap_discord_callback(commands.prepgt, "prepgt"),
+        )
+    )
+    client.tree.add_command(
+        app_commands.Command(
+            name="prepgtgremio",
+            description="Muestra la preparación GT del gremio",
+            callback=wrap_discord_callback(commands.prepgtgremio, "prepgtgremio"),
         )
     )

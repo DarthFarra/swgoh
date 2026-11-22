@@ -122,6 +122,8 @@ SHEET_OMICRON_PRIORITIES:  str = _optional("SHEET_OMICRON_PRIORITIES",  "Omicron
 DEFAULT_ROTE_SHEET:    str = _optional("DEFAULT_ROTE_SHEET",    "Asignaciones ROTE")
 SHEET_TICKET_SNAPSHOTS: str = _optional("SHEET_TICKET_SNAPSHOTS", "Ticket_Snapshots")
 SHEET_RAID_HISTORY: str = _optional("SHEET_RAID_HISTORY", "raid_history")
+SHEET_TW_REQS: str = _optional("SHEET_TW_REQS", "TW_Reqs")
+SWGOH_STATS_BASE: str = _optional("SWGOH_STATS_BASE", "http://localhost:3223").rstrip("/")
 
 # ---------------------------------------------------------------------------
 # Telegram bot

@@ -33,7 +33,7 @@ from .config import (
     BOT_TOKEN, SEND_ASSIGNMENTS_TIME, SYNC_DATA_CRON,
     TIMEZONE, ASSIGNMENTS_TIMEZONE, TICKET_REMINDER_LEAD_MINUTES,
 )
-from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache, tb_reload_targets, informeasalto
+from .commands import syncguild, misoperaciones, register, syncdata, operacionesjugador, tickets, sendassignments, omicrones, tb, tb_notifications, omicronsummary, refreshcache, tb_reload_targets, informeasalto, prepgt
 from .error_handler import on_error
 from .discord_listener import start_discord_listener, stop_discord_listener
 from .jobs.snapshot_tickets import schedule_snapshot_jobs, set_bot_for_snapshot_jobs
@@ -142,6 +142,7 @@ def main() -> None:
         + omicronsummary.get_handlers()
         + refreshcache.get_handlers()
         + informeasalto.get_handlers()
+        + prepgt.get_handlers()
     ):
         app.add_handler(wrap_handler(handler))
 
