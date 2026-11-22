@@ -415,15 +415,18 @@ def render_player_prep(prep: PlayerPrep, telegram: bool = True) -> str:
     if has_hard_failure(prep):
         lines.append("")
         lines.append(
-            "Esta cuenta no se puede apuntar a GT hasta que no resuelva "
-            "los stats marcados con ❌"
+            "<b>Esta cuenta no se puede apuntar a GT hasta que no resuelva "
+            "los stats marcados con ❌.</b>"
         )
     elif any(not failure.hard for failure in prep.failures):
         lines.append("")
         lines.append(
-            "Esta cuenta se puede apuntar a GT"
-            " pero ojo a los stats recomendados 👀"
+            "<b>Esta cuenta se puede apuntar a GT,</b>"
+            " pero ojo a los stats recomendados 👀."
         )
+    else:
+        lines.append("")
+        lines.append("<b>¡Perfecto! ¡Esta cuenta se puede apuntar a GT! ✅</b>")
     return "\n".join(lines)
 
 
